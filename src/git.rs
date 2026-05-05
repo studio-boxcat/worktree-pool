@@ -7,43 +7,36 @@ use std::process::{Command, Output};
 /// Run `git <args>` with `-C cwd`, capture stdout+stderr. Returns the trimmed stdout
 /// on success; on non-zero exit, returns an error including the stderr.
 pub fn run(cwd: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .with_context(|| format!("spawning git -C {} {}", cwd.display(), args.join(" ")))?;
+    let out = spawn(cwd, &[], args)?;
     check(&out, cwd, args)
 }
 
 /// Like `run`, but with extra `-c key=value` overrides before the subcommand.
 /// Order: `-C cwd -c k=v ... <args>`.
 pub fn run_with_config(cwd: &Path, overrides: &[(&str, &str)], args: &[&str]) -> Result<String> {
+    let out = spawn(cwd, overrides, args)?;
+    check(&out, cwd, args)
+}
+
+/// Like `run` but doesn't error on non-zero exit. Returns (success, stdout, stderr).
+pub fn run_lenient(cwd: &Path, args: &[&str]) -> Result<(bool, String, String)> {
+    let out = spawn(cwd, &[], args)?;
+    Ok((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    ))
+}
+
+fn spawn(cwd: &Path, overrides: &[(&str, &str)], args: &[&str]) -> Result<Output> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(cwd);
     for (k, v) in overrides {
         cmd.arg("-c").arg(format!("{k}={v}"));
     }
     cmd.args(args);
-    let out = cmd
-        .output()
-        .with_context(|| format!("spawning git -C {} -c... {}", cwd.display(), args.join(" ")))?;
-    check(&out, cwd, args)
-}
-
-/// Like `run` but doesn't error on non-zero exit. Returns (success, stdout, stderr).
-pub fn run_lenient(cwd: &Path, args: &[&str]) -> Result<(bool, String, String)> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .with_context(|| format!("spawning git -C {} {}", cwd.display(), args.join(" ")))?;
-    Ok((
-        out.status.success(),
-        String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        String::from_utf8_lossy(&out.stderr).trim().to_string(),
-    ))
+    cmd.output()
+        .with_context(|| format!("spawning git -C {} {}", cwd.display(), args.join(" ")))
 }
 
 fn check(out: &Output, cwd: &Path, args: &[&str]) -> Result<String> {
@@ -135,12 +128,6 @@ pub fn worktree_remove(source: &Path, slot: &Path) -> Result<(bool, String, Stri
 
 pub fn reset_hard(slot: &Path, commit: &str) -> Result<()> {
     run(slot, &["reset", "--hard", commit]).map(drop)
-}
-
-/// Clean untracked files but preserve our sidecar dir + the source repo's per-worktree gitdir.
-pub fn clean_untracked(slot: &Path) -> Result<()> {
-    // `-e .meta` excludes our pool-level meta if it ever leaked into a slot (defensive).
-    run(slot, &["clean", "-fd", "-e", ".meta"]).map(drop)
 }
 
 /// `git -C slot checkout -B <name>` (force-create branch at HEAD).

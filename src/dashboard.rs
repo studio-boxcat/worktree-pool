@@ -1,5 +1,5 @@
 //! `ls` and `inspect` rendering.
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
 
@@ -61,7 +61,7 @@ pub fn ls(pool_root: &Path, cfg: &PoolConfig, args: LsArgs) -> Result<()> {
     Ok(())
 }
 
-pub fn inspect(pool_root: &Path, _cfg: &PoolConfig, args: InspectArgs) -> Result<()> {
+pub fn inspect(pool_root: &Path, cfg: &PoolConfig, args: InspectArgs) -> Result<()> {
     let slot_path = pool_root.join(&args.name);
     if !slot_path.exists() {
         anyhow::bail!("no slot named '{}' in {}", args.name, pool_root.display());
@@ -97,11 +97,9 @@ pub fn inspect(pool_root: &Path, _cfg: &PoolConfig, args: InspectArgs) -> Result
     println!("## git status -sb\n{}", status);
     println!();
 
-    let (ok, log, _) = git::run_lenient(
-        &slot_path,
-        &["log", "--oneline", "-20", "origin/main..HEAD"],
-    )?;
-    println!("## git log --oneline -20 origin/main..HEAD");
+    let range = format!("{}..HEAD", cfg.default_commit);
+    let (ok, log, _) = git::run_lenient(&slot_path, &["log", "--oneline", "-20", &range])?;
+    println!("## git log --oneline -20 {range}");
     println!("{}", if ok && !log.is_empty() { log } else { "(none)".to_string() });
     Ok(())
 }
@@ -308,14 +306,3 @@ fn state_label(s: &State) -> &'static str {
     }
 }
 
-#[allow(dead_code)]
-fn _unused(_: &Path) -> Result<()> {
-    Ok(())
-}
-
-// Hide the leftover `Context` import pull-in.
-#[allow(dead_code)]
-fn _force_context_import(p: &Path) -> Result<()> {
-    std::fs::read_to_string(p).context("read")?;
-    Ok(())
-}

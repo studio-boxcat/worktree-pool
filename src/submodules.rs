@@ -33,22 +33,22 @@ pub fn parse_gitmodules(slot_dir: &Path) -> Result<Vec<SubmoduleEntry>> {
     parse_gitmodules_text(&raw)
 }
 
+/// Yield `(submodule_name, key, value)` for each `submodule.<name>.<key>=<value>` line.
+/// git lowercases keys on read regardless of source casing — so `worktreePoolTag`,
+/// `worktreepooltag`, and `WORKTREEPOOLTAG` all read as `worktreepooltag`.
+pub fn iter_keys(raw: &str) -> impl Iterator<Item = (&str, &str, &str)> {
+    raw.lines().filter(|l| !l.is_empty()).filter_map(|line| {
+        let rest = line.strip_prefix("submodule.")?;
+        let (sub_and_key, value) = rest.split_once('=')?;
+        let (name, key) = sub_and_key.rsplit_once('.')?;
+        Some((name, key, value))
+    })
+}
+
 fn parse_gitmodules_text(raw: &str) -> Result<Vec<SubmoduleEntry>> {
-    // Lines look like `submodule.<name>.<key>=<value>`.
-    // git lowercases keys on read regardless of source casing — so `worktreePoolTag` and
-    // `worktreepooltag` and any `WORKTREEPOOLTAG` all read as `worktreepooltag`.
     let mut by_name: HashMap<String, (Option<String>, Option<String>, Vec<String>)> =
         HashMap::new();
-    for line in raw.lines().filter(|l| !l.is_empty()) {
-        let Some(rest) = line.strip_prefix("submodule.") else {
-            continue;
-        };
-        let Some((sub_and_key, value)) = rest.split_once('=') else {
-            continue;
-        };
-        let Some((sub_name, key)) = sub_and_key.rsplit_once('.') else {
-            continue;
-        };
+    for (sub_name, key, value) in iter_keys(raw) {
         let entry = by_name.entry(sub_name.to_string()).or_default();
         match key {
             "path" => entry.0 = Some(value.to_string()),

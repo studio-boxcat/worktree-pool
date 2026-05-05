@@ -2,11 +2,11 @@
 //! writes the held-marker, renames the slot, creates a branch, runs submodule init.
 //! See README.md §Lifecycle for the spec.
 use anyhow::{Context, Result, bail};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::cli::AcquireArgs;
 use crate::config::PoolConfig;
-use crate::{cli, fs_paths, git, lock::Lock, mutex, slot, submodules};
+use crate::{fs_paths, git, lock::Lock, mutex, slot, submodules};
 
 pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> {
     let group = slot::resolve_group(cfg, args.group.as_deref())?;
@@ -178,6 +178,3 @@ fn cleanup_partial_worktree_add(source: &Path, slot: &Path) {
     let _ = std::fs::remove_dir_all(slot);
 }
 
-// Used by main.rs to decide whether `--exclude-submodule-tags` was actually present
-// on the command line (vs default-empty list).
-pub fn _suppress_unused_warnings(_: &cli::AcquireArgs, _: &mut PathBuf) {}

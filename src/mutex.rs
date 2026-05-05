@@ -90,14 +90,17 @@ impl InitMutex {
     }
 
     fn is_stale(path: &Path) -> Result<bool> {
-        let m = std::fs::metadata(path)
-            .with_context(|| format!("stat {}", path.display()))?;
-        let mtime = m.modified().with_context(|| "no mtime")?;
-        let age = SystemTime::now()
-            .duration_since(mtime)
-            .unwrap_or(Duration::ZERO);
-        Ok(age >= STALE_AFTER)
+        Ok(age_of(path)? >= STALE_AFTER)
     }
+}
+
+/// File mtime → age (`now - mtime`). Used for stale-mutex detection across the tool.
+pub fn age_of(path: &Path) -> Result<Duration> {
+    let m = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    let mtime = m.modified().with_context(|| "no mtime")?;
+    Ok(SystemTime::now()
+        .duration_since(mtime)
+        .unwrap_or(Duration::ZERO))
 }
 
 impl Drop for InitMutex {
