@@ -158,27 +158,39 @@ fn update_recursive(
     // processes lets the OS schedule everything fully concurrent.
     //
     // Two-phase to avoid `<source>/.git/config` lockfile contention:
-    //   1. Sequentially `git submodule init` each one — this writes
-    //      `submodule.<name>.url` to the parent's shared config under our URL rewrite.
-    //      Single-process, no lockfile contention.
-    //   2. In parallel, `git submodule update <path>` — this only READS the registered
-    //      url and writes per-submodule admin (independent files), so processes don't
-    //      contend on the same lockfile.
+    //   1. Sequentially write `submodule.<name>.url = <effective>` to the parent's
+    //      shared config via plain `git config` — much cheaper than `git submodule init`,
+    //      which spawns submodule--helper to do the same one write plus extra validation
+    //      work (~50ms vs ~5ms per submodule). For 17 submodules that's ~750ms vs ~85ms.
+    //      `submodule update <path>` doesn't need `submodule.<name>.active` when given
+    //      an explicit path, so we skip that key.
+    //   2. In parallel, `git submodule update <path>` — reads-only on parent config,
+    //      writes to its own admin dir / working tree, so processes don't fight for
+    //      the same lockfile.
     //
     // `protocol.file.allow=always` overrides git's post-CVE-2022-39253 default that
     // refuses `file:` (incl. plain local path) submodule clones — required for our
     // bare-mirror and git-modules modes.
     if !included.is_empty() {
-        // Phase 1: sequential `submodule init` with URL rewrites.
+        // Phase 1: sequential url registration.
         for e in &included {
-            let url_kv = rewrite_url(cfg, &e.name, &e.url, name_scope)
-                .map(|u| (format!("submodule.{}.url", e.name), u));
-            let mut overrides: Vec<(&str, &str)> = vec![("protocol.file.allow", "always")];
-            if let Some((k, v)) = url_kv.as_ref() {
-                overrides.push((k.as_str(), v.as_str()));
-            }
-            git::run_with_config(dir, &overrides, &["submodule", "init", &e.path])
-                .with_context(|| format!("submodule init {} in {}", e.path, dir.display()))?;
+            let effective_url = rewrite_url(cfg, &e.name, &e.url, name_scope)
+                .unwrap_or_else(|| e.url.clone());
+            git::run(
+                dir,
+                &[
+                    "config",
+                    &format!("submodule.{}.url", e.name),
+                    &effective_url,
+                ],
+            )
+            .with_context(|| {
+                format!(
+                    "writing submodule.{}.url in {}",
+                    e.name,
+                    dir.display()
+                )
+            })?;
         }
 
         // Phase 2: parallel `submodule update`. Each process reads-only from parent
