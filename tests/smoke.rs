@@ -460,6 +460,85 @@ fn stale_init_mutex_reclaimed_inline() {
     assert!(path.ends_with("/post-reclaim"));
 }
 
+/// Stale pool-wide mutex (planted with old mtime) must be reclaimed by the next
+/// acquire. Without auto-recovery a SIGKILL'd holder wedges every consumer of
+/// the pool until manual `rm <pool>/.meta/pool.lock`. The threshold is well above
+/// legitimate hold time so a real wedge surfaces inside a single retry loop.
+#[test]
+fn stale_pool_mutex_reclaimed_by_acquire() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    // Plant a stale pool mutex (mtime = 1 year ago).
+    let pool_lock = pool_root(&key).join(".meta/pool.lock");
+    std::fs::create_dir_all(pool_lock.parent().unwrap()).unwrap();
+    std::fs::write(&pool_lock, b"").unwrap();
+    let one_year_ago = SystemTime::now() - std::time::Duration::from_secs(365 * 86400);
+    std::fs::File::open(&pool_lock)
+        .unwrap()
+        .set_modified(one_year_ago)
+        .unwrap();
+
+    // Acquire should reclaim the stale pool mutex and proceed.
+    let out = Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", &key, "acquire", "--name", "after-wedge", "--group", "ios"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "acquire should reclaim stale pool mutex; got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("reclaiming stale pool mutex"),
+        "expected pool-mutex-reclaim warning; got: {stderr}"
+    );
+}
+
+/// `unstick --pool-mutex` force-clears the pool-wide mutex without waiting for
+/// the auto-reclaim threshold. The flag is intended for impatient operators —
+/// the test just confirms it removes the file when the flag is present and
+/// reports status (without removing) when not.
+#[test]
+fn unstick_pool_mutex_force_clear() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let pool_lock = pool_root(&key).join(".meta/pool.lock");
+    std::fs::create_dir_all(pool_lock.parent().unwrap()).unwrap();
+    std::fs::write(&pool_lock, b"").unwrap(); // fresh — would NOT auto-reclaim
+
+    // Without --pool-mutex: should report status and leave file in place.
+    let out = Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", &key, "unstick"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("pool mutex held"), "expected status line; got: {stdout}");
+    assert!(pool_lock.exists(), "pool mutex should NOT be removed without --pool-mutex");
+
+    // With --pool-mutex: file removed.
+    let out = Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", &key, "unstick", "--pool-mutex"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("force-cleared pool mutex"), "expected force-clear msg; got: {stdout}");
+    assert!(!pool_lock.exists(), "pool mutex should be removed with --pool-mutex");
+}
+
 /// Two parallel acquires with --unique-sha racing on the same SHA: at most one
 /// should succeed. (Currently the same-SHA scan is not pool-globally serialized,
 /// so this is best-effort; see TODO in README.)

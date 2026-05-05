@@ -7,6 +7,29 @@ use crate::config::PoolConfig;
 use crate::mutex;
 
 pub fn unstick(pool_root: &Path, _cfg: &PoolConfig, args: UnstickArgs) -> Result<()> {
+    // Pool-wide mutex: report status, force-clear if `--pool-mutex` was passed.
+    let pool_mutex_path = crate::fs_paths::pool_mutex(pool_root);
+    if pool_mutex_path.exists() {
+        let age = mutex::age_of(&pool_mutex_path).map(|d| d.as_secs()).unwrap_or(0);
+        if args.pool_mutex {
+            std::fs::remove_file(&pool_mutex_path)
+                .with_context(|| format!("rm {}", pool_mutex_path.display()))?;
+            println!(
+                "force-cleared pool mutex {} (age {}s)",
+                pool_mutex_path.display(),
+                age
+            );
+        } else {
+            println!(
+                "pool mutex held: {} (age {}s, stale-after {}s — auto-reclaim threshold; \
+                 pass --pool-mutex to force-clear)",
+                pool_mutex_path.display(),
+                age,
+                mutex::POOL_MUTEX_STALE_AFTER.as_secs()
+            );
+        }
+    }
+
     let init_dir = pool_root.join(".meta/init");
     if !init_dir.exists() {
         println!("no init mutexes present at {}", init_dir.display());

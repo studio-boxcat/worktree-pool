@@ -125,4 +125,12 @@ pub struct UnstickArgs {
     /// Specific slot id (e.g. `ios-2`). Without it, list all stale mutexes.
     #[arg(long)]
     pub slot: Option<String>,
+
+    /// Force-clear the pool-wide mutex (`<pool>/.meta/pool.lock`). Use only when
+    /// you're certain no legitimate acquire/release is in progress — an active
+    /// holder will lose its serialization guarantee and may corrupt slot state.
+    /// Stale holders (older than the pool-mutex threshold) are auto-reclaimed by
+    /// the next acquire/release; this flag is for impatient operators only.
+    #[arg(long)]
+    pub pool_mutex: bool,
 }

@@ -128,7 +128,18 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> 
     // Release pool-wide serialization before the (potentially minutes-long) submodule clone.
     drop(pool_mu);
 
-    submodules::update(&target_path, cfg, &args.exclude_submodule_tags)?;
+    // From here on, any Err leaves the slot held under user-name (lock + dir
+    // both visible). Caller must `release --name <name>` to recover. The
+    // explicit context message in the wrapper steers operators toward that
+    // recovery instead of leaving them to discover the stuck state by hand.
+    submodules::update(&target_path, cfg, &args.exclude_submodule_tags).with_context(|| {
+        format!(
+            "submodule update failed for slot '{}'; the slot is left HELD with partial state. \
+             Recover: `worktree-pool --pool <key> release --name {}` (the lock + working tree \
+             persist to allow inspection first; release un-renames the slot back to canonical N).",
+            args.name, args.name
+        )
+    })?;
 
     println!("{}", target_path.display());
     Ok(())

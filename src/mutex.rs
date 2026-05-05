@@ -115,11 +115,16 @@ impl Drop for InitMutex {
 }
 
 /// Pool-wide mutex. Held during slot-allocation critical sections in both `acquire`
-/// (same-SHA scan + slot-pick + lock-write) and `release` (pick-target + un-rename).
-/// Created via `O_EXCL`; busy-wait up to 60s then bail.
+/// (same-SHA scan + slot-pick + lock-write + rename) and `release` (pick-target +
+/// un-rename). Created via `O_EXCL`; busy-wait with stale-recovery.
 pub struct PoolMutex {
     path: PathBuf,
 }
+
+/// Pool mutex stale threshold. Legitimate hold is sub-second to a few seconds
+/// (scan + worktree_add/reset_hard + lock.write + worktree_rename). Anything older
+/// than this is a SIGKILL'd holder leftover and gets reclaimed.
+pub const POOL_MUTEX_STALE_AFTER: Duration = Duration::from_secs(120);
 
 impl PoolMutex {
     pub fn acquire(path: PathBuf) -> Result<Self> {
@@ -134,9 +139,33 @@ impl PoolMutex {
             match InitMutex::create_excl(&path) {
                 Ok(()) => return Ok(Self { path }),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Self-reclaim a stale (likely SIGKILL'd) holder. Without this,
+                    // any crash inside the held window wedges every consumer of the
+                    // pool until manual `rm <pool>/.meta/pool.lock`. The threshold
+                    // is well above legitimate hold time (scan + rename = ~2s tops)
+                    // and well below the busy-wait timeout, so a real wedge surfaces
+                    // automatically without operator intervention.
+                    if let Ok(age) = age_of(&path)
+                        && age >= POOL_MUTEX_STALE_AFTER
+                    {
+                        eprintln!(
+                            "warn: reclaiming stale pool mutex {} (age {}s, threshold {}s) — \
+                             prior holder likely crashed",
+                            path.display(),
+                            age.as_secs(),
+                            POOL_MUTEX_STALE_AFTER.as_secs()
+                        );
+                        std::fs::remove_file(&path).ok();
+                        // Loop iterates and tries to create_excl again.
+                        continue;
+                    }
                     if waited >= max_wait {
                         bail!(
-                            "pool mutex held >60s at {}; another acquire/release stuck (try `unstick`)",
+                            "pool mutex held >60s at {}; another acquire/release in progress \
+                             (legitimate cold submodule clone) or stale holder under threshold. \
+                             Inspect with `worktree-pool --pool <key> ls`. Force-clear with \
+                             `worktree-pool --pool <key> unstick --pool-mutex` if you're sure \
+                             no legitimate holder is running.",
                             path.display()
                         );
                     }
