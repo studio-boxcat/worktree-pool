@@ -10,7 +10,7 @@ A recyclable pool of `git worktree` checkouts with named lifecycle, branch creat
 
 A **pool** is a fixed-cardinality set of slots backed by a single source repo. Slots are interchangeable git worktrees; each `acquire` picks an idle slot, renames it to the caller's name, creates a branch, and hands back the path. `release` un-renames it back to the idle namespace and deletes the branch. Caches inside the slot dir survive recycling.
 
-Pools are referenced by **key** (e.g. `meow-tower`, `nonogram-farm`). Path is fixed: `~/.worktree-pool/<key>/`. For pools needing a different physical location (external SSD, etc.), symlink: `ln -s /Volumes/big/meow-tower ~/.worktree-pool/meow-tower`.
+Pools are referenced by **key** (e.g. `myapp`, `another-pool`). Path is fixed: `~/.worktree-pool/<key>/`. For pools needing a different physical location (external SSD, etc.), symlink: `ln -s /Volumes/big/myapp ~/.worktree-pool/myapp`.
 
 A **group** is an optional sub-namespace of slots (e.g. `ios`, `android`). With groups, idle slots are named `{group}-{N}`; without, just `slot-{N}`. Groups exist mainly for active-platform separation (e.g. Unity rebuilding `Library/` on iOS↔Android flip).
 
@@ -20,25 +20,25 @@ A **group** is an optional sub-namespace of slots (e.g. `ios`, `android`). With 
 
 ```sh
 # Initialize a pool
-worktree-pool --pool meow-tower init \
-  --source /Users/foo/Develop/meow-tower \
+worktree-pool --pool myapp init \
+  --source ~/Develop/myapp \
   --max-slots 16 \
   --groups ios,android
 
 # Acquire a slot at a specific commit
-worktree-pool --pool meow-tower acquire --name abc12345 --commit abc12345 --group ios
+worktree-pool --pool myapp acquire --name abc12345 --commit abc12345 --group ios
 # → prints worktree path on stdout
 
 # Acquire a dev session at origin/main (default)
-worktree-pool --pool meow-tower acquire --name langpack-refactor --group ios
+worktree-pool --pool myapp acquire --name feature-x --group ios
 
 # Release
-worktree-pool --pool meow-tower release --name abc12345
+worktree-pool --pool myapp release --name abc12345
 
 # Inspect
-worktree-pool --pool meow-tower ls
-worktree-pool --pool meow-tower ls --git-status     # adds dirty/untracked/ahead columns
-worktree-pool --pool meow-tower inspect --name abc12345
+worktree-pool --pool myapp ls
+worktree-pool --pool myapp ls --git-status     # adds dirty/untracked/ahead columns
+worktree-pool --pool myapp inspect --name abc12345
 ```
 
 ---
@@ -77,12 +77,12 @@ group: ios                         # only if pool has groups configured
 
 ```yaml
 schema_version: 1
-source: /Users/foo/Develop/meow-tower
+source: ~/Develop/myapp
 default_commit: refs/remotes/origin/main      # used when --commit omitted
 max_slots: 16
 groups: [ios, android]                         # optional; absent → slots named slot-{N}
 submodule_mirror_mode: git-modules             # bare-mirror | git-modules; optional
-submodule_mirror_base: /Users/foo/Develop/meow-tower
+submodule_mirror_base: ~/Develop/myapp
 ```
 
 `source` is the absolute path to the source git repo (bare or working clone). `submodule_mirror_*` rewrites submodule URLs to local mirrors at acquire time (avoids GitHub fetch); both bare-mirror (`<base>/<orgRepo>.git`) and git-modules (`<source>/.git/modules/<composedName>`) modes supported. Omit if submodules use their declared URLs.
@@ -153,7 +153,7 @@ ios-0  held   abc12345          ios    2h
 ios-1  held   feature-x         ios    3d
 ...
 
-Release one with: worktree-pool --pool meow-tower release --name <n>
+Release one with: worktree-pool --pool myapp release --name <n>
 ```
 
 There is no GC. The operator releases manually based on the table.
@@ -176,10 +176,10 @@ Example:
 
 ```sh
 # CI build skips editor-only modules
-worktree-pool --pool meow-tower acquire --name abc12345 --commit abc12345 --group ios --exclude-submodule-tags editor
+worktree-pool --pool myapp acquire --name abc12345 --commit abc12345 --group ios --exclude-submodule-tags editor
 
 # Dev session includes them
-worktree-pool --pool meow-tower acquire --name langpack-refactor --group ios
+worktree-pool --pool myapp acquire --name feature-x --group ios
 ```
 
 `worktree-pool --pool <key> validate-gitmodules` parses `.gitmodules` and warns on unknown `worktreePool*` keys (catches typos like `worktreePoolTags` plural).
@@ -226,13 +226,13 @@ The classifier always exits 0 so `wt-go`'s exit trap doesn't muddy the user's sh
 Per-consumer integration is a thin `just` recipe pre-filling the pool key:
 
 ```bash
-# meow-tower's justfile (just wt-go <name>)
+# myapp's justfile (just wt-go <name>)
 wt-go name *flags:
-    @worktree-pool-session go meow-tower {{quote(name)}} {{flags}}
+    @worktree-pool-session go myapp {{quote(name)}} {{flags}}
 wt-rm name:
-    @worktree-pool-session rm meow-tower {{quote(name)}}
+    @worktree-pool-session rm myapp {{quote(name)}}
 wt-cleanup name:
-    @worktree-pool-session cleanup meow-tower {{quote(name)}}
+    @worktree-pool-session cleanup myapp {{quote(name)}}
 ```
 
 ---
@@ -242,15 +242,15 @@ wt-cleanup name:
 Each consumer wraps the tool with a thin recipe that absorbs the `--pool` flag:
 
 ```bash
-# meow-toolbox/justfile
+# myapp-ci/justfile
 client-repo-pool *args:
-    worktree-pool --pool meow-tower {{args}}
+    worktree-pool --pool myapp {{args}}
 ```
 
 ```bash
-# nonogram-farm/justfile
+# another-pool/justfile
 pool *args:
-    worktree-pool --pool nonogram-farm {{args}}
+    worktree-pool --pool another-pool {{args}}
 ```
 
 Recipes are host-agnostic — pool keys map to fixed paths under `~/.worktree-pool/<key>/`, so the same recipe runs on both server and laptop.

@@ -114,9 +114,9 @@ Cleanup classifier (always exits 0 — it's an exit-trap target):
 Pool key is the first positional → project-agnostic. Each consumer wraps via a thin `just` recipe pre-filling the key:
 
 ```bash
-# meow-tower's justfile (just wt-go <name>)
+# myapp's justfile (just wt-go <name>)
 wt-go name *flags:
-    @worktree-pool-session go meow-tower {{quote(name)}} {{flags}}
+    @worktree-pool-session go myapp {{quote(name)}} {{flags}}
 ```
 
 Generic; same shape works for any pool.
@@ -137,17 +137,17 @@ Slots share `.git/` and `.git/modules/` with the source repo, but **not** the wo
 Each consumer wraps the pool with thin recipes pre-filling the pool key. `worktree-pool-session` is project-agnostic; pool config (source path, mirror mode) lives in `<pool>/.meta/config.yaml` written once by `init`.
 
 ```bash
-# Consumer's justfile, e.g. meow-tower
+# Consumer's justfile, e.g. myapp
 wt-go name *flags:
-    @worktree-pool-session go meow-tower {{quote(name)}} {{flags}}
+    @worktree-pool-session go myapp {{quote(name)}} {{flags}}
 wt-rm name:
-    @worktree-pool-session rm meow-tower {{quote(name)}}
+    @worktree-pool-session rm myapp {{quote(name)}}
 wt-cleanup name:
-    @worktree-pool-session cleanup meow-tower {{quote(name)}}
+    @worktree-pool-session cleanup myapp {{quote(name)}}
 wt-ls:
-    @worktree-pool --pool meow-tower ls
+    @worktree-pool --pool myapp ls
 wt-info name:
-    @worktree-pool --pool meow-tower inspect --name {{quote(name)}}
+    @worktree-pool --pool myapp inspect --name {{quote(name)}}
 ```
 
 Per-host `init` runs once per pool key. Source path differs by host (build server's bare mirror vs laptop's working clone); pool config carries the host-specific values.
