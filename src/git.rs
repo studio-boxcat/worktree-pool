@@ -231,9 +231,18 @@ pub fn reset_hard(slot: &Path, commit: &str) -> Result<()> {
     run(slot, &["reset", "--hard", commit]).map(drop)
 }
 
-/// `git -C slot checkout -B <name>` (force-create branch at HEAD).
+/// Force-create `<name>` at HEAD and attach HEAD to it. Tree-touchless.
+///
+/// Why not `git checkout -B <name>`? Even though HEAD is already at the right
+/// tree (we just `worktree add`'d it), `checkout` walks the entire index and
+/// queries every file through registered filters (`filter.lfs.process`,
+/// `filter-process` stdio per file). For meow-tower's 45K files that's ~600ms
+/// of pure no-op filter pings. `update-ref` + `symbolic-ref` does the actual
+/// state change (branch ref + HEAD attach) in ~12ms without touching files.
 pub fn checkout_force_branch(slot: &Path, name: &str) -> Result<()> {
-    run(slot, &["checkout", "-B", name]).map(drop)
+    let ref_path = format!("refs/heads/{name}");
+    run(slot, &["update-ref", &ref_path, "HEAD"])?;
+    run(slot, &["symbolic-ref", "HEAD", &ref_path]).map(drop)
 }
 
 /// Detach HEAD (so we can delete the current branch).
