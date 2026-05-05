@@ -213,7 +213,15 @@ worktree-pool-session cleanup <pool-key> <name>     # 🟢/🟡/🔴 exit-trap c
 worktree-pool-session rm      <pool-key> <name>     # safety-checked release
 ```
 
-`go` acquires/resumes a slot, prints a banner, `cd`s into the slot, runs `$WORKTREE_POOL_SESSION_CMD` (default `ai`) in `$SHELL`, and traps `cleanup` on exit. `cleanup` is the 🟢 (clean+merged → recycle) / 🟡 (dirty/untracked → keep) / 🔴 (unmerged → loud refuse) classifier. `rm` is the manual safety-checked release.
+`go` acquires/resumes a slot, prints a banner, `cd`s into the slot, runs `$WORKTREE_POOL_SESSION_CMD` (default `ai`) in `$SHELL`, and traps `cleanup` on exit. `rm` is the manual safety-checked release. `cleanup` classifies the slot's state on exit and either recycles or leaves it personalized:
+
+| Marker | Condition | Action |
+|---|---|---|
+| 🟢 | working tree clean AND 0 commits ahead `origin/main` | un-rename + delete branch + release (auto-recycle) |
+| 🟡 | dirty / untracked files | leave personalized — resume with `session go` later |
+| 🔴 | non-zero commits ahead `origin/main` (unmerged) | loud refuse — operator resolves via `git push` / `branch -D` / merge-back-to-main |
+
+The classifier always exits 0 so `wt-go`'s exit trap doesn't muddy the user's shell exit status. Re-running `session go <key> <name>` resumes any 🟡 / 🔴 slot.
 
 Per-consumer integration is a thin `just` recipe pre-filling the pool key:
 
