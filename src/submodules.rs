@@ -153,38 +153,50 @@ fn update_recursive(
 
     // Init each included submodule via its OWN git process, in parallel. The classic
     // batched form (`git submodule update --init <p1> <p2>...`) parallelizes fetch via
-    // `submodule.fetchJobs` but the parent process still serializes the per-submodule
-    // overhead (.git/modules registration, checkout dispatch, ref recording). Running N
-    // sibling processes lets the OS schedule everything — fetch, index, checkout — fully
-    // concurrent. For meow-tower's 17 top-level submodules from local bare mirrors this
-    // is the dominant wall-clock win on cold acquire.
+    // `submodule.fetchJobs` but the parent process still serializes per-submodule
+    // overhead (checkout dispatch, ref recording, LFS smudge). Running N sibling
+    // processes lets the OS schedule everything fully concurrent.
     //
-    // Each per-submodule call needs its own `-c submodule.<name>.url=<rewritten>` override.
-    // `protocol.file.allow=always` overrides git's post-CVE-2022-39253 default that refuses
-    // `file:` (incl. plain local path) submodule clones — required for our bare-mirror
-    // and git-modules modes.
+    // Two-phase to avoid `<source>/.git/config` lockfile contention:
+    //   1. Sequentially `git submodule init` each one — this writes
+    //      `submodule.<name>.url` to the parent's shared config under our URL rewrite.
+    //      Single-process, no lockfile contention.
+    //   2. In parallel, `git submodule update <path>` — this only READS the registered
+    //      url and writes per-submodule admin (independent files), so processes don't
+    //      contend on the same lockfile.
+    //
+    // `protocol.file.allow=always` overrides git's post-CVE-2022-39253 default that
+    // refuses `file:` (incl. plain local path) submodule clones — required for our
+    // bare-mirror and git-modules modes.
     if !included.is_empty() {
+        // Phase 1: sequential `submodule init` with URL rewrites.
+        for e in &included {
+            let url_kv = rewrite_url(cfg, &e.name, &e.url, name_scope)
+                .map(|u| (format!("submodule.{}.url", e.name), u));
+            let mut overrides: Vec<(&str, &str)> = vec![("protocol.file.allow", "always")];
+            if let Some((k, v)) = url_kv.as_ref() {
+                overrides.push((k.as_str(), v.as_str()));
+            }
+            git::run_with_config(dir, &overrides, &["submodule", "init", &e.path])
+                .with_context(|| format!("submodule init {} in {}", e.path, dir.display()))?;
+        }
+
+        // Phase 2: parallel `submodule update`. Each process reads-only from parent
+        // config and writes to its own admin dir / working tree, so they don't fight
+        // for the same lockfile.
         std::thread::scope(|scope| -> Result<()> {
             let handles: Vec<_> = included
                 .iter()
                 .map(|e| {
-                    let url = rewrite_url(cfg, &e.name, &e.url, name_scope);
                     scope.spawn(move || -> Result<()> {
-                        let url_kv =
-                            url.map(|u| (format!("submodule.{}.url", e.name), u));
-                        let mut overrides: Vec<(&str, &str)> =
-                            vec![("protocol.file.allow", "always")];
-                        if let Some((k, v)) = url_kv.as_ref() {
-                            overrides.push((k.as_str(), v.as_str()));
-                        }
                         git::run_with_config(
                             dir,
-                            &overrides,
-                            &["submodule", "update", "--init", &e.path],
+                            &[("protocol.file.allow", "always")],
+                            &["submodule", "update", &e.path],
                         )
                         .map(drop)
                         .with_context(|| {
-                            format!("submodule update --init {} in {}", e.path, dir.display())
+                            format!("submodule update {} in {}", e.path, dir.display())
                         })
                     })
                 })

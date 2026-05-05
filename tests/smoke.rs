@@ -653,3 +653,107 @@ fn acquire_release_with_submodule_rewires_pointers() {
     assert!(slot2.join("sub/FILE").exists());
 }
 
+/// Make a bare repo whose tip commit registers `n` independent submodules.
+/// Each submodule is a tiny standalone bare. Returns the parent bare.
+fn make_fixture_with_n_submodules(dir: &Path, n: usize) -> PathBuf {
+    // Build N tiny submodule bares.
+    let mut sub_bares = Vec::new();
+    for i in 0..n {
+        let sub_bare = dir.join(format!("sub{i}.git"));
+        run_git_root(&["init", "--quiet", "--bare", &sub_bare.display().to_string()]);
+        let sub_staging = dir.join(format!("sub{i}-staging"));
+        run_git_root(&[
+            "clone",
+            "--quiet",
+            &sub_bare.display().to_string(),
+            &sub_staging.display().to_string(),
+        ]);
+        run_git(&sub_staging, &["config", "user.email", "t@t"]);
+        run_git(&sub_staging, &["config", "user.name", "t"]);
+        std::fs::write(sub_staging.join("FILE"), format!("sub{i}-content").as_bytes()).unwrap();
+        run_git(&sub_staging, &["add", "FILE"]);
+        run_git(&sub_staging, &["commit", "--quiet", "-m", "init"]);
+        run_git(&sub_staging, &["push", "--quiet", "-u", "origin", "main"]);
+        sub_bares.push(sub_bare);
+    }
+
+    // Parent source with N submodules.
+    let bare = dir.join("source.git");
+    run_git_root(&["init", "--quiet", "--bare", &bare.display().to_string()]);
+    let staging = dir.join("staging");
+    run_git_root(&[
+        "clone",
+        "--quiet",
+        &bare.display().to_string(),
+        &staging.display().to_string(),
+    ]);
+    run_git(&staging, &["config", "user.email", "t@t"]);
+    run_git(&staging, &["config", "user.name", "t"]);
+    std::fs::write(staging.join("README"), b"hi").unwrap();
+    run_git(&staging, &["add", "README"]);
+    for (i, sub_bare) in sub_bares.iter().enumerate() {
+        run_git(
+            &staging,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "--quiet",
+                &sub_bare.display().to_string(),
+                &format!("sub{i}"),
+            ],
+        );
+    }
+    run_git(&staging, &["commit", "--quiet", "-m", "with submodules"]);
+    run_git(&staging, &["push", "--quiet", "-u", "origin", "main"]);
+    bare
+}
+
+/// Regression for the parallel submodule init path (`std::thread::scope` over N
+/// per-submodule git processes in `submodules::update`). With N siblings competing
+/// for the parent's `.git/config` lock, the per-submodule URL rewrite must still
+/// land correctly for each submodule. Verifies all N submodules are present and
+/// their content matches expectations after a fresh acquire.
+#[test]
+fn parallel_submodule_init_acquires_all() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    const N: usize = 6;
+    let bare = make_fixture_with_n_submodules(tmp.path(), N);
+    init_pool(&key, &bare);
+
+    let out = Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", &key, "acquire", "--name", "many", "--group", "ios"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "acquire failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let slot = pool_root(&key).join("many");
+
+    // All N submodules materialized with the right content.
+    for i in 0..N {
+        let file = slot.join(format!("sub{i}/FILE"));
+        assert!(file.exists(), "missing submodule sub{i}: {}", file.display());
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(content, format!("sub{i}-content"));
+    }
+
+    // Sanity: git status in slot succeeds (all submodule core.worktree pointers ok).
+    let st = StdCommand::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&slot)
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "git status failed: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+}
+
