@@ -1,0 +1,25 @@
+[package]
+name = "worktree-pool"
+version = "0.1.0"
+edition = "2024"
+description = "Recyclable git worktree pool with named lifecycle, branch creation, and same-SHA exclusion"
+license = "MIT"
+repository = "https://github.com/studio-boxcat/worktree-pool"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+gethostname = "1"
+nix = { version = "0.29", default-features = false, features = ["signal"] }
+tempfile = "3"
+
+[dev-dependencies]
+assert_cmd = "2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
