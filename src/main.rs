@@ -12,6 +12,7 @@ mod lock;
 mod mutex;
 mod release;
 mod slot;
+mod submodules;
 mod yaml;
 
 use anyhow::{Context, Result, anyhow, bail};

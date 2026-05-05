@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::AcquireArgs;
 use crate::config::PoolConfig;
-use crate::{cli, fs_paths, git, lock::Lock, mutex, slot};
+use crate::{cli, fs_paths, git, lock::Lock, mutex, slot, submodules};
 
 pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> {
     let group = slot::resolve_group(cfg, args.group.as_deref())?;
@@ -16,8 +16,18 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> 
         .unwrap_or(cfg.default_commit.as_str());
     let full_sha = git::resolve_full_sha(&cfg.source, commitish)?;
 
-    // Same-SHA exclusion is opt-in — only fires for callers that pass --unique-sha.
-    // Dev sessions branching off `main` shouldn't refuse just because a build is at the same SHA.
+    // The "pick a slot + write the lock" critical section needs pool-wide serialization,
+    // otherwise:
+    //   (a) two parallel `--unique-sha` acquires for the same SHA both pass the scan
+    //       and both write locks (race);
+    //   (b) parallel acquires can both pick the same canonical N before either writes
+    //       a lock to claim it.
+    // Per-slot init mutex doesn't cover (b) since the slot-pick happens before mutex
+    // acquisition. Use the pool-wide mutex for scan + pick + lock-write; release it
+    // before the slow ops (`worktree add`, submodule init) that only need the per-slot mutex.
+    let pool_mu = mutex::PoolMutex::acquire(fs_paths::pool_mutex(pool_root))
+        .context("acquiring pool-wide mutex for slot allocation")?;
+
     if args.unique_sha
         && let Some(holder) = find_same_sha_holder(pool_root, cfg, &full_sha)?
     {
@@ -31,27 +41,51 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> 
         );
     }
 
-    // Pick an idle slot in the requested group.
+    // Capacity gate. Renamed slots hide their home N (no `slot_id` in lock) so we
+    // can't infer budget from canonical-dir presence alone — count held-in-group locks.
+    let held_in_group = slot::count_held_in_group(pool_root, cfg, group)?;
+    if held_in_group >= cfg.max_slots as usize {
+        let entries = slot::enumerate(pool_root, cfg)?;
+        print_capacity_error(pool_root, cfg, group, &entries)?;
+        bail!(
+            "all {} {} slots are held",
+            cfg.max_slots,
+            group.unwrap_or("(no group)")
+        );
+    }
+
+    // Iterate acquirable Ns (fresh + recycled-idle), try the init mutex on each.
     let entries = slot::enumerate(pool_root, cfg)?;
-    let held_canonical = entries
+    let renamed_held: Vec<String> = entries
         .iter()
         .filter(|e| matches!(e.kind, slot::SlotEntryKind::Renamed))
         .map(|e| e.name.clone())
-        .collect::<Vec<_>>();
-    let n = match slot::smallest_free_n(pool_root, group, cfg.max_slots, &held_canonical) {
-        Ok(n) => n,
-        Err(e) => {
-            print_capacity_error(pool_root, cfg, group, &entries)?;
-            return Err(e);
+        .collect();
+    let candidates = slot::acquirable_ns(pool_root, group, cfg.max_slots, &renamed_held)?;
+
+    let mut acquired_mutex: Option<(String, mutex::InitMutex)> = None;
+    for n in candidates {
+        let id = slot::canonical_id(group, n);
+        let mutex_path = fs_paths::init_mutex(pool_root, &id);
+        match mutex::InitMutex::try_acquire(mutex_path)? {
+            Some(m) => {
+                acquired_mutex = Some((id, m));
+                break;
+            }
+            None => continue,
         }
-    };
-    let slot_id = slot::canonical_id(group, n);
+    }
+    let (slot_id, _mutex) = acquired_mutex.ok_or_else(|| {
+        anyhow::anyhow!(
+            "all candidate slots have init mutexes held by other acquires; \
+             run `worktree-pool --pool <key> unstick` to clear stale ones"
+        )
+    })?;
     let canonical_path = pool_root.join(&slot_id);
 
-    // Per-slot init mutex (heartbeat-stamped).
-    let init_mutex_path = fs_paths::init_mutex(pool_root, &slot_id);
-    let _mutex = mutex::InitMutex::try_acquire(init_mutex_path)?
-        .ok_or_else(|| anyhow::anyhow!("init mutex contended for {slot_id}; another acquire is in flight (try again or run `unstick --slot {slot_id}`)"))?;
+    // Note: we keep the pool mutex through lock-write (below) but drop it before the slow
+    // submodule init. That's why this whole block stays under `pool_mu`'s scope.
+    let _ = &pool_mu;
 
     // Materialize the slot at full_sha. Fresh slot → `worktree add`; recycled → `reset --hard` + clean.
     let is_fresh = !canonical_path.join(".git").exists();
@@ -62,8 +96,10 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> 
             return Err(e);
         }
     } else {
+        // Recycled slot: just `reset --hard`. Don't `git clean` — untracked files
+        // in this slot are caller's warmth (Unity Library/, node_modules/, build outputs)
+        // which the pool exists to preserve. The build system invalidates its own caches.
         git::reset_hard(&canonical_path, &full_sha)?;
-        git::clean_untracked(&canonical_path)?;
     }
 
     // Resolve the worktree's gitdir. Stable across `git worktree move`.
@@ -83,10 +119,7 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> 
         .with_context(|| format!("moving {} → {}", canonical_path.display(), target_path.display()))?;
     git::checkout_force_branch(&target_path, &args.name)?;
 
-    // TODO(submodules): apply --exclude-submodule-tags + URL overrides per pool config.
-    // For v0.1 we run plain `submodule update --init` to validate the basic flow.
-    let _ = git::run(&target_path, &["submodule", "update", "--init", "--recursive"]);
-    let _ = &args.exclude_submodule_tags;
+    submodules::update(&target_path, cfg, &args.exclude_submodule_tags)?;
 
     println!("{}", target_path.display());
     Ok(())

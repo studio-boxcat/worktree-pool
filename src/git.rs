@@ -59,6 +59,19 @@ fn check(out: &Output, cwd: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// `git -C dir config --file <file> --list`. Returns the raw key=value lines.
+pub fn config_file_list(cwd: &Path, file: &Path) -> Result<String> {
+    run(
+        cwd,
+        &[
+            "config",
+            "--file",
+            &file.display().to_string(),
+            "--list",
+        ],
+    )
+}
+
 /// Resolve a commit-ish to its full 40-char SHA against `source`.
 pub fn resolve_full_sha(source: &Path, commitish: &str) -> Result<String> {
     let arg = format!("{commitish}^{{commit}}");

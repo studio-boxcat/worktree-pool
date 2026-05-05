@@ -17,9 +17,10 @@ pub fn init_mutex(pool_root: &Path, slot_id: &str) -> PathBuf {
     pool_root.join(".meta/init").join(format!("{slot_id}.lock"))
 }
 
-/// Pool-wide release mutex: `<pool>/.meta/release.lock`.
-pub fn release_mutex(pool_root: &Path) -> PathBuf {
-    pool_root.join(".meta/release.lock")
+/// Pool-wide mutex serializing the slot-allocation critical sections (acquire's
+/// scan-and-pick window AND release's pick-target window): `<pool>/.meta/pool.lock`.
+pub fn pool_mutex(pool_root: &Path) -> PathBuf {
+    pool_root.join(".meta/pool.lock")
 }
 
 /// Lock file inside the source repo's per-worktree gitdir.

@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
 use crate::config::PoolConfig;
+use crate::{fs_paths, git};
 
 /// Canonical idle slot id: `{group}-{N}` when grouped, else `slot-{N}`.
 pub fn canonical_id(group: Option<&str>, n: u32) -> String {
@@ -47,10 +48,8 @@ pub fn resolve_group<'a>(cfg: &'a PoolConfig, requested: Option<&str>) -> Result
 
 /// Find the smallest N in `0..max_slots` such that `<pool>/{canonical_id(group, N)}`
 /// does not exist on disk and is not used as the current name of any held slot.
-///
-/// `held_names` is the set of currently-held slot dir names (not their canonical ids).
-/// We don't need to know each held slot's home id — N is just a free integer in the namespace,
-/// and any free integer works (slots are interchangeable).
+/// Used by `release` to pick the un-rename target; doesn't consider lock state because
+/// release-mutex serializes the call.
 pub fn smallest_free_n(
     pool_root: &Path,
     group: Option<&str>,
@@ -66,8 +65,75 @@ pub fn smallest_free_n(
             return Ok(n);
         }
     }
-    bail!("no free slot in {}/{:?}: all {max_slots} are in use",
-        pool_root.display(), group)
+    bail!(
+        "no free slot in {}/{:?}: all {max_slots} are in use",
+        pool_root.display(),
+        group
+    )
+}
+
+/// Iterator-friendly enumeration of canonical slot Ns that are currently *acquirable*:
+/// either `<pool>/{canonical_id(group, N)}` doesn't exist (fresh) OR it exists but has no
+/// held-marker at its gitdir (recycled idle). Skips Ns whose canonical name is currently
+/// used by a renamed (held) slot — name collision avoidance for `acquire --name {group}-N`.
+///
+/// Acquire iterates this in order and tries the init mutex on each; the first mutex it
+/// successfully creates is its slot. Lets two parallel acquires fall through to different
+/// Ns without the spurious "mutex contended" error.
+pub fn acquirable_ns(
+    pool_root: &Path,
+    group: Option<&str>,
+    max_slots: u32,
+    renamed_held: &[String],
+) -> Result<Vec<u32>> {
+    let mut out = Vec::new();
+    for n in 0..max_slots {
+        let id = canonical_id(group, n);
+        if renamed_held.iter().any(|h| h == &id) {
+            continue;
+        }
+        let p = pool_root.join(&id);
+        if !p.exists() {
+            out.push(n); // fresh — will `worktree add`
+            continue;
+        }
+        // Dir exists. Held iff there's a lock at the worktree's gitdir; idle otherwise.
+        let held = match git::worktree_gitdir(&p) {
+            Ok(gd) => fs_paths::slot_lock(&gd).exists(),
+            Err(_) => true, // can't resolve gitdir → treat as held (don't stomp)
+        };
+        if !held {
+            out.push(n); // recycled idle — will `reset --hard`
+        }
+    }
+    Ok(out)
+}
+
+/// Count held slots whose lock's `group` matches `requested_group`. Renamed slots
+/// hide their home N, so this is the only way to budget-check parallel acquires
+/// against `max_slots` (without `slot_id` in the lock).
+pub fn count_held_in_group(
+    pool_root: &Path,
+    cfg: &PoolConfig,
+    requested_group: Option<&str>,
+) -> Result<usize> {
+    let mut count = 0;
+    for entry in enumerate(pool_root, cfg)? {
+        let Ok(gitdir) = git::worktree_gitdir(&entry.path) else {
+            continue;
+        };
+        let lock_path = fs_paths::slot_lock(&gitdir);
+        if !lock_path.exists() {
+            continue;
+        }
+        let Ok(lock) = crate::lock::Lock::read(&lock_path) else {
+            continue;
+        };
+        if lock.group.as_deref() == requested_group {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 /// Enumerate top-level entries of the pool dir, partitioned by whether they look

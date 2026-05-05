@@ -111,14 +111,14 @@ impl Drop for InitMutex {
     }
 }
 
-/// Pool-wide release mutex. Held across the find-smallest-free-N + rename window.
-/// Created via `O_EXCL`; if it already exists, we busy-wait briefly then bail (releases
-/// are short — the wait shouldn't be long).
-pub struct ReleaseMutex {
+/// Pool-wide mutex. Held during slot-allocation critical sections in both `acquire`
+/// (same-SHA scan + slot-pick + lock-write) and `release` (pick-target + un-rename).
+/// Created via `O_EXCL`; busy-wait up to 60s then bail.
+pub struct PoolMutex {
     path: PathBuf,
 }
 
-impl ReleaseMutex {
+impl PoolMutex {
     pub fn acquire(path: PathBuf) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -133,7 +133,7 @@ impl ReleaseMutex {
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     if waited >= max_wait {
                         bail!(
-                            "release mutex held >60s at {}; try `worktree-pool unstick`",
+                            "pool mutex held >60s at {}; another acquire/release stuck (try `unstick`)",
                             path.display()
                         );
                     }
@@ -141,14 +141,14 @@ impl ReleaseMutex {
                     waited += step;
                 }
                 Err(e) => {
-                    return Err(e).context(format!("creating release mutex {}", path.display()));
+                    return Err(e).context(format!("creating pool mutex {}", path.display()));
                 }
             }
         }
     }
 }
 
-impl Drop for ReleaseMutex {
+impl Drop for PoolMutex {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }

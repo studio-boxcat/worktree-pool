@@ -9,9 +9,9 @@ use crate::config::PoolConfig;
 use crate::{fs_paths, git, lock::Lock, mutex, slot};
 
 pub fn run(pool_root: &Path, cfg: &PoolConfig, args: ReleaseArgs) -> Result<()> {
-    // Pool-wide release mutex serializes the find-smallest-free-N + rename window.
-    let _release_mu = mutex::ReleaseMutex::acquire(fs_paths::release_mutex(pool_root))
-        .context("acquiring release mutex")?;
+    // Pool-wide mutex serializes the find-smallest-free-N + rename window.
+    let _pool_mu = mutex::PoolMutex::acquire(fs_paths::pool_mutex(pool_root))
+        .context("acquiring pool mutex for release")?;
 
     let slot_path = pool_root.join(&args.name);
     if !slot_path.exists() {
