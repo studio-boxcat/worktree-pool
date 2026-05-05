@@ -496,3 +496,160 @@ fn parallel_unique_sha_at_most_one_succeeds() {
          (Note: the scan is not pool-globally serialized; this can fail intermittently.)"
     );
 }
+
+// ---------- submodule rename regression ----------
+
+/// Make a bare repo whose tip commit registers a submodule. Returns the parent bare.
+///
+/// Layout:
+///   <dir>/sub.git           (bare submodule source, one commit with "sub-content")
+///   <dir>/source.git        (bare parent source, one commit with .gitmodules + sub/)
+fn make_fixture_with_submodule(dir: &Path) -> PathBuf {
+    // Submodule source.
+    let sub_bare = dir.join("sub.git");
+    run_git_root(&["init", "--quiet", "--bare", &sub_bare.display().to_string()]);
+    let sub_staging = dir.join("sub-staging");
+    run_git_root(&[
+        "clone",
+        "--quiet",
+        &sub_bare.display().to_string(),
+        &sub_staging.display().to_string(),
+    ]);
+    run_git(&sub_staging, &["config", "user.email", "t@t"]);
+    run_git(&sub_staging, &["config", "user.name", "t"]);
+    std::fs::write(sub_staging.join("FILE"), b"sub-content").unwrap();
+    run_git(&sub_staging, &["add", "FILE"]);
+    run_git(&sub_staging, &["commit", "--quiet", "-m", "sub initial"]);
+    run_git(&sub_staging, &["push", "--quiet", "-u", "origin", "main"]);
+
+    // Parent source.
+    let bare = dir.join("source.git");
+    run_git_root(&["init", "--quiet", "--bare", &bare.display().to_string()]);
+    let staging = dir.join("staging");
+    run_git_root(&[
+        "clone",
+        "--quiet",
+        &bare.display().to_string(),
+        &staging.display().to_string(),
+    ]);
+    run_git(&staging, &["config", "user.email", "t@t"]);
+    run_git(&staging, &["config", "user.name", "t"]);
+    std::fs::write(staging.join("README"), b"hi").unwrap();
+    run_git(&staging, &["add", "README"]);
+    // Allow `file://` submodule URLs (git 2.38+ disables by default).
+    run_git(
+        &staging,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--quiet",
+            &sub_bare.display().to_string(),
+            "sub",
+        ],
+    );
+    run_git(&staging, &["commit", "--quiet", "-m", "with submodule"]);
+    run_git(&staging, &["push", "--quiet", "-u", "origin", "main"]);
+    bare
+}
+
+/// Regression: `worktree-pool acquire` performs a directory rename
+/// (`<canonical>` → `<user-name>`) before submodule init, and `release` performs
+/// the inverse rename AFTER submodules have been initialized. Both renames must
+/// rewrite the submodule admin's `core.worktree` pointer in
+/// `<source>/.git/worktrees/<id>/modules/<name>/config`, which `git worktree
+/// repair` does NOT do. Without that rewrite, the next git command in the
+/// renamed slot fails with `cannot chdir to '../../<old-name>/<sub>'`.
+///
+/// This test exercises both:
+///   acquire #1 (fresh): rename canonical→name happens BEFORE submodule init
+///                       (no broken pointers yet — but verifies submodules work post-rename).
+///   release #1: rename name→canonical AFTER submodule init (the path that
+///               originally caused `working trees containing submodules cannot be moved`).
+///   acquire #2 (recycled): rename canonical→name AFTER submodules already
+///                          initialized in a previous lifecycle (the path that
+///                          requires the modules/<NAME>/config rewrite).
+#[test]
+fn acquire_release_with_submodule_rewires_pointers() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture_with_submodule(tmp.path());
+    init_pool(&key, &bare);
+
+    // ---- acquire #1: fresh slot, submodules initialized after rename ----
+    let out = Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", &key, "acquire", "--name", "feat-1", "--group", "ios"])
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "acquire #1 failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let slot = pool_root(&key).join("feat-1");
+    // After acquire, the submodule should be checked out.
+    let sub_file = slot.join("sub/FILE");
+    assert!(
+        sub_file.exists(),
+        "submodule content missing post-acquire: {}",
+        sub_file.display()
+    );
+    // `git status` must succeed — fails if core.worktree is wrong.
+    let st = StdCommand::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&slot)
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "git status in slot failed (stale submodule core.worktree?): {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+
+    // ---- release #1: rename feat-1 → ios-0 with submodules already populated ----
+    release(&key, "feat-1");
+    let canonical = pool_root(&key).join("ios-0");
+    assert!(canonical.exists(), "ios-0 missing post-release");
+    // Pointers must be intact: a git command in the canonical slot must succeed.
+    let st = StdCommand::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&canonical)
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "git status in canonical slot failed post-release: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+
+    // ---- acquire #2: recycled slot, rename ios-0 → feat-2 with submodules already there ----
+    let out = Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", &key, "acquire", "--name", "feat-2", "--group", "ios"])
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "acquire #2 (recycled) failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let slot2 = pool_root(&key).join("feat-2");
+    let st = StdCommand::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&slot2)
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "git status in recycled slot failed: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+    // Submodule content still there from the recycled slot's prior life.
+    assert!(slot2.join("sub/FILE").exists());
+}
+
