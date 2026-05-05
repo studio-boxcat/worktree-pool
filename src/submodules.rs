@@ -151,30 +151,67 @@ fn update_recursive(
         (Vec::new(), entries)
     };
 
-    // Init the included submodules in one git invocation, with URL overrides.
+    // Init each included submodule via its OWN git process, in parallel. The classic
+    // batched form (`git submodule update --init <p1> <p2>...`) parallelizes fetch via
+    // `submodule.fetchJobs` but the parent process still serializes the per-submodule
+    // overhead (.git/modules registration, checkout dispatch, ref recording). Running N
+    // sibling processes lets the OS schedule everything — fetch, index, checkout — fully
+    // concurrent. For meow-tower's 17 top-level submodules from local bare mirrors this
+    // is the dominant wall-clock win on cold acquire.
+    //
+    // Each per-submodule call needs its own `-c submodule.<name>.url=<rewritten>` override.
+    // `protocol.file.allow=always` overrides git's post-CVE-2022-39253 default that refuses
+    // `file:` (incl. plain local path) submodule clones — required for our bare-mirror
+    // and git-modules modes.
     if !included.is_empty() {
-        let mut overrides: Vec<(String, String)> = Vec::new();
-        for e in &included {
-            if let Some(url) = rewrite_url(cfg, &e.name, &e.url, name_scope) {
-                overrides.push((format!("submodule.{}.url", e.name), url));
+        std::thread::scope(|scope| -> Result<()> {
+            let handles: Vec<_> = included
+                .iter()
+                .map(|e| {
+                    let url = rewrite_url(cfg, &e.name, &e.url, name_scope);
+                    scope.spawn(move || -> Result<()> {
+                        let url_kv =
+                            url.map(|u| (format!("submodule.{}.url", e.name), u));
+                        let mut overrides: Vec<(&str, &str)> =
+                            vec![("protocol.file.allow", "always")];
+                        if let Some((k, v)) = url_kv.as_ref() {
+                            overrides.push((k.as_str(), v.as_str()));
+                        }
+                        git::run_with_config(
+                            dir,
+                            &overrides,
+                            &["submodule", "update", "--init", &e.path],
+                        )
+                        .map(drop)
+                        .with_context(|| {
+                            format!("submodule update --init {} in {}", e.path, dir.display())
+                        })
+                    })
+                })
+                .collect();
+            let mut first_err: Option<anyhow::Error> = None;
+            for h in handles {
+                match h.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        } else {
+                            eprintln!("(also) {e:#}");
+                        }
+                    }
+                    Err(_) => {
+                        if first_err.is_none() {
+                            first_err = Some(anyhow::anyhow!("submodule update thread panicked"));
+                        }
+                    }
+                }
             }
-        }
-        let override_strs: Vec<(&str, &str)> = overrides
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-
-        // `protocol.file.allow=always` overrides git's post-CVE-2022-39253 default that
-        // refuses `file:` (incl. plain local path) submodule clones — required for our
-        // bare-mirror and git-modules modes.
-        let mut all_overrides = vec![("protocol.file.allow", "always")];
-        all_overrides.extend(override_strs);
-
-        let paths: Vec<&str> = included.iter().map(|e| e.path.as_str()).collect();
-        let mut args = vec!["submodule", "update", "--init"];
-        args.extend(paths.iter().copied());
-        git::run_with_config(dir, &all_overrides, &args)
-            .with_context(|| format!("submodule update --init in {}", dir.display()))?;
+            if let Some(e) = first_err {
+                return Err(e);
+            }
+            Ok(())
+        })?;
     }
 
     // Deinit + remove dirs for tag-excluded submodules. Unity treats absent embedded
