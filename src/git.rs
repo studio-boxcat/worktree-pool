@@ -66,6 +66,10 @@ pub fn config_file_list(cwd: &Path, file: &Path) -> Result<String> {
 }
 
 /// Resolve a commit-ish to its full 40-char SHA against `source`.
+///
+/// Note: shell-out (~40 ms cold) beat a gix-based impl in our profiling — the gix dep added
+/// 2 MB to the binary (765K → 2.8M) and slowed unrelated commands' startup more than it
+/// saved on this single spawn. See git history for the experiment.
 pub fn resolve_full_sha(source: &Path, commitish: &str) -> Result<String> {
     let arg = format!("{commitish}^{{commit}}");
     run(source, &["rev-parse", "--verify", &arg])
