@@ -115,8 +115,8 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> 
 
     // Rename `{group}-N → <name>` and create the branch.
     let target_path = pool_root.join(&args.name);
-    git::worktree_move(&cfg.source, &canonical_path, &target_path)
-        .with_context(|| format!("moving {} → {}", canonical_path.display(), target_path.display()))?;
+    git::worktree_rename(&cfg.source, &canonical_path, &target_path)
+        .with_context(|| format!("renaming {} → {}", canonical_path.display(), target_path.display()))?;
     git::checkout_force_branch(&target_path, &args.name)?;
 
     submodules::update(&target_path, cfg, &args.exclude_submodule_tags)?;

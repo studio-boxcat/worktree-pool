@@ -119,16 +119,20 @@ pub fn worktree_add(source: &Path, slot: &Path, commit: &str) -> Result<()> {
     .map(drop)
 }
 
-/// `git -C source worktree move <from> <to>`.
-pub fn worktree_move(source: &Path, from: &Path, to: &Path) -> Result<()> {
+/// Rename a worktree directory and repair its gitdir admin pointer.
+///
+/// We can't use `git worktree move` because it refuses on worktrees that contain
+/// initialized submodules ("fatal: working trees containing submodules cannot be
+/// moved or removed") — and every recycled slot in this pool has submodules. So
+/// we do the rename ourselves with `fs::rename` (atomic on the same filesystem,
+/// indifferent to submodules), then run `git worktree repair <new-path>` to fix
+/// the back-pointer in `<source>/.git/worktrees/<id>/gitdir`.
+pub fn worktree_rename(source: &Path, from: &Path, to: &Path) -> Result<()> {
+    std::fs::rename(from, to)
+        .with_context(|| format!("renaming {} → {}", from.display(), to.display()))?;
     run(
         source,
-        &[
-            "worktree",
-            "move",
-            &from.display().to_string(),
-            &to.display().to_string(),
-        ],
+        &["worktree", "repair", &to.display().to_string()],
     )
     .map(drop)
 }
