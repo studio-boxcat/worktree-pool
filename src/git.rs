@@ -74,7 +74,23 @@ pub fn resolve_full_sha(source: &Path, commitish: &str) -> Result<String> {
 
 /// Returns the absolute path of the worktree's gitdir
 /// (e.g. `<source>/.git/worktrees/<id>`).
+///
+/// In a non-main worktree, `<slot>/.git` is a one-line gitlink file: `gitdir: <abs-path>`.
+/// We parse it directly to avoid spawning `git rev-parse --git-dir` (~40 ms per call;
+/// hot in `ls` and same-SHA scan). Falls through to the spawn-based path if the file
+/// shape is unexpected (e.g. someone ran the tool against a main worktree by mistake).
 pub fn worktree_gitdir(slot: &Path) -> Result<PathBuf> {
+    let gitlink = slot.join(".git");
+    if let Ok(text) = std::fs::read_to_string(&gitlink)
+        && let Some(rest) = text.strip_prefix("gitdir: ")
+    {
+        let path = PathBuf::from(rest.trim());
+        return Ok(if path.is_absolute() {
+            path
+        } else {
+            slot.join(path)
+        });
+    }
     let gd = run(slot, &["rev-parse", "--git-dir"])?;
     let p = PathBuf::from(&gd);
     if p.is_absolute() {
