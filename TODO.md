@@ -26,7 +26,22 @@ Surfaced by efficiency-review agents during the v0.1.1 profile pass. Rust paths 
 
 Reviewers ran over the perf changes (`a504730`..`c17a34b`). Real bugs fixed inline (`5af9237`, `<this-commit>`); these are remaining deferred follow-ups.
 
+### Correctness / hardening (deferred)
+
 - **Cross-acquire `<source>/.git/config` lockfile contention (theoretical)** — `submodules::update` phase 1 sequentially writes `submodule.<name>.url` per submodule via `git -C <slot> config …`, which targets the shared `<source>/.git/config`. Two parallel acquires on different slots in the same source can cluster their writes (~17 × ~5ms each per acquire) and contend on git's `O_EXCL` lockfile retry. Not observed in 4-way stress test on macmini (window is small and git's internal retry usually wins). If it surfaces: take a per-source mutex around the phase-1 loop (cheap, scoped narrower than `pool_mu`), or set `extensions.worktreeConfig=true` and write submodule config per-worktree (requires checking git's worktree-allowed-keys for `submodule.*`).
+
+### Test coverage gaps (flagged by 2026-05 audit rounds, not yet addressed)
+
+These were enumerated by audit rounds 3 and 4 (see commit messages on `5af9237`..`dbfd3c6`). All represent real production code paths that ship with no integration test backing them.
+
+- **`acquire_release_with_submodule_rewires_pointers` assertions are weak** — `tests/smoke.rs` runs `git status --porcelain` after acquire and only asserts exit-code success. A bug that silently corrupts URL rewrites would still leave `git status` returning 0. Strengthen by reading `<source>/.git/worktrees/<id>/modules/sub/config` directly and asserting the `[remote "origin"] url` line matches the rewritten path (per pool config's `submodule_mirror_*`).
+- **Self-heal test only covers homogeneous stale state** — `release_self_heals_stale_submodule_core_worktree` uses `make_fixture_with_submodule` (1 submodule) and plants a single stale segment. Real partial-failure leaves *heterogeneous* state: SubA at user-name (rewritten), SubB at `stale-name-1`, SubC at `stale-name-2`. Use `make_fixture_with_n_submodules(N=3)`, plant different stale values, verify all converge to canonical after release.
+- **`--exclude-submodule-tags` deinit path completely untested end-to-end** — `submodules.rs` deinit-on-tag-excluded code path (around line 263) has only unit tests for `parse_gitmodules_*`. Add a fixture with two submodules, one tagged `editor` via `worktreePoolTag = editor`, acquire with `--exclude-submodule-tags editor`, assert the tagged submodule's working dir is absent post-acquire and the other is checked out.
+- **Group-less pool full lifecycle untested** — only the unit `classify_groupless` covers it. Add a smoke test that inits a pool with `--groups ""` and runs full acquire→release, verifying the canonical name pattern is `slot-N` (not `<group>-N`).
+- **Symlinked pool root never tested** — `git.rs::worktree_rename` documents (lines 172-180) the constraint that symlink basename must match target dir name; this is currently a doc-only contract. Add a test that creates `~/wtp-test/<key>` as a symlink to `<tmpdir>/<key>` (matching basenames) and runs full lifecycle.
+- **`rewrite_config_worktree` walker not unit-tested** — the multi-line / indentation / trailing-newline-preservation / multiple-`worktree =`-lines behavior in `git.rs:217-244` only exercised through `worktree_rename` integration. Add direct unit tests with synthetic config files.
+
+When tackling these, the existing `make_fixture_with_n_submodules(dir, n)` helper in `tests/smoke.rs` covers most of the needed scaffolding.
 
 ## Won't-do (decided this session)
 
