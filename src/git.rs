@@ -119,22 +119,99 @@ pub fn worktree_add(source: &Path, slot: &Path, commit: &str) -> Result<()> {
     .map(drop)
 }
 
-/// Rename a worktree directory and repair its gitdir admin pointer.
+/// Rename a worktree directory and repair every back-pointer that names the old path.
 ///
 /// We can't use `git worktree move` because it refuses on worktrees that contain
 /// initialized submodules ("fatal: working trees containing submodules cannot be
 /// moved or removed") — and every recycled slot in this pool has submodules. So
 /// we do the rename ourselves with `fs::rename` (atomic on the same filesystem,
-/// indifferent to submodules), then run `git worktree repair <new-path>` to fix
-/// the back-pointer in `<source>/.git/worktrees/<id>/gitdir`.
+/// indifferent to submodules), then fix back-pointers in two places:
+///   1. `<source>/.git/worktrees/<id>/gitdir` — handled by `git worktree repair`.
+///   2. `<source>/.git/worktrees/<id>/modules/**/config` — each submodule admin's
+///      `core.worktree` is a relative path that names the OLD slot dir; `git worktree
+///      repair` does not recurse, so we rewrite these ourselves by substituting
+///      `/<from-name>/` → `/<to-name>/` in the path component.
 pub fn worktree_rename(source: &Path, from: &Path, to: &Path) -> Result<()> {
     std::fs::rename(from, to)
         .with_context(|| format!("renaming {} → {}", from.display(), to.display()))?;
     run(
         source,
         &["worktree", "repair", &to.display().to_string()],
-    )
-    .map(drop)
+    )?;
+    let from_name = from
+        .file_name()
+        .and_then(|s| s.to_str())
+        .context("from path has no final component")?;
+    let to_name = to
+        .file_name()
+        .and_then(|s| s.to_str())
+        .context("to path has no final component")?;
+    if from_name == to_name {
+        return Ok(());
+    }
+    let admin = worktree_gitdir(to)?;
+    let modules_root = admin.join("modules");
+    if modules_root.exists() {
+        rewrite_submodule_worktrees(&modules_root, from_name, to_name)?;
+    }
+    Ok(())
+}
+
+/// Walk every `<modules_root>/**/config` and substitute `/<from_name>/` → `/<to_name>/`
+/// in lines that look like a `core.worktree = ...` value. Atomic replace per-file.
+fn rewrite_submodule_worktrees(modules_root: &Path, from_name: &str, to_name: &str) -> Result<()> {
+    let needle = format!("/{from_name}/");
+    let replacement = format!("/{to_name}/");
+    let mut stack = vec![modules_root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .with_context(|| format!("reading {}", dir.display()))?;
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
+                stack.push(path);
+            } else if ft.is_file() && entry.file_name() == "config" {
+                rewrite_config_worktree(&path, &needle, &replacement)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_config_worktree(config: &Path, needle: &str, replacement: &str) -> Result<()> {
+    let text = std::fs::read_to_string(config)
+        .with_context(|| format!("reading {}", config.display()))?;
+    let mut changed = false;
+    let new: String = text
+        .lines()
+        .map(|line| {
+            // Match `\tworktree = ...` (git config indents body lines with a tab).
+            let trimmed = line.trim_start();
+            if let Some(value) = trimmed.strip_prefix("worktree = ")
+                && value.contains(needle)
+            {
+                changed = true;
+                let prefix_len = line.len() - trimmed.len();
+                let new_value = value.replace(needle, replacement);
+                format!("{}worktree = {}", &line[..prefix_len], new_value)
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !changed {
+        return Ok(());
+    }
+    let mut out = new;
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    crate::atomic::write(config, &out)
+        .with_context(|| format!("writing {}", config.display()))?;
+    Ok(())
 }
 
 /// `git -C source worktree remove --force <slot>`. Best-effort.
