@@ -15,6 +15,10 @@ release-binary:
     file bin/worktree-pool-darwin-arm64
     echo "ok — committed binary updated. Don't forget to commit bin/worktree-pool-darwin-arm64."
 
+# Symlink committed binaries into ~/.local/bin/.
+install:
+    scripts/install.sh
+
 # Run all tests. Integration tests (tests/smoke.rs) spawn the binary via assert_cmd
 # and race on cargo's build lock when parallel — run serial to dodge that.
 test:

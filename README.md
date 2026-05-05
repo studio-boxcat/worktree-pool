@@ -188,15 +188,44 @@ worktree-pool --pool meow-tower acquire --name langpack-refactor --group ios
 
 ## Distribution
 
-arm64 macOS only. Binary is committed at `bin/worktree-pool-darwin-arm64`, ad-hoc codesigned (`codesign --sign - --force`). `scripts/install.sh` symlinks `~/.local/bin/worktree-pool` → `<repo>/bin/worktree-pool-darwin-arm64`.
+arm64 macOS only. Two artifacts ship from `bin/`:
+
+- `bin/worktree-pool-darwin-arm64` — the Rust binary (the pool primitive). Ad-hoc codesigned (`codesign --sign - --force`).
+- `bin/worktree-pool-session` — Bash wrapper for the common dev-session lifecycle (acquire + interactive shell + safe-recycle on exit). Project-agnostic; takes `<pool-key>` as first arg.
+
+`scripts/install.sh` (also `just install`) symlinks both into `~/.local/bin/`.
 
 ```sh
 git clone https://github.com/studio-boxcat/worktree-pool.git ~/Develop/worktree-pool
-~/Develop/worktree-pool/scripts/install.sh
+cd ~/Develop/worktree-pool && just install
 worktree-pool doctor
 ```
 
-To rebuild from source: `just release-binary` (reproducible flags + codesign + stage). Commit the resulting `bin/worktree-pool-darwin-arm64`.
+To rebuild the Rust binary: `just release-binary` (reproducible flags + codesign + stage). Commit the resulting `bin/worktree-pool-darwin-arm64`.
+
+## `worktree-pool-session` (dev-session helper)
+
+Three subcommands wrapping the lifecycle for interactive dev work:
+
+```sh
+worktree-pool-session go      <pool-key> <name> [pool-acquire-flags...]
+worktree-pool-session cleanup <pool-key> <name>     # 🟢/🟡/🔴 exit-trap classifier
+worktree-pool-session rm      <pool-key> <name>     # safety-checked release
+```
+
+`go` acquires/resumes a slot, prints a banner, `cd`s into the slot, runs `$WORKTREE_POOL_SESSION_CMD` (default `ai`) in `$SHELL`, and traps `cleanup` on exit. `cleanup` is the 🟢 (clean+merged → recycle) / 🟡 (dirty/untracked → keep) / 🔴 (unmerged → loud refuse) classifier. `rm` is the manual safety-checked release.
+
+Per-consumer integration is a thin `just` recipe pre-filling the pool key:
+
+```bash
+# meow-tower's justfile (just wt-go <name>)
+wt-go name *flags:
+    @worktree-pool-session go meow-tower {{quote(name)}} {{flags}}
+wt-rm name:
+    @worktree-pool-session rm meow-tower {{quote(name)}}
+wt-cleanup name:
+    @worktree-pool-session cleanup meow-tower {{quote(name)}}
+```
 
 ---
 

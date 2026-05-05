@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# worktree-pool-session — convenience wrapper around `worktree-pool` for the
+# common dev-session lifecycle: acquire + launch an interactive shell + safe-recycle on exit.
+# See https://github.com/studio-boxcat/worktree-pool for the underlying tool.
+#
+# Usage:
+#   worktree-pool-session go <pool-key> <name> [pool-acquire-flags...]
+#   worktree-pool-session cleanup <pool-key> <name>     # 🟢/🟡/🔴 exit-trap classifier
+#   worktree-pool-session rm <pool-key> <name>          # safety-checked release
+#
+# Project-agnostic: pool key is the first arg. Each consumer wraps via a thin
+# `just` recipe that pre-fills the pool key.
+
+set -uo pipefail   # set -e is per-subcommand (cleanup must always exit 0).
+
+# ---------- helpers ----------
+
+die() { echo "${0##*/}: $*" >&2; exit 1; }
+
+require_arg() { [ -n "$2" ] || die "usage: $3"; }
+
+pool_root() { printf '%s/.worktree-pool/%s' "$HOME" "$1"; }
+
+# Echo the name of any in-progress git operation (rebase, merge, cherry-pick,
+# revert) for the repo at $1. Empty if clean.
+in_progress_marker() {
+  local git_dir
+  git_dir=$(git -C "$1" rev-parse --git-dir 2>/dev/null || true)
+  [ -z "$git_dir" ] && return 0
+  local marker
+  for marker in rebase-merge rebase-apply MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD; do
+    if [ -e "$git_dir/$marker" ]; then
+      printf '%s' "$marker"
+      return 0
+    fi
+  done
+}
+
+# Echo count of commits in <branch> not in origin/main. '?' on rev-list failure.
+# Returns 1 if the branch ref doesn't exist.
+ahead_count() {
+  local path=$1 branch=$2
+  git -C "$path" fetch --quiet origin main 2>/dev/null || true
+  git -C "$path" show-ref --quiet --verify "refs/heads/$branch" || return 1
+  git -C "$path" rev-list --count "origin/main..$branch" 2>/dev/null || echo '?'
+}
+
+# ---------- subcommands ----------
+
+cmd_go() {
+  set -e
+  local key="${1:-}"; shift || true
+  local name="${1:-}"; shift || true
+  require_arg key  "$key"  "session go <pool-key> <name> [pool-flags...]"
+  require_arg name "$name" "session go <pool-key> <name> [pool-flags...]"
+
+  local POOL_ROOT
+  POOL_ROOT=$(pool_root "$key")
+  [ -d "$POOL_ROOT" ] || die "pool '$key' not initialized at $POOL_ROOT — run: worktree-pool --pool $key init --source <repo> --max-slots <n> ..."
+
+  # Refuse from inside a pool slot — `pwd -P` resolves symlinks.
+  local pool_real cwd_real
+  pool_real=$(cd "$POOL_ROOT" && pwd -P)
+  cwd_real=$(pwd -P)
+  if [[ "$cwd_real" == "$pool_real"/* ]]; then
+    die "refusing to nest — already inside a pool slot."
+  fi
+
+  # Resume detection — read BEFORE acquire (pool may rename mid-call).
+  local existing=0
+  [ -d "$POOL_ROOT/$name" ] && existing=1
+
+  local path
+  path=$(worktree-pool --pool "$key" acquire --name "$name" "$@" | tail -1)
+  if [[ -z "$path" || ! -d "$path" ]]; then
+    die "pool returned no path."
+  fi
+
+  # On exit, run our own cleanup verb. Quoting is conservative for keys/names with shell metachars.
+  local self
+  self="$0"
+  trap "'$self' cleanup '$key' '$name'" EXIT
+
+  printf '\n──── session: %s/%s @ %s ────\n\n' "$key" "$name" "$path"
+
+  local cmd="${WORKTREE_POOL_SESSION_CMD:-ai}"
+  [ "$existing" = 1 ] && cmd="$cmd --continue"
+  (cd "$path" && exec "${SHELL:-zsh}" -ic "$cmd")
+}
+
+cmd_cleanup() {
+  local key="${1:-}"; shift || true
+  local name="${1:-}"; shift || true
+  [ -n "$key" ] && [ -n "$name" ] || { echo "usage: cleanup <pool-key> <name>" >&2; exit 0; }
+
+  local POOL_ROOT path
+  POOL_ROOT=$(pool_root "$key")
+  path="$POOL_ROOT/$name"
+
+  local G Y R X
+  if [ -t 1 ]; then
+    G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[1;31m'; X=$'\e[0m'
+  else
+    G=''; Y=''; R=''; X=''
+  fi
+
+  if [ ! -d "$path" ]; then
+    printf '%s🟢 slot %s/%s already recycled%s\n' "$G" "$key" "$name" "$X"
+    exit 0
+  fi
+
+  local marker
+  marker=$(in_progress_marker "$path")
+  if [ -n "$marker" ]; then
+    printf '%s🟡 %s: in-progress %s — finish or abort first. NOT recycling.%s\n' \
+      "$Y" "$name" "$marker" "$X" >&2
+    exit 0
+  fi
+
+  local porcelain dirty untrk ahead
+  porcelain=$(git -C "$path" status --porcelain 2>/dev/null || true)
+  read -r dirty untrk < <(printf '%s' "$porcelain" | awk 'NF{if(/^\?\?/)u++;else d++} END{print d+0, u+0}')
+
+  ahead=0
+  if a=$(ahead_count "$path" "$name"); then ahead="$a"; fi
+
+  if [ "$ahead" != "0" ]; then
+    printf '%s🔴 UNMERGED: %s has %s commit(s) not in origin/main — NOT recycling.%s\n' \
+      "$R" "$name" "$ahead" "$X" >&2
+    printf '   git branch -D %s   # to discard\n' "$name" >&2
+    exit 0
+  fi
+  if [ "$dirty" != "0" ] || [ "$untrk" != "0" ]; then
+    printf '%s🟡 dirty: %s — %s modified, %s untracked. NOT recycling.%s\n' \
+      "$Y" "$name" "$dirty" "$untrk" "$X" >&2
+    exit 0
+  fi
+
+  "$0" rm "$key" "$name" || true
+  printf '%s🟢 recycled cleanly: %s/%s%s\n' "$G" "$key" "$name" "$X"
+}
+
+cmd_rm() {
+  set -e
+  local key="${1:-}"; shift || true
+  local name="${1:-}"; shift || true
+  require_arg key  "$key"  "session rm <pool-key> <name>"
+  require_arg name "$name" "session rm <pool-key> <name>"
+
+  local POOL_ROOT path
+  POOL_ROOT=$(pool_root "$key")
+  path="$POOL_ROOT/$name"
+  [ -d "$path" ] || die "no slot named '$name' in pool '$key' at $POOL_ROOT."
+
+  local porcelain
+  porcelain=$(git -C "$path" status --porcelain 2>/dev/null || true)
+  if [ -n "$porcelain" ]; then
+    echo "${0##*/}: '$name' is dirty — refusing." >&2
+    printf '%s\n' "$porcelain" | sed 's/^/  /' >&2
+    exit 1
+  fi
+
+  local ahead
+  if ahead=$(ahead_count "$path" "$name"); then
+    if [ "$ahead" != "0" ]; then
+      echo "${0##*/}: '$name' has $ahead commit(s) not in origin/main — refusing." >&2
+      echo "  git branch -D $name   # to discard" >&2
+      exit 1
+    fi
+  fi
+
+  worktree-pool --pool "$key" release --name "$name"
+}
+
+# ---------- dispatch ----------
+
+verb="${1:-}"; shift || true
+case "$verb" in
+  go)      cmd_go      "$@" ;;
+  cleanup) cmd_cleanup "$@" ;;
+  rm)      cmd_rm      "$@" ;;
+  *)       die "usage: ${0##*/} {go|cleanup|rm} <pool-key> <name> ..." ;;
+esac

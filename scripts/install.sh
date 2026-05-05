@@ -4,32 +4,39 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN_SRC="$REPO_ROOT/bin/worktree-pool-darwin-arm64"
 LINK_DIR="$HOME/.local/bin"
-LINK_DST="$LINK_DIR/worktree-pool"
+mkdir -p "$LINK_DIR"
 
-if [ ! -x "$BIN_SRC" ]; then
-  echo "missing or non-executable: $BIN_SRC" >&2
-  echo "rebuild via: just release-binary" >&2
-  exit 1
-fi
+# Symlinks: <tool> → <repo>/bin/<artifact>
+declare -a LINKS=(
+  "worktree-pool:$REPO_ROOT/bin/worktree-pool-darwin-arm64"
+  "worktree-pool-session:$REPO_ROOT/bin/worktree-pool-session"
+)
 
 if [ "$(uname -sm)" != "Darwin arm64" ]; then
-  echo "warn: committed binary is darwin-arm64; you're on $(uname -sm). Tool may not run." >&2
+  echo "warn: committed Rust binary is darwin-arm64; you're on $(uname -sm)." >&2
 fi
 
-mkdir -p "$LINK_DIR"
-ln -sfn "$BIN_SRC" "$LINK_DST"
-echo "linked $LINK_DST → $BIN_SRC"
+for entry in "${LINKS[@]}"; do
+  name="${entry%%:*}"
+  src="${entry#*:}"
+  dst="$LINK_DIR/$name"
+  if [ ! -x "$src" ]; then
+    echo "missing or non-executable: $src" >&2
+    [ "$name" = "worktree-pool" ] && echo "  rebuild via: just release-binary" >&2
+    exit 1
+  fi
+  ln -sfn "$src" "$dst"
+  echo "linked $dst → $src"
+done
 
-# Sanity: try a doctor invocation to exercise the symlink.
-if "$LINK_DST" doctor >/dev/null 2>&1; then
+# Sanity-check the Rust binary; the bash script doesn't need exercising.
+if "$LINK_DIR/worktree-pool" doctor >/dev/null 2>&1; then
   echo "doctor passed."
 else
-  echo "warn: '$LINK_DST doctor' did not exit cleanly; run it manually to inspect." >&2
+  echo "warn: '$LINK_DIR/worktree-pool doctor' did not exit cleanly; run it manually to inspect." >&2
 fi
 
-# PATH hint if ~/.local/bin isn't in PATH.
 case ":$PATH:" in
   *":$LINK_DIR:"*) ;;
   *) echo "warn: $LINK_DIR is not on \$PATH; add to your shell rc:" >&2
