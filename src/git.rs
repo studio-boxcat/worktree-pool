@@ -66,6 +66,10 @@ pub fn config_file_list(cwd: &Path, file: &Path) -> Result<String> {
 }
 
 /// Resolve a commit-ish to its full 40-char SHA against `source`.
+///
+/// We tried both `gix` and `git2` (vendored libgit2). Both shaved ~10 ms off `acquire`
+/// (1 spawn eliminated) but penalized `ls` and `release` startup. See da8b429 commit
+/// message for the full 3-way profile matrix.
 pub fn resolve_full_sha(source: &Path, commitish: &str) -> Result<String> {
     let arg = format!("{commitish}^{{commit}}");
     run(source, &["rev-parse", "--verify", &arg])
