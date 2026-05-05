@@ -49,13 +49,15 @@ worktree-pool --pool myapp inspect --name abc12345
 ~/.worktree-pool/<key>/                            — pool root
 ~/.worktree-pool/<key>/.meta/config.yaml          — pool config (written by `init`)
 ~/.worktree-pool/<key>/.meta/init/<slot-id>.lock  — init mutex (per-slot)
-~/.worktree-pool/<key>/.meta/release.lock         — pool-wide release mutex
+~/.worktree-pool/<key>/.meta/pool.lock            — pool-wide mutex (acquire + release)
 ~/.worktree-pool/<key>/{group}-{N}/                — idle slot
 ~/.worktree-pool/<key>/<name>/                     — held slot (post-rename)
 <source>/.git/worktrees/<git-id>/worktree-pool/lock — held marker per slot
 ```
 
-The held marker lives in the source repo's per-worktree gitdir (which git keeps stable across `git worktree move`), not inside the slot's working tree. Slot dir stays pristine; `git status` inside a slot shows only the user's actual changes.
+The held marker lives in the source repo's per-worktree gitdir (which stays stable across our `fs::rename` + `git worktree repair` flow — see "Why not `git worktree move`?" below). Slot dir stays pristine; `git status` inside a slot shows only the user's actual changes.
+
+**Symlinked pool root constraint**: if `~/.worktree-pool/<key>` is a symlink (typical when relocating slots to a faster volume), the symlink basename **must match** the target directory name. Submodule `core.worktree` rewrites are anchored on the pool-key segment, derived from the symlink basename. A mismatch (`ln -s /Volumes/big/myapp-pool ~/.worktree-pool/myapp`) would silently no-op the rewrites. Standard form: `ln -s /Volumes/big/<key> ~/.worktree-pool/<key>`.
 
 ---
 
@@ -115,22 +117,23 @@ worktree-pool doctor
 2. Same-SHA exclusion: scan held locks; refuse if any has matching `full_sha`.
 3. Pick idle `{group}-N` (smallest free N in that group, or `slot-N` if no groups).
 4. Acquire per-slot init mutex (`<pool>/.meta/init/<slot-id>.lock`, `O_EXCL`); heartbeat every 60s during init.
-5. If fresh slot (no `.git`): `git worktree add --detach <slot> <full_sha>`. If recycled: `git -C <slot> reset --hard <full_sha> && git -C <slot> clean -fd -e .meta`.
+5. If fresh slot (no `.git`): `git worktree add --detach <slot> <full_sha>`. If recycled: `git -C <slot> reset --hard <full_sha>` (NEVER `git clean` — untracked files are caller's warmth).
 6. Write lock at `<source>/.git/worktrees/<id>/worktree-pool/lock` atomically (tempfile + rename) — held marker lands BEFORE the rename.
-7. `git worktree move <slot> <name>`.
-8. `git -C <name> checkout -B <name>` (force-create branch at HEAD).
-9. `git -C <name> submodule update --init`, filtering by `--exclude-submodule-tags` against `worktreePoolTag` values in `.gitmodules`. URL overrides applied per `submodule_mirror_*`.
-10. Release init mutex.
-11. Print slot path on stdout.
+7. Rename slot via `fs::rename(<slot>, <name>) + git worktree repair <name>` plus per-submodule `core.worktree` rewrite (see "Why not `git worktree move`?").
+8. Force-create branch via `git -C <name> update-ref refs/heads/<name> HEAD && git -C <name> symbolic-ref -m "worktree-pool acquire" HEAD refs/heads/<name>`. (Avoids `git checkout -B`'s per-file filter-process pings.)
+9. Drop pool-wide mutex; per-slot init mutex still held.
+10. `git -C <name> submodule update --init`-equivalent, two-phase: sequential `git config submodule.<name>.url` writes (URL overrides per `submodule_mirror_*`), then parallel per-submodule `git submodule update <path>`. Tag-excluded submodules filtered by `--exclude-submodule-tags` against `worktreePoolTag` in `.gitmodules`.
+11. Release init mutex.
+12. Print slot path on stdout.
 
 ### `release`
 
-1. Acquire pool-wide release mutex.
-2. Find held slot by lock-name match (scan `<source>/.git/worktrees/*/worktree-pool/lock`).
+1. Acquire pool-wide mutex.
+2. Locate slot by user-name (`<pool>/<name>`).
 3. Delete lock file (held → idle visible to other acquires).
-4. `git -C <name> checkout --detach`. Best-effort `git -C <name> branch -D <name>`. Best-effort `git -C <name> push origin --delete <name>` (no-op if never pushed).
-5. Compute smallest free `{group}-N` (excluding current `<name>` and any other held slot's home id).
-6. `git worktree move <name> <{group}-N>`.
+4. `git -C <name> checkout --detach`. Best-effort `git -C <name> branch -D <name>`. Best-effort `git -C <name> push origin --delete <name>` (no-op for bare-mirror sources; only meaningful if `origin` is a real remote).
+5. Compute smallest free `{group}-N` (excluding any held slot's home id).
+6. Un-rename via `fs::rename(<name>, <{group}-N>) + git worktree repair` plus submodule `core.worktree` self-heal rewrite.
 7. Release pool-wide mutex.
 
 ### Same-SHA exclusion

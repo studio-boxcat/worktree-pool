@@ -710,6 +710,71 @@ fn make_fixture_with_n_submodules(dir: &Path, n: usize) -> PathBuf {
     bare
 }
 
+/// Regression for the self-heal path in `rewrite_slot_segment` (commit b349ec4).
+///
+/// Simulates the silent-corruption scenario from TODO.md: a previous
+/// `worktree_rename` failed mid-walk and left a submodule's `core.worktree`
+/// stuck at an old slot name (`stale-name`) — neither the source nor the
+/// target of any subsequent rename. The new pool-key-anchored rewrite must
+/// normalize the segment unconditionally so the next rename converges.
+///
+/// Steps: acquire (which clones the submodule), then **manually plant a stale
+/// `core.worktree` value** in `<source>/.git/worktrees/<id>/modules/sub/config`
+/// to simulate prior partial-failure state. Then release. Verify the planted
+/// stale segment got normalized to the canonical slot name (not silently
+/// preserved as it would have been pre-fix).
+#[test]
+fn release_self_heals_stale_submodule_core_worktree() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture_with_submodule(tmp.path());
+    init_pool(&key, &bare);
+
+    // Acquire under user-name "feat-1" (slot home will be ios-0).
+    let out = Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", &key, "acquire", "--name", "feat-1", "--group", "ios"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let slot = pool_root(&key).join("feat-1");
+
+    // Find the submodule's admin config inside source's worktrees admin.
+    // gitlink at <slot>/.git is one line: `gitdir: <abs-path>/<id>`.
+    let gitlink = std::fs::read_to_string(slot.join(".git")).unwrap();
+    let gitdir = gitlink
+        .strip_prefix("gitdir: ")
+        .unwrap()
+        .trim()
+        .to_string();
+    let sub_config = PathBuf::from(&gitdir).join("modules/sub/config");
+    let original = std::fs::read_to_string(&sub_config).unwrap();
+    assert!(
+        original.contains("/feat-1/sub"),
+        "expected `feat-1/sub` in {}: {original}",
+        sub_config.display()
+    );
+
+    // Plant a stale segment — simulate prior partial-rewrite leftover.
+    let corrupted = original.replace("/feat-1/sub", "/stale-name/sub");
+    std::fs::write(&sub_config, &corrupted).unwrap();
+
+    // Now release. The rename feat-1 → ios-0 should self-heal the stale segment
+    // (anchored on pool-key, sets segment to "ios-0" regardless of current value).
+    release(&key, "feat-1");
+
+    let after = std::fs::read_to_string(&sub_config).unwrap();
+    assert!(
+        after.contains("/ios-0/sub"),
+        "stale `/stale-name/sub` was NOT self-healed to `/ios-0/sub` after release: {after}"
+    );
+    assert!(
+        !after.contains("/stale-name/sub"),
+        "stale segment still present after release: {after}"
+    );
+}
+
 /// Regression for the parallel submodule init path (`std::thread::scope` over N
 /// per-submodule git processes in `submodules::update`). With N siblings competing
 /// for the parent's `.git/config` lock, the per-submodule URL rewrite must still

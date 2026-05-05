@@ -133,6 +133,23 @@ pub fn worktree_add(source: &Path, slot: &Path, commit: &str) -> Result<()> {
 ///      slot-name PATH SEGMENT (anchored to the pool-key parent) — see
 ///      `rewrite_submodule_worktrees` for why naive substring substitution is unsafe.
 pub fn worktree_rename(source: &Path, from: &Path, to: &Path) -> Result<()> {
+    // Both args must be siblings under the same pool root — pool-key derivation
+    // assumes it. Pure invariant-check; both call sites pass `pool_root.join(...)`.
+    debug_assert_eq!(
+        from.parent(),
+        to.parent(),
+        "worktree_rename: from and to must share a parent (pool root)"
+    );
+    // Pre-flight: if `to` already exists, refuse rather than risk clobbering a
+    // stale dir from a prior crash. `fs::rename` on macOS can replace an existing
+    // empty/dir target; this turns that footgun into a loud error.
+    if to.try_exists().unwrap_or(false) {
+        bail!(
+            "worktree_rename: target {} already exists — refusing to clobber. \
+             Inspect and clean up (likely leftover state from a prior crash).",
+            to.display()
+        );
+    }
     std::fs::rename(from, to)
         .with_context(|| format!("renaming {} → {}", from.display(), to.display()))?;
     run(
@@ -150,9 +167,17 @@ pub fn worktree_rename(source: &Path, from: &Path, to: &Path) -> Result<()> {
     if from_name == to_name {
         return Ok(());
     }
-    // The pool-key segment (the parent dir of the slot) anchors the rewrite — only
-    // the slot-name segment that immediately follows it gets rewritten, never another
-    // segment that happens to share the slot's name.
+    // The pool-key segment (the parent dir of the slot) anchors the rewrite —
+    // only the slot-name segment that immediately follows it gets rewritten,
+    // never another segment that happens to share the slot's name.
+    //
+    // Symlinked pool roots: if `~/.worktree-pool/<key>` is a symlink, this
+    // derivation uses the symlink basename. The README's documented form
+    // (`ln -s /Volumes/big/<key> ~/.worktree-pool/<key>`) keeps both names
+    // identical, so the anchor still matches `core.worktree`'s segments. If
+    // the target dir name DIFFERS from the symlink basename, segment-anchored
+    // rewrite would silently no-op — see TODO.md and README §Layout for the
+    // documented constraint.
     let pool_key = to
         .parent()
         .and_then(|p| p.file_name())

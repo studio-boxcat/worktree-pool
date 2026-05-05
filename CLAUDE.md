@@ -46,18 +46,19 @@ Lock file mtime = held-since (fallback when `started_at` is unparseable). Mere f
 5. Iterate acquirable Ns (fresh + recycled-idle, smallest first). Try per-slot init mutex on each; first success wins.
 6. Materialize: fresh → `git worktree add --detach <pool>/{group}-N <full_sha>`; recycled → `git -C <slot> reset --hard <full_sha>`. **Never `git clean`** — untracked files are caller's warmth.
 7. Write lock at `<source>/.git/worktrees/<id>/worktree-pool/lock` (atomic).
-8. `git worktree move <pool>/{group}-N <pool>/<name>`.
-9. `git -C <pool>/<name> checkout -B <name>`.
-10. `submodule update --init`, applying `--exclude-submodule-tags` filter + URL overrides per pool config.
-11. Drop pool-wide mutex; print path on stdout (last line).
+8. Rename via `fs::rename` + `git worktree repair` (`git worktree move` refuses on slots with submodules — see `git.rs::worktree_rename`). Also rewrites every submodule admin's `core.worktree` (anchored on the pool-key segment, idempotent self-heal).
+9. Force-create branch: `git -C <pool>/<name> update-ref refs/heads/<name> HEAD && symbolic-ref HEAD refs/heads/<name>`. (Avoids `git checkout -B`'s 600ms of per-file filter-process pings on a tree that's already at the right state.)
+10. Drop pool-wide mutex (slot is now visibly held under user-name; submodule init below is per-slot work guarded by the still-held init mutex).
+11. Submodule update, two-phase to dodge `<source>/.git/config` lockfile contention: (a) sequential `git config submodule.<name>.url` writes per submodule, applying URL overrides per pool config; (b) parallel per-submodule `git submodule update <path>` via `std::thread::scope`. Tag exclusion via `--exclude-submodule-tags` against `worktreePoolTag` in `.gitmodules`.
+12. Release init mutex; print path on stdout (last line).
 
 **Release:**
 1. Take pool-wide mutex.
 2. Read lock to recover `group`.
 3. Delete lock (slot becomes idle to other acquires inside the mutex).
-4. Detach HEAD; `branch -D <name>` (local); `push --delete origin <name>` (best-effort, no-op if never pushed).
+4. Detach HEAD; `branch -D <name>` (local); `push --delete origin <name>` (best-effort, no-op if `origin` is a bare mirror).
 5. Find smallest free `{group}-N`.
-6. `git worktree move <pool>/<name> <pool>/{group}-N`.
+6. Un-rename via `fs::rename` + `git worktree repair` + submodule `core.worktree` self-heal (same primitives as acquire's rename).
 7. Drop mutex.
 
 **Crash recovery:** writing the lock BEFORE the rename means a crash leaves the slot held at canonical `{group}-N` (clean recovery state). A crash between rename and lock-write would leave a renamed slot with no lock — operator clears via `git -C <source> worktree remove --force <slot>` and re-acquires.
@@ -169,7 +170,7 @@ If you need GC-like behavior, write a 5-line script: `worktree-pool ls` → filt
 
 - Code lives in `src/`; one module per concern (`acquire`, `release`, `slot`, `lock`, `mutex`, `submodules`, `dashboard`, `admin`, `doctor`).
 - Hand-rolled YAML in `yaml.rs` — line-oriented scalars only. `serde_yaml` is unmaintained; ~30 LOC suffices.
-- `git` operations shell out via `git.rs` (libgit2 doesn't expose `worktree move`).
+- `git` operations shell out via `git.rs`. We bypass `git worktree move` entirely (it refuses on slots with submodules, the common case) — `worktree_rename` does `fs::rename` + `git worktree repair` + submodule admin `core.worktree` self-heal instead.
 - Atomic writes via `tempfile::NamedTempFile::persist` (handles EXDEV across volumes).
 - Tests: `cargo test` (or `just test` to serialize). 26 unit + 12 integration covering full lifecycle, race conditions, and recycled-slot warmth regression.
 
