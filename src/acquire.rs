@@ -83,9 +83,13 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> 
     })?;
     let canonical_path = pool_root.join(&slot_id);
 
-    // Note: we keep the pool mutex through lock-write (below) but drop it before the slow
-    // submodule init. That's why this whole block stays under `pool_mu`'s scope.
-    let _ = &pool_mu;
+    // We keep the pool mutex through lock-write + rename (below) — these are the
+    // pool-wide-visible state changes that another acquire's scan must see atomically.
+    // Once the slot is visibly held under its user-name (post-rename), submodule init
+    // is per-slot work guarded by the per-slot init mutex (still held via `_mutex`),
+    // so we drop `pool_mu` explicitly before it. That's the difference between a 60s
+    // pool-mutex timeout and 4-way parallel cold acquires sharing the submodule clone
+    // wall time.
 
     // Materialize the slot at full_sha. Fresh slot → `worktree add`; recycled → `reset --hard` + clean.
     let is_fresh = !canonical_path.join(".git").exists();
@@ -118,6 +122,10 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> 
     git::worktree_rename(&cfg.source, &canonical_path, &target_path)
         .with_context(|| format!("renaming {} → {}", canonical_path.display(), target_path.display()))?;
     git::checkout_force_branch(&target_path, &args.name)?;
+
+    // Slot is now visibly held under user-name; further state is per-slot only.
+    // Release pool-wide serialization before the (potentially minutes-long) submodule clone.
+    drop(pool_mu);
 
     submodules::update(&target_path, cfg, &args.exclude_submodule_tags)?;
 
