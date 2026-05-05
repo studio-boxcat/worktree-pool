@@ -123,6 +123,35 @@ Generic; same shape works for any pool.
 
 ---
 
+## Multi-slot gotchas
+
+Slots share `.git/` and `.git/modules/` with the source repo, but **not** the working tree. Things to know when running multiple slots concurrently:
+
+- **Per-slot warmth lives inside the slot dir.** Build artifacts (Unity `Library/`, `Temp/`, `proj-*`, `node_modules/`, gradle caches) survive recycle because pool's `acquire` does `git reset --hard` only — never `git clean`. Across-platform flips inside a single slot rebuild platform-specific caches; don't symlink caches across slots.
+- **Submodule git-dirs (`<source>/.git/modules/...`) are shared.** Concurrent submodule updates can race on ref locks; the pool's `retryOnGitLock` handles transient `index.lock` / `worktrees.lock` contention.
+- **Shared docs (`TODO.md`, `CLAUDE.md`, `docs/`) are high-traffic.** Keep edits scoped, commit in their own commit, rebase early. A long-held dev session diverging on these is the usual source of conflicts.
+- **Branch refs accumulate in the source repo.** `release` deletes the branch (local + remote best-effort), so steady state has zero buildup. Crashed acquires that bypass release leave orphans — operator can prune via `git for-each-ref refs/heads/ | xargs ...`.
+
+## Integration patterns
+
+Each consumer wraps the pool with thin recipes pre-filling the pool key. `worktree-pool-session` is project-agnostic; pool config (source path, mirror mode) lives in `<pool>/.meta/config.yaml` written once by `init`.
+
+```bash
+# Consumer's justfile, e.g. meow-tower
+wt-go name *flags:
+    @worktree-pool-session go meow-tower {{quote(name)}} {{flags}}
+wt-rm name:
+    @worktree-pool-session rm meow-tower {{quote(name)}}
+wt-cleanup name:
+    @worktree-pool-session cleanup meow-tower {{quote(name)}}
+wt-ls:
+    @worktree-pool --pool meow-tower ls
+wt-info name:
+    @worktree-pool --pool meow-tower inspect --name {{quote(name)}}
+```
+
+Per-host `init` runs once per pool key. Source path differs by host (build server's bare mirror vs laptop's working clone); pool config carries the host-specific values.
+
 ## What this tool does NOT do
 
 Cuts that simplify the design:
