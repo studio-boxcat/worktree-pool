@@ -3,7 +3,9 @@
 //! Reads `<slot>/.gitmodules` to enumerate submodules + their `worktreePoolTag` values.
 //! For each submodule:
 //!  - skip if its tag is in `--exclude-submodule-tags`, AND deinit if currently inited;
-//!  - otherwise build `-c submodule.<name>.url=<rewritten>` overrides and `git submodule update --init`.
+//!  - otherwise: register `submodule.<name>.url` directly via `git config` (skips
+//!    the submodule--helper overhead of `git submodule init`), then run a parallel
+//!    `git submodule update <path>` per submodule via `std::thread::scope`.
 //!
 //! Recurses into nested `.gitmodules`. `editorOnly`-style filtering applies only to top-level
 //! submodules (the convention is Unity-Package-specific even though this tool is generic).
@@ -123,7 +125,7 @@ pub fn extract_org_repo(url: &str) -> Option<String> {
     None
 }
 
-/// Run `git submodule update --init` filtered by `exclude_tags` and with URL rewrites
+/// Initialize and update submodules filtered by `exclude_tags` and with URL rewrites
 /// applied. Recurses into nested `.gitmodules` if present.
 pub fn update(slot: &Path, cfg: &PoolConfig, exclude_tags: &[String]) -> Result<()> {
     update_recursive(slot, cfg, exclude_tags, "")
@@ -259,7 +261,12 @@ fn update_recursive(
     // Deinit + remove dirs for tag-excluded submodules. Unity treats absent embedded
     // packages as "not installed" — exactly what excluded modules should look like.
     for e in &skipped {
-        let (_ok, _, _) = git::run_lenient(dir, &["submodule", "deinit", "-f", &e.path])?;
+        let (ok, _, stderr) = git::run_lenient(dir, &["submodule", "deinit", "-f", &e.path])?;
+        if !ok {
+            // Don't fail the whole acquire on deinit cleanup — but surface the warning
+            // so an operator debugging missing exclusion has a breadcrumb.
+            eprintln!("warn: submodule deinit -f {} failed: {}", e.path, stderr);
+        }
         let _ = std::fs::remove_dir_all(dir.join(&e.path));
     }
 

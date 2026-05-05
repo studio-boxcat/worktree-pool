@@ -116,7 +116,7 @@ worktree-pool doctor
 1. Resolve `--commit` (default `default_commit` from pool config) against source → full SHA.
 2. Same-SHA exclusion: scan held locks; refuse if any has matching `full_sha`.
 3. Pick idle `{group}-N` (smallest free N in that group, or `slot-N` if no groups).
-4. Acquire per-slot init mutex (`<pool>/.meta/init/<slot-id>.lock`, `O_EXCL`); heartbeat every 60s during init.
+4. Acquire per-slot init mutex (`<pool>/.meta/init/<slot-id>.lock`, `O_EXCL`); heartbeat every 30s during init.
 5. If fresh slot (no `.git`): `git worktree add --detach <slot> <full_sha>`. If recycled: `git -C <slot> reset --hard <full_sha>` (NEVER `git clean` — untracked files are caller's warmth).
 6. Write lock at `<source>/.git/worktrees/<id>/worktree-pool/lock` atomically (tempfile + rename) — held marker lands BEFORE the rename.
 7. Rename slot via `fs::rename(<slot>, <name>) + git worktree repair <name>` plus per-submodule `core.worktree` rewrite (see "Why not `git worktree move`?").
@@ -142,7 +142,7 @@ When `acquire` resolves `--commit` to a full SHA, it scans all held locks. If an
 
 ### Init mutex liveness
 
-The init mutex's mtime is updated every 60s by the holder during init (heartbeat). On acquire, if a slot's init mutex exists with mtime older than 60min, it's reclaimed silently with a stderr warning logged. This handles the SIGKILL'd-init edge case without time-based silent reaping of held slots. Operator can also `worktree-pool unstick [--slot <id>]` for explicit cleanup.
+The init mutex's mtime is updated every 30s by the holder during init (heartbeat). On acquire, if a slot's init mutex exists with mtime older than 60min, it's reclaimed silently with a stderr warning logged. This handles the SIGKILL'd-init edge case without time-based silent reaping of held slots. Operator can also `worktree-pool unstick [--slot <id>]` for explicit cleanup.
 
 ### Capacity-bound failures
 
@@ -165,7 +165,7 @@ There is no GC. The operator releases manually based on the table.
 
 ## Submodule filtering
 
-The tool reads `worktreePoolTag = <tag>` lines in the source repo's `.gitmodules` (case-insensitive on key — git lowercases on read). `acquire --exclude-submodule-tags <t1,t2>` deinits any submodule whose tag matches and skips it during `git submodule update --init`. The taxonomy lives in `.gitmodules` (version-controlled with the source repo) so adding a new tagged submodule propagates to every consumer on next checkout.
+The tool reads `worktreePoolTag = <tag>` lines in the source repo's `.gitmodules` (case-insensitive on key — git lowercases on read). `acquire --exclude-submodule-tags <t1,t2>` deinits any submodule whose tag matches and skips it during the submodule init/update phase. The taxonomy lives in `.gitmodules` (version-controlled with the source repo) so adding a new tagged submodule propagates to every consumer on next checkout.
 
 Example:
 
@@ -257,6 +257,22 @@ pool *args:
 ```
 
 Recipes are host-agnostic — pool keys map to fixed paths under `~/.worktree-pool/<key>/`, so the same recipe runs on both server and laptop.
+
+---
+
+## Why not `git worktree move`?
+
+`git worktree move` refuses to move a worktree that has initialized submodules:
+
+```
+fatal: working trees containing submodules cannot be moved or removed
+```
+
+Every recycled slot in the pool has submodules — Unity packages, FacebookSDK, etc. — so `git worktree move` is unusable for our rename step. We replace it with three primitives that achieve the same end state:
+
+1. **`std::fs::rename(from, to)`** — atomic on the same filesystem, indifferent to submodules. Moves only the slot's working tree directory.
+2. **`git -C <source> worktree repair <to>`** — rewrites `<source>/.git/worktrees/<id>/gitdir` to point at the new path. Idempotent.
+3. **Per-submodule `core.worktree` rewrite** — `git worktree repair` does NOT recurse into submodules. We walk `<source>/.git/worktrees/<id>/modules/**/config` ourselves and rewrite each submodule's `core.worktree` value, anchored on the pool-key path segment that precedes the slot name (so a slot named `Packages` doesn't accidentally collide with sub-paths like `Packages/com.foo`). The rewrite is idempotent and self-healing — a stale segment from a partial prior rewrite gets normalized on the next rename. See `git.rs::worktree_rename` and tests `rewrite_slot_segment_*`.
 
 ---
 

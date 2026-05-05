@@ -129,9 +129,10 @@ Generic; same shape works for any pool.
 Slots share `.git/` and `.git/modules/` with the source repo, but **not** the working tree. Things to know when running multiple slots concurrently:
 
 - **Per-slot warmth lives inside the slot dir.** Build artifacts (Unity `Library/`, `Temp/`, `proj-*`, `node_modules/`, gradle caches) survive recycle because pool's `acquire` does `git reset --hard` only — never `git clean`. Across-platform flips inside a single slot rebuild platform-specific caches; don't symlink caches across slots.
-- **Submodule git-dirs (`<source>/.git/modules/...`) are shared.** Concurrent submodule updates can race on ref locks; the pool's `retryOnGitLock` handles transient `index.lock` / `worktrees.lock` contention.
+- **Submodule git-dirs (`<source>/.git/modules/...`) are shared.** Concurrent submodule updates can race on ref locks (`index.lock` / `worktrees.lock`); git's own internal `O_EXCL` retry handles transient contention.
 - **Shared docs (`TODO.md`, `CLAUDE.md`, `docs/`) are high-traffic.** Keep edits scoped, commit in their own commit, rebase early. A long-held dev session diverging on these is the usual source of conflicts.
 - **Branch refs accumulate in the source repo.** `release` deletes the branch (local + remote best-effort), so steady state has zero buildup. Crashed acquires that bypass release leave orphans — operator can prune via `git for-each-ref refs/heads/ | xargs ...`.
+- **LFS endpoint routing is consumer's responsibility.** Pool slots clone submodules from the source bare; if those submodules use LFS, smudging hits whatever `lfs.url` resolves to. Consumers using a remote LFS relay (e.g. EC2 reverse-proxy) should set a `[url] insteadOf` rewrite to a faster local endpoint where available. macmini-side example: `git config --global url.http://localhost:3690/.insteadOf https://relay.example/` (lives in `~/.gitconfig.local`, not the dotfiles repo, so it's machine-specific). Without the rewrite, cold acquires that hit LFS smudge incur per-object WAN round-trips. Pool tooling itself doesn't inspect or enforce this.
 
 ## Integration patterns
 
@@ -172,6 +173,6 @@ If you need GC-like behavior, write a 5-line script: `worktree-pool ls` → filt
 - Hand-rolled YAML in `yaml.rs` — line-oriented scalars only. `serde_yaml` is unmaintained; ~30 LOC suffices.
 - `git` operations shell out via `git.rs`. We bypass `git worktree move` entirely (it refuses on slots with submodules, the common case) — `worktree_rename` does `fs::rename` + `git worktree repair` + submodule admin `core.worktree` self-heal instead.
 - Atomic writes via `tempfile::NamedTempFile::persist` (handles EXDEV across volumes).
-- Tests: `cargo test` (or `just test` to serialize). 26 unit + 12 integration covering full lifecycle, race conditions, and recycled-slot warmth regression.
+- Tests: `cargo test` (or `just test` to serialize). Unit + integration covering full lifecycle, race conditions, recycled-slot warmth, and submodule-rewrite self-heal regression.
 
 `just release-binary` rebuilds the committed arm64 binary at `bin/worktree-pool-darwin-arm64` (reproducible flags + ad-hoc codesign). Commit the result.

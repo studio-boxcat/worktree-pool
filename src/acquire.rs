@@ -106,7 +106,8 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> 
         git::reset_hard(&canonical_path, &full_sha)?;
     }
 
-    // Resolve the worktree's gitdir. Stable across `git worktree move`.
+    // Resolve the worktree's gitdir. Stable across our `fs::rename` + `git worktree
+    // repair` flow (the gitlink in `<slot>/.git` keeps pointing at the same admin dir).
     let gitdir = git::worktree_gitdir(&canonical_path)?;
     let lock_path = fs_paths::slot_lock(&gitdir);
 

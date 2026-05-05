@@ -710,6 +710,51 @@ fn make_fixture_with_n_submodules(dir: &Path, n: usize) -> PathBuf {
     bare
 }
 
+/// Regression for `worktree_rename`'s pre-flight clobber check (commit d175279).
+///
+/// On macOS, `fs::rename(from, to)` will silently replace `to` if it's an empty
+/// directory (and even non-empty dirs in some configurations). This is a real
+/// hazard if a prior crashed acquire/release left a stale dir at the user-name
+/// path. The pre-flight `to.try_exists()` check turns the silent clobber into
+/// a loud error.
+///
+/// Test: acquire under "feat-1", manually plant a directory at "feat-2", then
+/// try to rename via a release/re-acquire cycle that would target "feat-2".
+/// The simplest exposure: pre-create the target dir before an acquire — the
+/// pool's lock-pick + rename will hit the bail path.
+#[test]
+fn acquire_refuses_when_target_dir_already_exists() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    // Plant a stale dir at the slot path the next acquire will pick.
+    let stale = pool_root(&key).join("planted");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("OLD_FILE"), b"prior-crash-leftover").unwrap();
+
+    // Acquire under that name should refuse rather than clobber.
+    let out = Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", &key, "acquire", "--name", "planted", "--group", "ios"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "acquire should refuse to clobber stale target");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("already exists") || stderr.contains("refusing to clobber"),
+        "expected clobber-refusal error; got: {stderr}"
+    );
+    // The stale file should still be there (not silently removed).
+    assert!(
+        stale.join("OLD_FILE").exists(),
+        "stale file was clobbered: {}",
+        stale.display()
+    );
+}
+
 /// Regression for the self-heal path in `rewrite_slot_segment` (commit b349ec4).
 ///
 /// Simulates the silent-corruption scenario from TODO.md: a previous

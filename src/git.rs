@@ -1,5 +1,8 @@
-//! `git` shell-out helpers. We don't link `libgit2` because it doesn't expose
-//! `git worktree move`; mixing libgit2 + shell would just add complexity.
+//! `git` shell-out helpers. We profiled both `gix` and `git2` and shell-out won
+//! on binary size + startup (see `resolve_full_sha` doc + da8b429); the ~10ms
+//! per-spawn savings were dwarfed by submodule clones anyway. We also don't use
+//! `git worktree move` (refuses on slots with submodules) — see `worktree_rename`
+//! for the `fs::rename` + `git worktree repair` + admin rewrite flow that replaces it.
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -145,9 +148,13 @@ pub fn worktree_rename(source: &Path, from: &Path, to: &Path) -> Result<()> {
     // empty/dir target; this turns that footgun into a loud error.
     if to.try_exists().unwrap_or(false) {
         bail!(
-            "worktree_rename: target {} already exists — refusing to clobber. \
-             Inspect and clean up (likely leftover state from a prior crash).",
-            to.display()
+            "worktree_rename: target {to_disp} already exists — refusing to clobber. \
+             Likely leftover state from a prior crashed acquire/release. Recover with:\n  \
+               git -C {src_disp} worktree remove --force {to_disp}\n  \
+               rm -rf {to_disp}\n\
+             then retry.",
+            to_disp = to.display(),
+            src_disp = source.display()
         );
     }
     std::fs::rename(from, to)
