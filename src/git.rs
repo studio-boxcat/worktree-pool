@@ -129,8 +129,9 @@ pub fn worktree_add(source: &Path, slot: &Path, commit: &str) -> Result<()> {
 ///   1. `<source>/.git/worktrees/<id>/gitdir` — handled by `git worktree repair`.
 ///   2. `<source>/.git/worktrees/<id>/modules/**/config` — each submodule admin's
 ///      `core.worktree` is a relative path that names the OLD slot dir; `git worktree
-///      repair` does not recurse, so we rewrite these ourselves by substituting
-///      `/<from-name>/` → `/<to-name>/` in the path component.
+///      repair` does not recurse, so we rewrite these ourselves by replacing the
+///      slot-name PATH SEGMENT (anchored to the pool-key parent) — see
+///      `rewrite_submodule_worktrees` for why naive substring substitution is unsafe.
 pub fn worktree_rename(source: &Path, from: &Path, to: &Path) -> Result<()> {
     std::fs::rename(from, to)
         .with_context(|| format!("renaming {} → {}", from.display(), to.display()))?;
@@ -149,19 +150,40 @@ pub fn worktree_rename(source: &Path, from: &Path, to: &Path) -> Result<()> {
     if from_name == to_name {
         return Ok(());
     }
+    // The pool-key segment (the parent dir of the slot) anchors the rewrite — only
+    // the slot-name segment that immediately follows it gets rewritten, never another
+    // segment that happens to share the slot's name.
+    let pool_key = to
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .context("to path has no parent dir name (pool-key)")?;
     let admin = worktree_gitdir(to)?;
     let modules_root = admin.join("modules");
     if modules_root.exists() {
-        rewrite_submodule_worktrees(&modules_root, from_name, to_name)?;
+        rewrite_submodule_worktrees(&modules_root, pool_key, from_name, to_name)?;
     }
     Ok(())
 }
 
-/// Walk every `<modules_root>/**/config` and substitute `/<from_name>/` → `/<to_name>/`
-/// in lines that look like a `core.worktree = ...` value. Atomic replace per-file.
-fn rewrite_submodule_worktrees(modules_root: &Path, from_name: &str, to_name: &str) -> Result<()> {
-    let needle = format!("/{from_name}/");
-    let replacement = format!("/{to_name}/");
+/// Walk every `<modules_root>/**/config` and rewrite the slot-name path segment in
+/// each `core.worktree` value, anchored to the pool-key segment that precedes it.
+///
+/// Why anchored? `core.worktree` looks like
+///   `../../../../<...>/<pool-key>/<slot-name>/<sub-path>`
+/// and the slot-name appears EXACTLY ONCE in that form — between `<pool-key>` and
+/// `<sub-path>`. A naive `value.replace("/old/", "/new/")` would corrupt the result
+/// any time `<sub-path>` itself contains the old slot name as a directory component
+/// (a Unity slot named "Packages" or "modules" would catastrophically rewrite paths
+/// like `<pool-key>/Packages/Packages/com.foo`). Anchoring to the pool-key segment
+/// — known to be the slot's parent — picks the right segment unambiguously regardless
+/// of slot name.
+fn rewrite_submodule_worktrees(
+    modules_root: &Path,
+    pool_key: &str,
+    from_name: &str,
+    to_name: &str,
+) -> Result<()> {
     let mut stack = vec![modules_root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = std::fs::read_dir(&dir)
@@ -173,14 +195,19 @@ fn rewrite_submodule_worktrees(modules_root: &Path, from_name: &str, to_name: &s
             if ft.is_dir() {
                 stack.push(path);
             } else if ft.is_file() && entry.file_name() == "config" {
-                rewrite_config_worktree(&path, &needle, &replacement)?;
+                rewrite_config_worktree(&path, pool_key, from_name, to_name)?;
             }
         }
     }
     Ok(())
 }
 
-fn rewrite_config_worktree(config: &Path, needle: &str, replacement: &str) -> Result<()> {
+fn rewrite_config_worktree(
+    config: &Path,
+    pool_key: &str,
+    from_name: &str,
+    to_name: &str,
+) -> Result<()> {
     let text = std::fs::read_to_string(config)
         .with_context(|| format!("reading {}", config.display()))?;
     let mut changed = false;
@@ -190,11 +217,10 @@ fn rewrite_config_worktree(config: &Path, needle: &str, replacement: &str) -> Re
             // Match `\tworktree = ...` (git config indents body lines with a tab).
             let trimmed = line.trim_start();
             if let Some(value) = trimmed.strip_prefix("worktree = ")
-                && value.contains(needle)
+                && let Some(new_value) = rewrite_slot_segment(value, pool_key, from_name, to_name)
             {
                 changed = true;
                 let prefix_len = line.len() - trimmed.len();
-                let new_value = value.replace(needle, replacement);
                 format!("{}worktree = {}", &line[..prefix_len], new_value)
             } else {
                 line.to_string()
@@ -212,6 +238,23 @@ fn rewrite_config_worktree(config: &Path, needle: &str, replacement: &str) -> Re
     crate::atomic::write(config, &out)
         .with_context(|| format!("writing {}", config.display()))?;
     Ok(())
+}
+
+/// Rewrite the slot-name segment in a `core.worktree` relative path, anchored to
+/// `<pool_key>/<from_name>/`. Returns `None` if the value doesn't match the expected
+/// shape (which means it doesn't reference the renamed slot — leave it alone).
+fn rewrite_slot_segment(value: &str, pool_key: &str, from_name: &str, to_name: &str) -> Option<String> {
+    // Path segments split on '/'. We want the index `i` where
+    //   segments[i-1] == pool_key && segments[i] == from_name
+    // and rewrite segments[i] = to_name. Replaces only that one segment.
+    let mut segments: Vec<&str> = value.split('/').collect();
+    for i in 1..segments.len() {
+        if segments[i - 1] == pool_key && segments[i] == from_name {
+            segments[i] = to_name;
+            return Some(segments.join("/"));
+        }
+    }
+    None
 }
 
 /// `git -C source worktree remove --force <slot>`. Best-effort.
@@ -242,7 +285,13 @@ pub fn reset_hard(slot: &Path, commit: &str) -> Result<()> {
 pub fn checkout_force_branch(slot: &Path, name: &str) -> Result<()> {
     let ref_path = format!("refs/heads/{name}");
     run(slot, &["update-ref", &ref_path, "HEAD"])?;
-    run(slot, &["symbolic-ref", "HEAD", &ref_path]).map(drop)
+    // `-m` writes a HEAD reflog entry — without it, `git reflog HEAD` won't show
+    // the branch attach. Cheap; aids debugging when poking at slot state by hand.
+    run(
+        slot,
+        &["symbolic-ref", "-m", "worktree-pool acquire", "HEAD", &ref_path],
+    )
+    .map(drop)
 }
 
 /// Detach HEAD (so we can delete the current branch).
@@ -258,4 +307,52 @@ pub fn branch_delete(slot: &Path, name: &str) -> Result<(bool, String, String)> 
 /// Best-effort remote branch delete.
 pub fn push_delete(slot: &Path, remote: &str, name: &str) -> Result<(bool, String, String)> {
     run_lenient(slot, &["push", remote, "--delete", name])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewrite_slot_segment_basic() {
+        let v = "../../../../../../../../../../.worktree-pool/meow-tower/old/Packages/com.foo";
+        let out = rewrite_slot_segment(v, "meow-tower", "old", "new").unwrap();
+        assert_eq!(out, "../../../../../../../../../../.worktree-pool/meow-tower/new/Packages/com.foo");
+    }
+
+    /// Regression: slot named `Packages` collides with a sub-path component.
+    /// Naive `value.replace("/Packages/", "/new/")` would rewrite BOTH segments
+    /// (the slot AND the submodule's `Packages/com.foo` parent dir). The anchored
+    /// form rewrites only the segment immediately after the pool-key.
+    #[test]
+    fn rewrite_slot_segment_does_not_corrupt_when_subpath_repeats_slotname() {
+        let v = "../../../../../../../../../../.worktree-pool/meow-tower/Packages/Packages/com.foo";
+        let out = rewrite_slot_segment(v, "meow-tower", "Packages", "ios-0").unwrap();
+        // Only the slot segment (after `meow-tower/`) is rewritten; the inner
+        // `Packages/com.foo` is preserved.
+        assert_eq!(out, "../../../../../../../../../../.worktree-pool/meow-tower/ios-0/Packages/com.foo");
+    }
+
+    #[test]
+    fn rewrite_slot_segment_does_not_corrupt_when_slotname_equals_pool_key() {
+        // Pathological case: someone names the slot the same as the pool key.
+        // The pool-key anchor still picks the right segment (the one after the pool-key).
+        let v = "../../.worktree-pool/meow-tower/meow-tower/sub";
+        let out = rewrite_slot_segment(v, "meow-tower", "meow-tower", "ios-0").unwrap();
+        assert_eq!(out, "../../.worktree-pool/meow-tower/ios-0/sub");
+    }
+
+    #[test]
+    fn rewrite_slot_segment_returns_none_when_path_does_not_match() {
+        // Value doesn't reference the renamed slot at all.
+        let out = rewrite_slot_segment("../../somewhere/else", "meow-tower", "old", "new");
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn rewrite_slot_segment_handles_absolute_paths() {
+        let v = "/Users/x/.worktree-pool/meow-tower/old-name/Packages/com.foo";
+        let out = rewrite_slot_segment(v, "meow-tower", "old-name", "new-name").unwrap();
+        assert_eq!(out, "/Users/x/.worktree-pool/meow-tower/new-name/Packages/com.foo");
+    }
 }

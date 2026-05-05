@@ -7,7 +7,7 @@
 //!
 //! Recurses into nested `.gitmodules`. `editorOnly`-style filtering applies only to top-level
 //! submodules (the convention is Unity-Package-specific even though this tool is generic).
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -174,8 +174,26 @@ fn update_recursive(
     if !included.is_empty() {
         // Phase 1: sequential url registration.
         for e in &included {
-            let effective_url = rewrite_url(cfg, &e.name, &e.url, name_scope)
-                .unwrap_or_else(|| e.url.clone());
+            let effective_url = match rewrite_url(cfg, &e.name, &e.url, name_scope) {
+                Some(u) => u,
+                None => {
+                    // No mirror configured: fall back to the declared URL. We skip
+                    // `git submodule init`'s URL-resolution step (which we'd otherwise
+                    // get for free), so refuse relative URLs here — they'd be written
+                    // verbatim and silently fetch from the wrong place. (`git submodule
+                    // init` resolves `../foo.git` against the parent's `origin` URL.)
+                    if e.url.starts_with("./") || e.url.starts_with("../") {
+                        bail!(
+                            "submodule {} has relative url `{}` and no `submodule_mirror_*` \
+                             rewrite is configured. Either configure a mirror in pool config, \
+                             or change the submodule URL to absolute.",
+                            e.name,
+                            e.url
+                        );
+                    }
+                    e.url.clone()
+                }
+            };
             git::run(
                 dir,
                 &[
