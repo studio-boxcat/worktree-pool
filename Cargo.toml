@@ -21,7 +21,7 @@ name = "yaml"
 harness = false
 
 [profile.release]
-opt-level = 3
+opt-level = "s"
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
