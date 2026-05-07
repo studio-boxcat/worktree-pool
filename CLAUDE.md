@@ -31,7 +31,7 @@ worktree-pool --pool myapp init \
 worktree-pool --pool myapp acquire --name abc12345 --commit abc12345 --group ios
 # → prints worktree path on stdout
 
-# Acquire a dev session at origin/main (default)
+# Acquire a dev session at the pool's default_commit
 worktree-pool --pool myapp acquire --name feature-x --group ios
 
 # Release
@@ -223,7 +223,7 @@ Bash dispatcher in `bin/worktree-pool-session`. Subcommands wrapping the slot + 
 ```sh
 worktree-pool-session path    <pool-key> <name>     # print slot path; exit 0 if exists, 1 if not, 2 on error
 worktree-pool-session go      <pool-key> <name> [--from <commit-ish>] [pool-acquire-flags...]
-worktree-pool-session sync    [message]             # commit + merge origin/main + publish
+worktree-pool-session sync    [message]             # commit + merge-back-to-main (local-only)
 worktree-pool-session cleanup <pool-key> <name>     # 🟢/🟡/🔴 exit-trap classifier
 worktree-pool-session rm      <pool-key> <name>     # safety-checked release
 worktree-pool-session orient                        # print current repo path + CLAUDE.md
@@ -255,15 +255,15 @@ Cleanup classifier (always exits 0 — it's an exit-trap target, so `wt-go`'s ex
 
 | Marker | Condition | Action |
 |---|---|---|
-| 🟢 | clean working tree AND 0 commits ahead `origin/main` | un-rename + delete branch + release (recycle) |
+| 🟢 | clean working tree AND 0 commits ahead local `main` | un-rename + delete branch + release (recycle) |
 | 🟡 | dirty / untracked files | leave personalized — resume with `session go` later |
-| 🔴 | non-zero commits ahead `origin/main` (unmerged) | loud refuse — operator resolves before recycling |
+| 🔴 | non-zero commits ahead local `main` (unmerged) | loud refuse — operator resolves before recycling |
 
 Re-running `session go <key> <name>` resumes any 🟡 / 🔴 slot.
 
 ### Sync flow
 
-Strict merge-back-to-`main` + publish. Idempotent re-run after manual conflict resolution. Auto-discovers the main worktree via `git worktree list`; no pool-key needed since the operation is git-only.
+Strict merge-back-to-local-`main`. Local-only; no fetch, no push. Idempotent re-run after manual conflict resolution. Auto-discovers the main worktree via `git worktree list`; no pool-key needed since the operation is git-only.
 
 Steps in order, refuses loudly on anything unexpected:
 
@@ -272,13 +272,12 @@ Steps in order, refuses loudly on anything unexpected:
 3. Find main via `git worktree list --porcelain`; refuse if `main` isn't checked out anywhere.
 4. Refuse if main worktree has tracked uncommitted changes (untracked there is fine — `git reset --hard HEAD` only touches tracked files).
 5. Auto-commit dirty tracked work with the supplied message. Refuses if dirty *and* no message. `wip` shorthand → `WIP via sync`.
-6. `git fetch origin main`; `git merge --no-ff origin/main`. Halts on conflict — resolve, `git add`, `git commit`, then re-run sync (the merge step becomes a no-op).
-7. Re-fetch `origin/main`; refuse if it's no longer ancestor of `HEAD` (someone advanced main during long conflict resolution).
-8. Atomic `git update-ref refs/heads/main HEAD <expected_main>`. Refuses if a parallel slot advanced main first.
+6. `git merge --no-ff main`. Halts on conflict — resolve, `git add`, `git commit`, then re-run sync (the merge step becomes a no-op).
+7. Refuse if `main` is no longer ancestor of `HEAD` (a parallel slot's sync advanced main during long conflict resolution).
+8. Atomic `git update-ref refs/heads/main HEAD <expected_main>`. Refuses if a parallel slot advanced main between step 7 and here.
 9. `git -C <main_path> reset --hard HEAD` to refresh main's tree.
-10. `git push --atomic origin main <branch>` — both refs together or neither. No `--force`.
 
-Idempotent: re-runs after a push reject are safe (no-op if `main == HEAD`). Resume after conflict = re-run sync after the manual merge commit lands.
+Idempotent: re-runs are safe (no-op if `main == HEAD`). Resume after conflict = re-run sync after the manual merge commit lands. Pushing to a remote is the operator's responsibility — `wt-sync` only advances local refs.
 
 ---
 

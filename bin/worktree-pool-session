@@ -6,7 +6,7 @@
 # Usage:
 #   worktree-pool-session path <pool-key> <name>        # print slot path; exit 0 if exists, 1 if not, 2 on error
 #   worktree-pool-session go <pool-key> <name> [--from <commit-ish>] [pool-acquire-flags...]
-#   worktree-pool-session sync [message]                # commit + merge origin/main + publish
+#   worktree-pool-session sync [message]                # commit + merge-back-to-main
 #   worktree-pool-session cleanup <pool-key> <name>     # 🟢/🟡/🔴 exit-trap classifier
 #   worktree-pool-session rm <pool-key> <name>          # safety-checked release
 #   worktree-pool-session orient                        # print current repo path + CLAUDE.md
@@ -41,13 +41,12 @@ in_progress_marker() {
   done
 }
 
-# Echo count of commits in <branch> not in origin/main. '?' on rev-list failure.
+# Echo count of commits in <branch> not in main. '?' on rev-list failure.
 # Returns 1 if the branch ref doesn't exist.
 ahead_count() {
   local path=$1 branch=$2
-  git -C "$path" fetch --quiet origin main 2>/dev/null || true
   git -C "$path" show-ref --quiet --verify "refs/heads/$branch" || return 1
-  git -C "$path" rev-list --count "origin/main..$branch" 2>/dev/null || echo '?'
+  git -C "$path" rev-list --count "main..$branch" 2>/dev/null || echo '?'
 }
 
 # Find the absolute path of the worktree that has refs/heads/main checked out.
@@ -202,7 +201,7 @@ cmd_sync() {
   [ -n "$main_path" ] || die "sync: main is not checked out in any worktree"
 
   # `git reset --hard HEAD` only touches tracked files, so untracked content
-  # in main survives the post-publish refresh; ignore `??` here.
+  # in main survives the post-merge refresh; ignore `??` here.
   local main_dirty
   main_dirty=$(git -C "$main_path" status --porcelain | awk '!/^\?\?/')
   if [ -n "$main_dirty" ]; then
@@ -226,10 +225,9 @@ cmd_sync() {
     git commit -m "$msg"
   fi
 
-  # Merge origin/main. On conflict, halt with resume hint. On the resume path
+  # Merge main. On conflict, halt with resume hint. On the resume path
   # (after manual conflict resolution + commit), this is "Already up to date."
-  git fetch origin main
-  if ! git merge --no-ff -m "Sync main into $branch" origin/main; then
+  if ! git merge --no-ff -m "Sync main into $branch" main; then
     echo >&2
     echo "sync: merge halted with conflicts. Resolve and either:" >&2
     echo "  • finish: 'git add' the files, 'git commit', then re-run sync" >&2
@@ -237,25 +235,25 @@ cmd_sync() {
     exit 1
   fi
 
-  # Publish: advance local main, refresh main worktree, atomic push.
-  # Re-fetch in case origin/main moved during a long conflict resolution.
-  git fetch origin main
-  if ! git merge-base --is-ancestor origin/main HEAD; then
-    echo "sync: origin/main has moved past your merge base." >&2
-    echo "  Re-merge with 'git merge --no-ff origin/main', resolve, commit, then re-run." >&2
+  # Advance main + refresh main worktree. A parallel slot's sync could have
+  # advanced main during a long conflict resolution; refuse rather than
+  # clobber. The atomic update-ref's <expected_main> is the second guard —
+  # if main moved between this check and the update, update-ref refuses.
+  if ! git merge-base --is-ancestor main HEAD; then
+    echo "sync: main has moved past your merge base (parallel slot synced first)." >&2
+    echo "  Re-merge with 'git merge --no-ff main', resolve, commit, then re-run." >&2
     exit 1
   fi
 
   local expected_main
   expected_main=$(git rev-parse main)
-  # Skip the no-op so push-rejected re-runs are idempotent.
+  # Skip the no-op so re-runs are idempotent (e.g. after manual conflict resolution).
   if [ "$expected_main" != "$(git rev-parse HEAD)" ]; then
     git update-ref -m "sync from $branch" refs/heads/main HEAD "$expected_main"
     git -C "$main_path" reset --hard HEAD >/dev/null
   fi
 
-  git push --atomic origin main "$branch"
-  echo "sync: $branch published; main + origin/main + origin/$branch at $(git rev-parse --short HEAD)"
+  echo "sync: $branch merged; main at $(git rev-parse --short HEAD)"
 }
 
 cmd_cleanup() {
@@ -295,7 +293,7 @@ cmd_cleanup() {
   if a=$(ahead_count "$path" "$name"); then ahead="$a"; fi
 
   if [ "$ahead" != "0" ]; then
-    printf '%s🔴 UNMERGED: %s has %s commit(s) not in origin/main — NOT recycling.%s\n' \
+    printf '%s🔴 UNMERGED: %s has %s commit(s) not in main — NOT recycling.%s\n' \
       "$R" "$name" "$ahead" "$X" >&2
     printf '   git branch -D %s   # to discard\n' "$name" >&2
     exit 0
@@ -333,10 +331,17 @@ cmd_rm() {
   local ahead
   if ahead=$(ahead_count "$path" "$name"); then
     if [ "$ahead" != "0" ]; then
-      echo "${0##*/}: '$name' has $ahead commit(s) not in origin/main — refusing." >&2
+      echo "${0##*/}: '$name' has $ahead commit(s) not in main — refusing." >&2
       echo "  git branch -D $name   # to discard" >&2
       exit 1
     fi
+  fi
+
+  # Best-effort remote branch delete. Skip when no `origin/<name>` exists
+  # (avoids a spurious "remote ref does not exist" error on local-only branches).
+  if git -C "$path" ls-remote --exit-code --heads origin "$name" >/dev/null 2>&1; then
+    git -C "$path" push origin --delete "$name" || \
+      echo "${0##*/}: warning: failed to delete origin/$name (continuing)." >&2
   fi
 
   worktree-pool --pool "$key" release --name "$name"

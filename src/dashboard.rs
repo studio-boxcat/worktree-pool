@@ -217,7 +217,7 @@ fn augment_with_git(row: &mut Row) -> Result<()> {
     }
     let (ok, ahead, _) = git::run_lenient(
         &row.path,
-        &["rev-list", "--count", "HEAD", "^refs/remotes/origin/main"],
+        &["rev-list", "--count", "HEAD", "^refs/heads/main"],
     )?;
     if ok {
         row.ahead = ahead.trim().to_string();
