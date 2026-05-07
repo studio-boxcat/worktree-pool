@@ -541,7 +541,7 @@ fn unstick_pool_mutex_force_clear() {
 
 /// Two parallel acquires with --unique-sha racing on the same SHA: at most one
 /// should succeed. (Currently the same-SHA scan is not pool-globally serialized,
-/// so this is best-effort; see TODO in README.)
+/// so this is best-effort; see TODO.md.)
 #[test]
 fn parallel_unique_sha_at_most_one_succeeds() {
     let key = pool_key();

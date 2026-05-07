@@ -1,6 +1,6 @@
 //! `acquire` orchestration. Picks an idle slot, pins HEAD to the requested commit,
 //! writes the held-marker, renames the slot, creates a branch, runs submodule init.
-//! See README.md §Lifecycle for the spec.
+//! See CLAUDE.md §Lifecycle for the spec.
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 

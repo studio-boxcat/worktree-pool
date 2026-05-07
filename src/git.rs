@@ -179,12 +179,12 @@ pub fn worktree_rename(source: &Path, from: &Path, to: &Path) -> Result<()> {
     // never another segment that happens to share the slot's name.
     //
     // Symlinked pool roots: if `~/.worktree-pool/<key>` is a symlink, this
-    // derivation uses the symlink basename. The README's documented form
+    // derivation uses the symlink basename. CLAUDE.md's documented form
     // (`ln -s /Volumes/big/<key> ~/.worktree-pool/<key>`) keeps both names
     // identical, so the anchor still matches `core.worktree`'s segments. If
     // the target dir name DIFFERS from the symlink basename, segment-anchored
-    // rewrite would silently no-op — see TODO.md and README §Layout for the
-    // documented constraint.
+    // rewrite would silently no-op — see TODO.md and CLAUDE.md §Layout for
+    // the documented constraint.
     let pool_key = to
         .parent()
         .and_then(|p| p.file_name())

@@ -5,11 +5,14 @@
 #
 # Usage:
 #   worktree-pool-session new <pool-key> <name> [--from <commit-ish>] [pool-acquire-flags...]
+#   worktree-pool-session sync [message]                # commit + merge origin/main + publish
 #   worktree-pool-session cleanup <pool-key> <name>     # 🟢/🟡/🔴 exit-trap classifier
 #   worktree-pool-session rm <pool-key> <name>          # safety-checked release
 #
-# Project-agnostic: pool key is the first arg. Each consumer wraps via a thin
-# `just` recipe that pre-fills the pool key.
+# Slot-lifecycle verbs (new/cleanup/rm) take a pool-key first arg. The git-flow
+# verb (sync) takes none — it operates on the current worktree's repo and finds
+# the main worktree via `git worktree list`. Each consumer wraps with a thin
+# `just` recipe.
 
 set -uo pipefail   # set -e is per-subcommand (cleanup must always exit 0).
 
@@ -78,14 +81,22 @@ cmd_new() {
     die "refusing to nest — already inside a pool slot."
   fi
 
-  # Resume detection — read BEFORE acquire (pool may rename mid-call).
-  local existing=0
-  [ -d "$POOL_ROOT/$name" ] && existing=1
-
-  local path
-  path=$(worktree-pool --pool "$key" acquire --name "$name" ${acquire_args[@]+"${acquire_args[@]}"} | tail -1)
-  if [[ -z "$path" || ! -d "$path" ]]; then
-    die "pool returned no path."
+  # If a slot with this name already exists, resume it instead of acquiring.
+  # The verb is `new`, so warn loudly — `--from` and other acquire flags are
+  # ignored on resume (slot stays at its existing commit).
+  local path existing=0
+  if [ -d "$POOL_ROOT/$name" ]; then
+    existing=1
+    path="$POOL_ROOT/$name"
+    local Y='' X=''
+    [ -t 2 ] && { Y=$'\e[33m'; X=$'\e[0m'; }
+    printf '%s⚠ slot %s/%s already exists — resuming (acquire flags ignored). Use `%s rm %s %s` first to recreate.%s\n' \
+      "$Y" "$key" "$name" "${0##*/}" "$key" "$name" "$X" >&2
+  else
+    path=$(worktree-pool --pool "$key" acquire --name "$name" ${acquire_args[@]+"${acquire_args[@]}"} | tail -1)
+    if [[ -z "$path" || ! -d "$path" ]]; then
+      die "pool returned no path."
+    fi
   fi
 
   # On exit, run our own cleanup verb. Quoting is conservative for keys/names with shell metachars.
@@ -98,6 +109,103 @@ cmd_new() {
   local cmd="${WORKTREE_POOL_SESSION_CMD:-ai}"
   [ "$existing" = 1 ] && cmd="$cmd --continue"
   (cd "$path" && exec "${SHELL:-zsh}" -ic "$cmd")
+}
+
+# Find the absolute path of the worktree that has refs/heads/main checked out.
+# Echoes empty string if no worktree holds main. Pool slots are themselves
+# `git worktree`s of source, so from any slot this returns the source path.
+find_main_path() {
+  git worktree list --porcelain | awk '
+    /^worktree /{p=substr($0, 10)}
+    /^branch refs\/heads\/main$/{print p; exit}
+  '
+}
+
+cmd_sync() {
+  set -e
+  local msg="${1:-}"
+
+  local branch
+  branch=$(git rev-parse --abbrev-ref HEAD)
+  if [ "$branch" = "main" ] || [ "$branch" = "HEAD" ]; then
+    die "sync: must run from a non-main branch (current: $branch)"
+  fi
+
+  local marker
+  marker=$(in_progress_marker .)
+  if [ -n "$marker" ]; then
+    echo "sync: in-progress $marker — finish or abort first." >&2
+    echo "After finishing the merge commit, re-run sync." >&2
+    exit 1
+  fi
+
+  local untracked
+  untracked=$(git ls-files --others --exclude-standard)
+  if [ -n "$untracked" ]; then
+    echo "sync: untracked files — add, ignore, or remove first:" >&2
+    printf '%s\n' "$untracked" | sed 's/^/  /' >&2
+    exit 1
+  fi
+
+  local main_path
+  main_path=$(find_main_path)
+  [ -n "$main_path" ] || die "sync: main is not checked out in any worktree"
+
+  # `git reset --hard HEAD` only touches tracked files, so untracked content
+  # in main survives the post-publish refresh; ignore `??` here.
+  local main_dirty
+  main_dirty=$(git -C "$main_path" status --porcelain | awk '!/^\?\?/')
+  if [ -n "$main_dirty" ]; then
+    echo "sync: main worktree ($main_path) has uncommitted tracked changes:" >&2
+    printf '%s\n' "$main_dirty" | sed 's/^/  /' >&2
+    exit 1
+  fi
+
+  # Auto-commit dirty tracked work. Refuse silent WIP commits.
+  if ! git diff --quiet || ! git diff --cached --quiet; then
+    if [ -z "$msg" ]; then
+      echo "sync: dirty tracked work needs a commit message:" >&2
+      git status --short >&2
+      echo >&2
+      echo "  sync \"feat: <what you did>\"" >&2
+      echo "  sync wip                          # shorthand → 'WIP via sync'" >&2
+      exit 1
+    fi
+    [ "$msg" = "wip" ] && msg="WIP via sync"
+    git add -u
+    git commit -m "$msg"
+  fi
+
+  # Merge origin/main. On conflict, halt with resume hint. On the resume path
+  # (after manual conflict resolution + commit), this is "Already up to date."
+  git fetch origin main
+  if ! git merge --no-ff -m "Sync main into $branch" origin/main; then
+    echo >&2
+    echo "sync: merge halted with conflicts. Resolve and either:" >&2
+    echo "  • finish: 'git add' the files, 'git commit', then re-run sync" >&2
+    echo "  • back out: 'git merge --abort'" >&2
+    exit 1
+  fi
+
+  # Publish: advance local main, refresh main worktree, atomic push.
+  # Re-fetch in case origin/main moved during a long conflict resolution.
+  git fetch origin main
+  if ! git merge-base --is-ancestor origin/main HEAD; then
+    echo "sync: origin/main has moved past your merge base." >&2
+    echo "  Re-merge with 'git merge --no-ff origin/main', resolve, commit, then re-run." >&2
+    exit 1
+  fi
+
+  local expected_main
+  expected_main=$(git rev-parse main)
+  # Skip the no-op so push-rejected re-runs are idempotent.
+  if [ "$expected_main" != "$(git rev-parse HEAD)" ]; then
+    git update-ref -m "sync from $branch" refs/heads/main HEAD "$expected_main"
+    git -C "$main_path" reset --hard HEAD >/dev/null
+  fi
+
+  git push --atomic origin main "$branch"
+  echo "sync: $branch published; main + origin/main + origin/$branch at $(git rev-parse --short HEAD)"
 }
 
 cmd_cleanup() {
@@ -189,7 +297,8 @@ cmd_rm() {
 verb="${1:-}"; shift || true
 case "$verb" in
   new)     cmd_new     "$@" ;;
+  sync)    cmd_sync    "$@" ;;
   cleanup) cmd_cleanup "$@" ;;
   rm)      cmd_rm      "$@" ;;
-  *)       die "usage: ${0##*/} {new|cleanup|rm} <pool-key> <name> ..." ;;
+  *)       die "usage: ${0##*/} new <pool-key> <name> ... | sync [message] | {cleanup|rm} <pool-key> <name>" ;;
 esac

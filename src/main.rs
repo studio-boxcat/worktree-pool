@@ -1,4 +1,4 @@
-//! See README.md for the design spec.
+//! See CLAUDE.md for the design spec.
 mod acquire;
 mod admin;
 mod atomic;

@@ -1,6 +1,6 @@
 //! `release` orchestration. Un-renames the slot to the smallest free `{group}-N`,
 //! deletes the branch (local + remote best-effort), drops the lock.
-//! See README.md §Lifecycle for the spec.
+//! See CLAUDE.md §Lifecycle for the spec.
 use anyhow::{Context, Result};
 use std::path::Path;
 

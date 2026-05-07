@@ -1,4 +1,4 @@
-//! CLI surface. See README.md for command semantics.
+//! CLI surface. See CLAUDE.md for command semantics.
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
