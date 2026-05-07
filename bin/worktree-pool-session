@@ -5,12 +5,13 @@
 #
 # Usage:
 #   worktree-pool-session path <pool-key> <name>        # print slot path; exit 0 if exists, 1 if not, 2 on error
-#   worktree-pool-session new <pool-key> <name> [--from <commit-ish>] [pool-acquire-flags...]
+#   worktree-pool-session go <pool-key> <name> [--from <commit-ish>] [pool-acquire-flags...]
 #   worktree-pool-session sync [message]                # commit + merge origin/main + publish
 #   worktree-pool-session cleanup <pool-key> <name>     # 🟢/🟡/🔴 exit-trap classifier
 #   worktree-pool-session rm <pool-key> <name>          # safety-checked release
+#   worktree-pool-session orient                        # print current repo path + CLAUDE.md
 #
-# Slot-scoped verbs (path/new/cleanup/rm) take a pool-key first arg. The git-flow
+# Slot-scoped verbs (path/go/cleanup/rm) take a pool-key first arg. The git-flow
 # verb (sync) takes none — it operates on the current worktree's repo and finds
 # the main worktree via `git worktree list`. Each consumer wraps with a thin
 # `just` recipe.
@@ -88,12 +89,12 @@ cmd_path() {
   [ -d "$path" ]
 }
 
-cmd_new() {
+cmd_go() {
   set -e
   local key="${1:-}"; shift || true
   local name="${1:-}"; shift || true
-  require_arg key  "$key"  "session new <pool-key> <name> [--from <commit-ish>] [pool-flags...]"
-  require_arg name "$name" "session new <pool-key> <name> [--from <commit-ish>] [pool-flags...]"
+  require_arg key  "$key"  "session go <pool-key> <name> [--from <commit-ish>] [pool-flags...]"
+  require_arg name "$name" "session go <pool-key> <name> [--from <commit-ish>] [pool-flags...]"
 
   # Translate `--from <X>` → `--commit <X>` for the underlying acquire.
   local acquire_args=() from=""
@@ -120,8 +121,8 @@ cmd_new() {
   fi
 
   # If a slot with this name already exists, resume it instead of acquiring.
-  # The verb is `new`, so warn loudly — `--from` and other acquire flags are
-  # ignored on resume (slot stays at its existing commit).
+  # Warn loudly — `--from` and other acquire flags are ignored on resume
+  # (slot stays at its existing commit).
   local path existing=0
   if [ -d "$POOL_ROOT/$name" ]; then
     existing=1
@@ -320,14 +321,33 @@ cmd_rm() {
   worktree-pool --pool "$key" release --name "$name"
 }
 
+# Print the current repo's toplevel path and CLAUDE.md to stdout. Intended for
+# AI-agent session bootstrap — `orient` answers "where am I and what are the
+# rules here." No pool-key argument; resolved from `git rev-parse`.
+cmd_orient() {
+  local repo
+  repo=$(git rev-parse --show-toplevel 2>/dev/null) || die "orient: not inside a git repo"
+  printf '%s\n' "$repo"
+  if [ -f "$repo/CLAUDE.md" ]; then
+    printf '\n'
+    cat "$repo/CLAUDE.md"
+  fi
+}
+
 # ---------- dispatch ----------
 
 verb="${1:-}"; shift || true
 case "$verb" in
   path)    cmd_path    "$@" ;;
-  new)     cmd_new     "$@" ;;
+  go)      cmd_go      "$@" ;;
+  new)
+    Y='' X=''
+    [ -t 2 ] && { Y=$'\e[33m'; X=$'\e[0m'; }
+    printf '%s⚠ `new` is deprecated — use `go` instead.%s\n' "$Y" "$X" >&2
+    cmd_go "$@" ;;
   sync)    cmd_sync    "$@" ;;
   cleanup) cmd_cleanup "$@" ;;
   rm)      cmd_rm      "$@" ;;
-  *)       die "usage: ${0##*/} {path|new|cleanup|rm} <pool-key> <name> ... | sync [message]" ;;
+  orient)  cmd_orient  "$@" ;;
+  *)       die "usage: ${0##*/} {path|go|cleanup|rm} <pool-key> <name> ... | sync [message] | orient" ;;
 esac

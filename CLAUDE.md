@@ -222,13 +222,14 @@ Bash dispatcher in `bin/worktree-pool-session`. Subcommands wrapping the slot + 
 
 ```sh
 worktree-pool-session path    <pool-key> <name>     # print slot path; exit 0 if exists, 1 if not, 2 on error
-worktree-pool-session new     <pool-key> <name> [--from <commit-ish>] [pool-acquire-flags...]
+worktree-pool-session go      <pool-key> <name> [--from <commit-ish>] [pool-acquire-flags...]
 worktree-pool-session sync    [message]             # commit + merge origin/main + publish
 worktree-pool-session cleanup <pool-key> <name>     # 🟢/🟡/🔴 exit-trap classifier
 worktree-pool-session rm      <pool-key> <name>     # safety-checked release
+worktree-pool-session orient                        # print current repo path + CLAUDE.md
 ```
 
-`new` acquires/resumes a slot, prints a banner, `cd`s into the slot, runs `$WORKTREE_POOL_SESSION_CMD` (default `ai`) in `$SHELL`, and traps `cleanup` on exit. `--from <commit-ish>` (optional) forks the new branch from the given ref; translated to `acquire --commit <X>`. Omit to use the pool's `default_commit`. If a slot with `<name>` already exists, `new` resumes it with a loud warning (acquire flags are ignored on resume — slot stays at its existing commit); the underlying `ai` is invoked with `--continue`. Use `rm` first if you want to recreate from scratch.
+`go` acquires/resumes a slot, prints a banner, `cd`s into the slot, runs `$WORKTREE_POOL_SESSION_CMD` (default `ai`) in `$SHELL`, and traps `cleanup` on exit. `--from <commit-ish>` (optional) forks the new branch from the given ref; translated to `acquire --commit <X>`. Omit to use the pool's `default_commit`. If a slot with `<name>` already exists, `go` resumes it with a loud warning (acquire flags are ignored on resume — slot stays at its existing commit); the underlying `ai` is invoked with `--continue`. Use `rm` first if you want to recreate from scratch. (Legacy alias `new` is accepted with a deprecation warning.)
 
 `rm` is the manual one-shot with the same safety checks (refuse on dirty / unmerged); used directly when the session is gone but state persists.
 
@@ -236,15 +237,17 @@ worktree-pool-session rm      <pool-key> <name>     # safety-checked release
 
 `sync` takes no pool-key — it operates on the current worktree's repo and finds the main worktree via `git worktree list`. See [§Sync flow](#sync-flow) below.
 
-Cleanup classifier (always exits 0 — it's an exit-trap target, so `wt-new`'s exit trap doesn't muddy the user's shell exit status):
+`orient` prints the current repo's toplevel path followed by its `CLAUDE.md` to stdout. Intended for AI-agent bootstrap — answers "where am I and what are the rules here." No pool-key argument; resolved from `git rev-parse`. Refuses if not inside a git repo.
+
+Cleanup classifier (always exits 0 — it's an exit-trap target, so `wt-go`'s exit trap doesn't muddy the user's shell exit status):
 
 | Marker | Condition | Action |
 |---|---|---|
 | 🟢 | clean working tree AND 0 commits ahead `origin/main` | un-rename + delete branch + release (recycle) |
-| 🟡 | dirty / untracked files | leave personalized — resume with `session new` later |
+| 🟡 | dirty / untracked files | leave personalized — resume with `session go` later |
 | 🔴 | non-zero commits ahead `origin/main` (unmerged) | loud refuse — operator resolves before recycling |
 
-Re-running `session new <key> <name>` resumes any 🟡 / 🔴 slot.
+Re-running `session go <key> <name>` resumes any 🟡 / 🔴 slot.
 
 ### Sync flow
 
@@ -273,8 +276,8 @@ Each consumer wraps the pool with thin recipes pre-filling the pool key. `worktr
 
 ```bash
 # Consumer's justfile, e.g. myapp
-wt-new name *flags:
-    @worktree-pool-session new myapp {{quote(name)}} {{flags}}
+wt-go name *flags:
+    @worktree-pool-session go myapp {{quote(name)}} {{flags}}
 wt-rm name:
     @worktree-pool-session rm myapp {{quote(name)}}
 wt-cleanup name:
