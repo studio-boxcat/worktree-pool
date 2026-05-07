@@ -225,11 +225,14 @@ worktree-pool-session new     <pool-key> <name> [--from <commit-ish>] [pool-acqu
 worktree-pool-session sync    [message]             # commit + merge origin/main + publish
 worktree-pool-session cleanup <pool-key> <name>     # 🟢/🟡/🔴 exit-trap classifier
 worktree-pool-session rm      <pool-key> <name>     # safety-checked release
+worktree-pool-session path    <pool-key> <name>     # print slot path; exit 0 if exists, 1 if not, 2 on error
 ```
 
 `new` acquires/resumes a slot, prints a banner, `cd`s into the slot, runs `$WORKTREE_POOL_SESSION_CMD` (default `ai`) in `$SHELL`, and traps `cleanup` on exit. `--from <commit-ish>` (optional) forks the new branch from the given ref; translated to `acquire --commit <X>`. Omit to use the pool's `default_commit`. If a slot with `<name>` already exists, `new` resumes it with a loud warning (acquire flags are ignored on resume — slot stays at its existing commit); the underlying `ai` is invoked with `--continue`. Use `rm` first if you want to recreate from scratch.
 
 `rm` is the manual one-shot with the same safety checks (refuse on dirty / unmerged); used directly when the session is gone but state persists.
+
+`path` is the predicate query — prints `~/.worktree-pool/<key>/<name>` on stdout (always, when key + pool are valid) and exits 0 if the slot exists, 1 if it doesn't, 2 on usage / pool-not-initialized. Lets consumer recipes branch on resume vs. fresh acquire (`if path … >/dev/null; then …`) without re-stitching the pool-root path themselves. Pattern matches `git rev-parse --git-dir`, `brew --prefix`, `pyenv prefix`.
 
 `sync` takes no pool-key — it operates on the current worktree's repo and finds the main worktree via `git worktree list`. See [§Sync flow](#sync-flow) below.
 
@@ -276,6 +279,8 @@ wt-rm name:
     @worktree-pool-session rm myapp {{quote(name)}}
 wt-cleanup name:
     @worktree-pool-session cleanup myapp {{quote(name)}}
+wt-path name:
+    @worktree-pool-session path myapp {{quote(name)}}
 wt-ls:
     @worktree-pool --pool myapp ls
 wt-info name:
@@ -284,7 +289,7 @@ wt-sync message="":
     @worktree-pool-session sync {{quote(message)}}
 ```
 
-Pool key is the first positional for slot-lifecycle verbs → project-agnostic. Same shape works for any pool. Recipes are host-agnostic — pool keys map to fixed paths under `~/.worktree-pool/<key>/`, so the same recipe runs on both server and laptop.
+Pool key is the first positional for slot-scoped verbs → project-agnostic. Same shape works for any pool. Recipes are host-agnostic — pool keys map to fixed paths under `~/.worktree-pool/<key>/`, so the same recipe runs on both server and laptop.
 
 ---
 
