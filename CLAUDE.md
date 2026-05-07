@@ -229,7 +229,19 @@ worktree-pool-session rm      <pool-key> <name>     # safety-checked release
 worktree-pool-session orient                        # print current repo path + CLAUDE.md
 ```
 
-`go` acquires/resumes a slot, prints a banner, `cd`s into the slot, runs `$WORKTREE_POOL_SESSION_CMD` (default `ai`) in `$SHELL`, and traps `cleanup` on exit. `--from <commit-ish>` (optional) forks the new branch from the given ref; translated to `acquire --commit <X>`. Omit to use the pool's `default_commit`. If a slot with `<name>` already exists, `go` resumes it with a loud warning (acquire flags are ignored on resume — slot stays at its existing commit); the underlying `ai` is invoked with `--continue`. Use `rm` first if you want to recreate from scratch. (Legacy alias `new` is accepted with a deprecation warning.)
+`go` acquires/resumes a slot, prints a banner, `cd`s into the slot, runs `$WORKTREE_POOL_SESSION_CMD -n <name>` (default `ai`) in `$SHELL`, and traps an exit handler (default: the `cleanup` verb; overridable — see Hooks). The `-n <name>` is claude's session display name (visible in the prompt box, `/resume` picker, terminal title); assumes the configured launcher accepts it.
+
+`--from <commit-ish>` (optional) forks the new branch from the given ref; translated to `acquire --commit <X>`. Omit to use the pool's `default_commit`. If a slot with `<name>` already exists, `go` resumes it with a loud warning (acquire flags are ignored on resume — slot stays at its existing commit); the underlying `ai` is invoked with `--continue`. Use `rm` first if you want to recreate from scratch. (Legacy alias `new` is accepted with a deprecation warning.)
+
+**Hooks** (env vars; let project wrappers reuse `go` for the shared 80% and inject project-specific extras):
+
+| Env var | Behavior |
+|---|---|
+| `WORKTREE_POOL_SESSION_CMD` | Launcher; default `ai`. Receives `-n <name>` and `--continue` (on resume) appended. |
+| `WORKTREE_POOL_SESSION_PRE_HOOK` | Shell snippet `eval`d in `cmd_go`'s shell after the banner, before launch. Non-zero exit aborts launch and triggers the cleanup trap. For deps install, dev-server start, project-specific banners. |
+| `WORKTREE_POOL_SESSION_CLEANUP_CMD` | Overrides the EXIT trap target (default `worktree-pool-session cleanup "$WT_KEY" "$WT_NAME"`). The override is responsible for delegating to `cleanup` itself if it wants the slot recycled — skipping it leaves the slot held. |
+
+Hooks see `$WT_KEY`, `$WT_NAME`, `$WT_PATH`, `$WT_FRESH` (1=fresh acquire, 0=resume) in env. **Quoting:** `CLEANUP_CMD` is a string passed to `trap`, so its `$WT_*` references must defer expansion to fire-time — escape (`\$WT_NAME`) or single-quote the assignment (`CLEANUP_CMD='just wt-cleanup "$WT_NAME"'`). Naked `"$WT_NAME"` expands at export-time (likely empty in the caller's env) and silently misroutes the trap. `PRE_HOOK` is `eval`d once at fire-time, so quoting is just normal shell.
 
 `rm` is the manual one-shot with the same safety checks (refuse on dirty / unmerged); used directly when the session is gone but state persists.
 

@@ -138,14 +138,35 @@ cmd_go() {
     fi
   fi
 
-  # On exit, run our own cleanup verb. Quoting is conservative for keys/names with shell metachars.
-  local self
+  # Hook contract: WT_KEY/WT_NAME/WT_PATH/WT_FRESH (1=fresh, 0=resume) exported
+  # for both PRE_HOOK and CLEANUP_CMD; expand at fire time.
+  export WT_KEY="$key" WT_NAME="$name" WT_PATH="$path"
+  export WT_FRESH=$([ "$existing" = 0 ] && echo 1 || echo 0)
+
+  # EXIT trap. Default = our own `cleanup` verb; override for wrappers that
+  # need extras (dev-server stop, meta sweep). $WT_KEY/$WT_NAME expand at
+  # trap-fire time, so the override sees the right slot.
+  local self trap_cmd
   self="$0"
-  trap "'$self' cleanup '$key' '$name'" EXIT
+  if [ -n "${WORKTREE_POOL_SESSION_CLEANUP_CMD:-}" ]; then
+    trap_cmd="$WORKTREE_POOL_SESSION_CLEANUP_CMD"
+  else
+    trap_cmd="'$self' cleanup \"\$WT_KEY\" \"\$WT_NAME\""
+  fi
+  trap "$trap_cmd" EXIT
 
   printf '\n──── session: %s/%s @ %s ────\n\n' "$key" "$name" "$path"
 
-  local cmd="${WORKTREE_POOL_SESSION_CMD:-ai}"
+  # Pre-launch hook: deps install, dev-server start, project banner, etc.
+  # Eval'd in cmd_go's shell; aborts launch on non-zero (set -e). Hook reads
+  # $WT_* from env.
+  [ -n "${WORKTREE_POOL_SESSION_PRE_HOOK:-}" ] && eval "$WORKTREE_POOL_SESSION_PRE_HOOK"
+
+  # `-n <name>` sets claude's session display name (prompt box, /resume picker,
+  # terminal title). Assumes the launcher accepts it — true for `claude` and
+  # the default `ai` wrapper. printf %q quotes for the inline `zsh -ic` shell.
+  local cmd
+  printf -v cmd '%s -n %q' "${WORKTREE_POOL_SESSION_CMD:-ai}" "$name"
   [ "$existing" = 1 ] && cmd="$cmd --continue"
   (cd "$path" && exec "${SHELL:-zsh}" -ic "$cmd")
 }
