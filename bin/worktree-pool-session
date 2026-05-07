@@ -4,16 +4,16 @@
 # See https://github.com/studio-boxcat/worktree-pool for the underlying tool.
 #
 # Usage:
+#   worktree-pool-session path <pool-key> <name>        # print slot path; exit 0 if exists, 1 if not, 2 on error
 #   worktree-pool-session new <pool-key> <name> [--from <commit-ish>] [pool-acquire-flags...]
 #   worktree-pool-session sync [message]                # commit + merge origin/main + publish
 #   worktree-pool-session cleanup <pool-key> <name>     # 🟢/🟡/🔴 exit-trap classifier
 #   worktree-pool-session rm <pool-key> <name>          # safety-checked release
-#   worktree-pool-session path <pool-key> <name>        # print slot path; exit 0 if exists, 1 if not, 2 on error
 #
-# Slot-lifecycle verbs (new/cleanup/rm) and the query verb (path) take a pool-key
-# first arg. The git-flow verb (sync) takes none — it operates on the current
-# worktree's repo and finds the main worktree via `git worktree list`. Each
-# consumer wraps with a thin `just` recipe.
+# Slot-scoped verbs (path/new/cleanup/rm) take a pool-key first arg. The git-flow
+# verb (sync) takes none — it operates on the current worktree's repo and finds
+# the main worktree via `git worktree list`. Each consumer wraps with a thin
+# `just` recipe.
 
 set -uo pipefail   # set -e is per-subcommand (cleanup must always exit 0).
 
@@ -49,7 +49,44 @@ ahead_count() {
   git -C "$path" rev-list --count "origin/main..$branch" 2>/dev/null || echo '?'
 }
 
+# Find the absolute path of the worktree that has refs/heads/main checked out.
+# Echoes empty string if no worktree holds main. Pool slots are themselves
+# `git worktree`s of source, so from any slot this returns the source path.
+find_main_path() {
+  git worktree list --porcelain | awk '
+    /^worktree /{p=substr($0, 10)}
+    /^branch refs\/heads\/main$/{print p; exit}
+  '
+}
+
 # ---------- subcommands ----------
+
+# Print the absolute slot path for `<pool-key>/<name>`. Always emits the path
+# on stdout (when key+pool are valid) so callers that only need exists/not
+# can `>/dev/null` it. Exit codes:
+#   0 — slot exists at that path (resumable / introspectable)
+#   1 — pool exists but slot doesn't (caller would `acquire` to create)
+#   2 — usage error or pool not initialized
+# Distinct from the predicate exits so callers can branch without parsing.
+cmd_path() {
+  local key="${1:-}"; shift || true
+  local name="${1:-}"; shift || true
+  if [ -z "$key" ] || [ -z "$name" ]; then
+    echo "usage: ${0##*/} path <pool-key> <name>" >&2
+    exit 2
+  fi
+
+  local POOL_ROOT
+  POOL_ROOT=$(pool_root "$key")
+  if [ ! -d "$POOL_ROOT" ]; then
+    echo "${0##*/}: pool '$key' not initialized at $POOL_ROOT" >&2
+    exit 2
+  fi
+
+  local path="$POOL_ROOT/$name"
+  printf '%s\n' "$path"
+  [ -d "$path" ]
+}
 
 cmd_new() {
   set -e
@@ -110,16 +147,6 @@ cmd_new() {
   local cmd="${WORKTREE_POOL_SESSION_CMD:-ai}"
   [ "$existing" = 1 ] && cmd="$cmd --continue"
   (cd "$path" && exec "${SHELL:-zsh}" -ic "$cmd")
-}
-
-# Find the absolute path of the worktree that has refs/heads/main checked out.
-# Echoes empty string if no worktree holds main. Pool slots are themselves
-# `git worktree`s of source, so from any slot this returns the source path.
-find_main_path() {
-  git worktree list --porcelain | awk '
-    /^worktree /{p=substr($0, 10)}
-    /^branch refs\/heads\/main$/{print p; exit}
-  '
 }
 
 cmd_sync() {
@@ -293,41 +320,14 @@ cmd_rm() {
   worktree-pool --pool "$key" release --name "$name"
 }
 
-# Print the absolute slot path for `<pool-key>/<name>`. Always emits the path
-# on stdout (when key+pool are valid) so callers that only need exists/not
-# can `>/dev/null` it. Exit codes:
-#   0 — slot exists at that path (resumable / introspectable)
-#   1 — pool exists but slot doesn't (caller would `acquire` to create)
-#   2 — usage error or pool not initialized
-# Distinct from the predicate exits so callers can branch without parsing.
-cmd_path() {
-  local key="${1:-}"; shift || true
-  local name="${1:-}"; shift || true
-  if [ -z "$key" ] || [ -z "$name" ]; then
-    echo "usage: ${0##*/} path <pool-key> <name>" >&2
-    exit 2
-  fi
-
-  local POOL_ROOT
-  POOL_ROOT=$(pool_root "$key")
-  if [ ! -d "$POOL_ROOT" ]; then
-    echo "${0##*/}: pool '$key' not initialized at $POOL_ROOT" >&2
-    exit 2
-  fi
-
-  local path="$POOL_ROOT/$name"
-  printf '%s\n' "$path"
-  [ -d "$path" ]
-}
-
 # ---------- dispatch ----------
 
 verb="${1:-}"; shift || true
 case "$verb" in
+  path)    cmd_path    "$@" ;;
   new)     cmd_new     "$@" ;;
   sync)    cmd_sync    "$@" ;;
   cleanup) cmd_cleanup "$@" ;;
   rm)      cmd_rm      "$@" ;;
-  path)    cmd_path    "$@" ;;
-  *)       die "usage: ${0##*/} new <pool-key> <name> ... | sync [message] | {cleanup|rm|path} <pool-key> <name>" ;;
+  *)       die "usage: ${0##*/} {path|new|cleanup|rm} <pool-key> <name> ... | sync [message]" ;;
 esac

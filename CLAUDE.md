@@ -221,11 +221,11 @@ Every recycled slot in the pool has submodules — Unity packages, FacebookSDK, 
 Bash dispatcher in `bin/worktree-pool-session`. Subcommands wrapping the slot + git-flow lifecycle for interactive dev work:
 
 ```sh
+worktree-pool-session path    <pool-key> <name>     # print slot path; exit 0 if exists, 1 if not, 2 on error
 worktree-pool-session new     <pool-key> <name> [--from <commit-ish>] [pool-acquire-flags...]
 worktree-pool-session sync    [message]             # commit + merge origin/main + publish
 worktree-pool-session cleanup <pool-key> <name>     # 🟢/🟡/🔴 exit-trap classifier
 worktree-pool-session rm      <pool-key> <name>     # safety-checked release
-worktree-pool-session path    <pool-key> <name>     # print slot path; exit 0 if exists, 1 if not, 2 on error
 ```
 
 `new` acquires/resumes a slot, prints a banner, `cd`s into the slot, runs `$WORKTREE_POOL_SESSION_CMD` (default `ai`) in `$SHELL`, and traps `cleanup` on exit. `--from <commit-ish>` (optional) forks the new branch from the given ref; translated to `acquire --commit <X>`. Omit to use the pool's `default_commit`. If a slot with `<name>` already exists, `new` resumes it with a loud warning (acquire flags are ignored on resume — slot stays at its existing commit); the underlying `ai` is invoked with `--continue`. Use `rm` first if you want to recreate from scratch.
