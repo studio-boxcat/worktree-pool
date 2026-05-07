@@ -4,7 +4,7 @@
 # See https://github.com/studio-boxcat/worktree-pool for the underlying tool.
 #
 # Usage:
-#   worktree-pool-session go <pool-key> <name> [pool-acquire-flags...]
+#   worktree-pool-session new <pool-key> <name> [--from <commit-ish>] [pool-acquire-flags...]
 #   worktree-pool-session cleanup <pool-key> <name>     # 🟢/🟡/🔴 exit-trap classifier
 #   worktree-pool-session rm <pool-key> <name>          # safety-checked release
 #
@@ -47,12 +47,24 @@ ahead_count() {
 
 # ---------- subcommands ----------
 
-cmd_go() {
+cmd_new() {
   set -e
   local key="${1:-}"; shift || true
   local name="${1:-}"; shift || true
-  require_arg key  "$key"  "session go <pool-key> <name> [pool-flags...]"
-  require_arg name "$name" "session go <pool-key> <name> [pool-flags...]"
+  require_arg key  "$key"  "session new <pool-key> <name> [--from <commit-ish>] [pool-flags...]"
+  require_arg name "$name" "session new <pool-key> <name> [--from <commit-ish>] [pool-flags...]"
+
+  # Translate `--from <X>` → `--commit <X>` for the underlying acquire.
+  local acquire_args=() from=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from)     [ $# -ge 2 ] || die "--from requires an argument"; from="$2"; shift 2 ;;
+      --from=*)   from="${1#--from=}"; shift ;;
+      *)          acquire_args+=("$1"); shift ;;
+    esac
+  done
+  # `${arr[@]+...}` form keeps empty-array expansion safe under bash 3.2's `set -u`.
+  [ -n "$from" ] && acquire_args=(--commit "$from" ${acquire_args[@]+"${acquire_args[@]}"})
 
   local POOL_ROOT
   POOL_ROOT=$(pool_root "$key")
@@ -71,7 +83,7 @@ cmd_go() {
   [ -d "$POOL_ROOT/$name" ] && existing=1
 
   local path
-  path=$(worktree-pool --pool "$key" acquire --name "$name" "$@" | tail -1)
+  path=$(worktree-pool --pool "$key" acquire --name "$name" ${acquire_args[@]+"${acquire_args[@]}"} | tail -1)
   if [[ -z "$path" || ! -d "$path" ]]; then
     die "pool returned no path."
   fi
@@ -176,8 +188,8 @@ cmd_rm() {
 
 verb="${1:-}"; shift || true
 case "$verb" in
-  go)      cmd_go      "$@" ;;
+  new)     cmd_new     "$@" ;;
   cleanup) cmd_cleanup "$@" ;;
   rm)      cmd_rm      "$@" ;;
-  *)       die "usage: ${0##*/} {go|cleanup|rm} <pool-key> <name> ..." ;;
+  *)       die "usage: ${0##*/} {new|cleanup|rm} <pool-key> <name> ..." ;;
 esac

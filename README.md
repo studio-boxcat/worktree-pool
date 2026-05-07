@@ -211,27 +211,27 @@ To rebuild the Rust binary: `just release-binary` (reproducible flags + codesign
 Three subcommands wrapping the lifecycle for interactive dev work:
 
 ```sh
-worktree-pool-session go      <pool-key> <name> [pool-acquire-flags...]
+worktree-pool-session new     <pool-key> <name> [--from <commit-ish>] [pool-acquire-flags...]
 worktree-pool-session cleanup <pool-key> <name>     # 🟢/🟡/🔴 exit-trap classifier
 worktree-pool-session rm      <pool-key> <name>     # safety-checked release
 ```
 
-`go` acquires/resumes a slot, prints a banner, `cd`s into the slot, runs `$WORKTREE_POOL_SESSION_CMD` (default `ai`) in `$SHELL`, and traps `cleanup` on exit. `rm` is the manual safety-checked release. `cleanup` classifies the slot's state on exit and either recycles or leaves it personalized:
+`new` acquires/resumes a slot, prints a banner, `cd`s into the slot, runs `$WORKTREE_POOL_SESSION_CMD` (default `ai`) in `$SHELL`, and traps `cleanup` on exit. `--from <commit-ish>` forks the new branch from the given ref (translates to `acquire --commit <X>`); omit to use the pool's `default_commit`. `rm` is the manual safety-checked release. `cleanup` classifies the slot's state on exit and either recycles or leaves it personalized:
 
 | Marker | Condition | Action |
 |---|---|---|
 | 🟢 | working tree clean AND 0 commits ahead `origin/main` | un-rename + delete branch + release (auto-recycle) |
-| 🟡 | dirty / untracked files | leave personalized — resume with `session go` later |
+| 🟡 | dirty / untracked files | leave personalized — resume with `session new` later |
 | 🔴 | non-zero commits ahead `origin/main` (unmerged) | loud refuse — operator resolves via `git push` / `branch -D` / merge-back-to-main |
 
-The classifier always exits 0 so `wt-go`'s exit trap doesn't muddy the user's shell exit status. Re-running `session go <key> <name>` resumes any 🟡 / 🔴 slot.
+The classifier always exits 0 so `wt-new`'s exit trap doesn't muddy the user's shell exit status. Re-running `session new <key> <name>` resumes any 🟡 / 🔴 slot.
 
 Per-consumer integration is a thin `just` recipe pre-filling the pool key:
 
 ```bash
-# myapp's justfile (just wt-go <name>)
-wt-go name *flags:
-    @worktree-pool-session go myapp {{quote(name)}} {{flags}}
+# myapp's justfile (just wt-new <name>)
+wt-new name *flags:
+    @worktree-pool-session new myapp {{quote(name)}} {{flags}}
 wt-rm name:
     @worktree-pool-session rm myapp {{quote(name)}}
 wt-cleanup name:

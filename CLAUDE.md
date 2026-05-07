@@ -97,17 +97,19 @@ Tag filter applies at top level only; nested submodules always init when their p
 Bash dispatcher in `bin/worktree-pool-session`. Three subcommands wrapping the lifecycle for interactive dev work:
 
 ```sh
-worktree-pool-session go      <pool-key> <name> [pool-acquire-flags...]
+worktree-pool-session new     <pool-key> <name> [--from <commit-ish>] [pool-acquire-flags...]
 worktree-pool-session cleanup <pool-key> <name>     # 🟢/🟡/🔴 exit-trap classifier
 worktree-pool-session rm      <pool-key> <name>     # safety-checked release
 ```
+
+`--from <commit-ish>` (optional) forks the new branch from the given ref; translated to `acquire --commit <X>`. Omit to use the pool's `default_commit`.
 
 Cleanup classifier (always exits 0 — it's an exit-trap target):
 
 | Marker | Condition | Action |
 |---|---|---|
 | 🟢 | clean working tree AND 0 commits ahead `origin/main` | un-rename + delete branch + release (recycle) |
-| 🟡 | dirty / untracked files | leave personalized — resume with `session go` later |
+| 🟡 | dirty / untracked files | leave personalized — resume with `session new` later |
 | 🔴 | non-zero commits ahead `origin/main` (unmerged) | loud refuse — operator resolves before recycling |
 
 `rm` is the manual one-shot with the same safety checks (refuse on dirty / unmerged); used directly when the session is gone but state persists.
@@ -115,9 +117,9 @@ Cleanup classifier (always exits 0 — it's an exit-trap target):
 Pool key is the first positional → project-agnostic. Each consumer wraps via a thin `just` recipe pre-filling the key:
 
 ```bash
-# myapp's justfile (just wt-go <name>)
-wt-go name *flags:
-    @worktree-pool-session go myapp {{quote(name)}} {{flags}}
+# myapp's justfile (just wt-new <name>)
+wt-new name *flags:
+    @worktree-pool-session new myapp {{quote(name)}} {{flags}}
 ```
 
 Generic; same shape works for any pool.
@@ -140,8 +142,8 @@ Each consumer wraps the pool with thin recipes pre-filling the pool key. `worktr
 
 ```bash
 # Consumer's justfile, e.g. myapp
-wt-go name *flags:
-    @worktree-pool-session go myapp {{quote(name)}} {{flags}}
+wt-new name *flags:
+    @worktree-pool-session new myapp {{quote(name)}} {{flags}}
 wt-rm name:
     @worktree-pool-session rm myapp {{quote(name)}}
 wt-cleanup name:
