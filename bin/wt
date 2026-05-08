@@ -499,7 +499,10 @@ cmd_rm() {
   require_arg name "$name" "wt rm <name> [--force]"
 
   local path="$POOL_ROOT/$name"
-  [ -d "$path" ] || die "no slot named '$name' in pool '$POOL_KEY' at $POOL_ROOT."
+  [ -d "$path" ] || die "no slot named '$name' in pool '$POOL_KEY' at $POOL_ROOT.
+  If the slot dir is gone but the branch persists (orphan from manual cleanup),
+  remove it directly:
+    git branch -D $name && git push origin :$name   # only if merged into main"
 
   if ! slot_repo_ok "$path"; then
     die "slot '$name' at $path is broken (no valid .git). Recover with: rm -rf $(printf '%q' "$path")"
