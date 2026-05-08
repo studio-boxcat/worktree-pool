@@ -12,7 +12,7 @@ This file is both the user-facing README and the contract — what callers and i
 
 A **pool** is a fixed-cardinality set of slots backed by a single source repo. Slots are interchangeable git worktrees; each `acquire` picks an idle slot, renames it to the caller's name, creates a branch, and hands back the path. `release` un-renames it back to the idle namespace and deletes the branch. Caches inside the slot dir survive recycling.
 
-Pools are referenced by **key** (e.g. `myapp`, `another-pool`). Path: `$WORKTREE_ROOT/<key>/`. `WORKTREE_ROOT` must be exported by the shell (set in `~/.zshenv.local` — fail-loud if unset; no fallback). For pools needing a different physical location (external SSD, etc.), symlink: `ln -s /Volumes/big/<key> "$WORKTREE_ROOT/<key>"`.
+Pools are referenced by **key** (e.g. `myapp`, `another-pool`). Path: `$WORKTREE_ROOT/<key>/` — env var required, no fallback (set in `~/.zshenv.local`). For pools needing a different physical location (external SSD, etc.), symlink: `ln -s /Volumes/big/<key> "$WORKTREE_ROOT/<key>"`.
 
 A **group** is an optional sub-namespace of slots (e.g. `ios`, `android`). With groups, idle slots are named `{group}-{N}`; without, just `slot-{N}`. Groups exist mainly for active-platform separation (e.g. Unity rebuilding `Library/` on iOS↔Android flip).
 
@@ -353,7 +353,7 @@ Slots share `.git/` and `.git/modules/` with the source repo, but **not** the wo
 Cuts that simplify the design:
 
 - **No GC.** All cleanup is operator-explicit. Capacity-bound errors list the table; operator picks a slot to release.
-- **No registry.** Pool key → path mapping is convention-based (`$WORKTREE_ROOT/<key>/`). No `~/.config/...`-tracked file. `WORKTREE_ROOT` is the only env input — it picks the parent dir, not the per-pool location.
+- **No registry.** Pool key → path mapping is convention-based (`$WORKTREE_ROOT/<key>/`). No `~/.config/...`-tracked file.
 - **No cross-host coordination.** Pools are host-local. Network-mounted shared pools are not supported (no `host`/`pid` liveness checks).
 - **No dead-process detection.** A SIGKILL'd holder leaves the lock; operator notices via `ls` and runs `release`. The exception is the init mutex (60min stale → reclaim).
 - **No auto-recovery.** Process crashes between rename and lock-write may leave orphans visible in `ls`; operator inspects and recovers manually.
@@ -383,7 +383,7 @@ arm64 macOS only. Two artifacts ship from `bin/`:
 ```sh
 git clone https://github.com/studio-boxcat/worktree-pool.git ~/Develop/worktree-pool
 cd ~/Develop/worktree-pool && just install
-echo 'export WORKTREE_ROOT="$HOME/.worktree-pool"' >> ~/.zshenv.local   # pick any path — fail-loud if unset
+echo 'export WORKTREE_ROOT="$HOME/.worktree-pool"' >> ~/.zshenv.local
 worktree-pool doctor
 ```
 
