@@ -160,9 +160,16 @@ source_hooks() {
 }
 
 # Call hook function $1 if defined, passing remaining args. No-op otherwise.
+# Always returns 0 when the hook is absent — under cmd_go's `set -e`, a bare
+# `declare -F … && fn` would abort the script when the hook isn't defined
+# (the && short-circuit propagates declare's non-zero status as the function's
+# exit code). When the hook IS defined, its exit status propagates so set -e
+# can still abort on a real hook failure.
 call_hook() {
   local fn="$1"; shift
-  declare -F "$fn" >/dev/null 2>&1 && "$fn" "$@"
+  if declare -F "$fn" >/dev/null 2>&1; then
+    "$fn" "$@"
+  fi
 }
 
 # ---------- subcommands ----------
@@ -276,7 +283,26 @@ Recover with: rm -rf $(printf '%q' "$path"), then re-run."
   local cmd
   printf -v cmd '%s -n %q' "$launcher" "$name"
   [ "$existing" = 1 ] && cmd="$cmd --continue"
+
+  # Time the inner shell so we can flag suspiciously short sessions: if the
+  # launcher dies in <3s on a FRESH acquire (no real work could've happened),
+  # the trap is about to recycle the slot and the operator would otherwise
+  # see only "🟢 recycled cleanly" — no clue the launcher misfired (auth, env,
+  # missing TTY, missing $WT_LAUNCHER on PATH). `set +e` for the subshell so a
+  # non-zero exit doesn't trip cmd_go's `set -e` before we print the warning.
+  local launch_start launch_dur
+  launch_start=$(date +%s)
+  set +e
   (cd "$path" && exec "${SHELL:-zsh}" -ic "$cmd")
+  set -e
+  launch_dur=$(( $(date +%s) - launch_start ))
+
+  if [ "$launch_dur" -lt 3 ] && [ "$existing" = 0 ]; then
+    local Y='' X=''
+    [ -t 2 ] && { Y=$'\e[33m'; X=$'\e[0m'; }
+    printf '%s⚠ launcher (%s) exited after %ss — likely misfired (auth, env, missing TTY, or %s not on PATH).\n  Slot will be auto-recycled by the EXIT trap. Re-run after fixing, or use `%s rm --force %s` if you need a clean retry.%s\n' \
+      "$Y" "$launcher" "$launch_dur" "$launcher" "${0##*/}" "$name" "$X" >&2
+  fi
 }
 
 cmd_sync() {
