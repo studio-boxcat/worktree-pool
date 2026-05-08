@@ -10,7 +10,7 @@ mkdir -p "$LINK_DIR"
 # Symlinks: <tool> → <repo>/bin/<artifact>
 declare -a LINKS=(
   "worktree-pool:$REPO_ROOT/bin/worktree-pool-darwin-arm64"
-  "worktree-pool-session:$REPO_ROOT/bin/worktree-pool-session"
+  "wt:$REPO_ROOT/bin/wt"
 )
 
 if [ "$(uname -sm)" != "Darwin arm64" ]; then

@@ -12,7 +12,7 @@ This file is both the user-facing README and the contract — what callers and i
 
 A **pool** is a fixed-cardinality set of slots backed by a single source repo. Slots are interchangeable git worktrees; each `acquire` picks an idle slot, renames it to the caller's name, creates a branch, and hands back the path. `release` un-renames it back to the idle namespace and deletes the branch. Caches inside the slot dir survive recycling.
 
-Pools are referenced by **key** (e.g. `myapp`, `another-pool`). Path is fixed: `~/.worktree-pool/<key>/`. No registry, no env var. For pools needing a different physical location (external SSD, etc.), symlink: `ln -s /Volumes/big/<key> ~/.worktree-pool/<key>`.
+Pools are referenced by **key** (e.g. `myapp`, `another-pool`). Path: `$WORKTREE_ROOT/<key>/`. `WORKTREE_ROOT` must be exported by the shell (set in `~/.zshenv.local` — fail-loud if unset; no fallback). For pools needing a different physical location (external SSD, etc.), symlink: `ln -s /Volumes/big/<key> "$WORKTREE_ROOT/<key>"`.
 
 A **group** is an optional sub-namespace of slots (e.g. `ios`, `android`). With groups, idle slots are named `{group}-{N}`; without, just `slot-{N}`. Groups exist mainly for active-platform separation (e.g. Unity rebuilding `Library/` on iOS↔Android flip).
 
@@ -66,18 +66,18 @@ worktree-pool doctor
 ## Layout
 
 ```
-~/.worktree-pool/<key>/                                # pool root
-~/.worktree-pool/<key>/.meta/config.yaml              # pool config (written by `init`)
-~/.worktree-pool/<key>/.meta/init/<slot-id>.lock      # init mutex (per-slot)
-~/.worktree-pool/<key>/.meta/pool.lock                # pool-wide mutex (acquire + release)
-~/.worktree-pool/<key>/{group}-{N}/                    # idle slot
-~/.worktree-pool/<key>/<name>/                         # held slot (post-rename)
+$WORKTREE_ROOT/<key>/                                  # pool root
+$WORKTREE_ROOT/<key>/.meta/config.yaml                # pool config (written by `init`)
+$WORKTREE_ROOT/<key>/.meta/init/<slot-id>.lock        # init mutex (per-slot)
+$WORKTREE_ROOT/<key>/.meta/pool.lock                  # pool-wide mutex (acquire + release)
+$WORKTREE_ROOT/<key>/{group}-{N}/                      # idle slot
+$WORKTREE_ROOT/<key>/<name>/                           # held slot (post-rename)
 <source>/.git/worktrees/<git-id>/worktree-pool/lock   # held marker per slot
 ```
 
 The held marker lives in the source repo's per-worktree gitdir (which stays stable across our `fs::rename` + `git worktree repair` flow — see [§Why not `git worktree move`?](#why-not-git-worktree-move)). Slot dir stays pristine; `git status` inside a slot shows only the user's actual changes.
 
-**Symlinked pool root constraint**: if `~/.worktree-pool/<key>` is a symlink (typical when relocating slots to a faster volume), the symlink basename **must match** the target directory name. Submodule `core.worktree` rewrites are anchored on the pool-key segment, derived from the symlink basename. A mismatch (`ln -s /Volumes/big/myapp-pool ~/.worktree-pool/myapp`) would silently no-op the rewrites. Standard form: `ln -s /Volumes/big/<key> ~/.worktree-pool/<key>`.
+**Symlinked pool root constraint**: if `$WORKTREE_ROOT/<key>` is a symlink (typical when relocating slots to a faster volume), the symlink basename **must match** the target directory name. Submodule `core.worktree` rewrites are anchored on the pool-key segment, derived from the symlink basename. A mismatch (`ln -s /Volumes/big/myapp-pool "$WORKTREE_ROOT/myapp"`) would silently no-op the rewrites. Standard form: `ln -s /Volumes/big/<key> "$WORKTREE_ROOT/<key>"`.
 
 ---
 
@@ -145,7 +145,7 @@ Per-host `init` runs once per pool key. Source path differs by host (build serve
 Writing the lock BEFORE the rename means a crash leaves the slot held at canonical `{group}-N` (clean recovery state). Two residual failure modes need operator action:
 
 - **Renamed but no lock** (crash between rename and lock-write — git state intact, lock missing): `git -C <source> worktree remove --force <slot>` then re-acquire.
-- **Ghost dir** (`.git` gitlink missing or dangling — typically from a half-completed `worktree remove` whose working-tree rm couldn't finish, e.g. an IDE holding a file open): no git state to release through. `worktree-pool-session go/cleanup/rm` all detect this and refuse with `🔴 BROKEN` (see [§Cleanup classifier](#worktree-pool-session-dev-session-helper)). Recover with `rm -rf <slot-path>`.
+- **Ghost dir** (`.git` gitlink missing or dangling — typically from a half-completed `worktree remove` whose working-tree rm couldn't finish, e.g. an IDE holding a file open): no git state to release through. `wt go/cleanup/rm` all detect this and refuse with `🔴 BROKEN` (see [§Cleanup classifier](#wt-dev-session-helper)). Recover with `rm -rf <slot-path>`.
 
 ### Init mutex liveness
 
@@ -219,51 +219,85 @@ Every recycled slot in the pool has submodules — Unity packages, FacebookSDK, 
 
 ---
 
-## `worktree-pool-session` (dev-session helper)
+## `wt` (dev-session helper)
 
-Bash dispatcher in `bin/worktree-pool-session`. Subcommands wrapping the slot + git-flow lifecycle for interactive dev work:
+Bash dispatcher in `bin/wt`. Subcommands wrapping the slot + git-flow lifecycle for interactive dev work:
 
 ```sh
-worktree-pool-session path    <pool-key> <name>     # print slot path; exit 0 if exists, 1 if not, 2 on error
-worktree-pool-session go      <pool-key> <name> [--from <commit-ish>] [pool-acquire-flags...]
-worktree-pool-session sync    [message]             # commit + merge-back-to-main (local-only)
-worktree-pool-session cleanup <pool-key> <name>     # 🟢/🟡/🔴 exit-trap classifier
-worktree-pool-session rm      <pool-key> <name> [--force]   # safety-checked release; --force discards dirty/unmerged
-worktree-pool-session orient                        # print current repo path + CLAUDE.md
+wt [--pool <key>] path    <name>     # print slot path; exit 0 if exists, 1 if not, 2 on error
+wt [--pool <key>] go      <name> [--from <commit-ish>] [pool-acquire-flags...]
+wt [--pool <key>] rm      <name> [--force]   # safety-checked release; --force discards dirty/unmerged
+wt [--pool <key>] cleanup <name>     # 🟢/🟡/🔴 exit-trap classifier
+wt [--pool <key>] ls      [--git-status]
+wt [--pool <key>] info    <name>
+wt sync   [message]                  # commit + merge-back-to-main (local-only)
+wt orient                            # print current repo path + CLAUDE.md
 ```
 
-`go` acquires/resumes a slot, prints a banner, `cd`s into the slot, runs `$WORKTREE_POOL_SESSION_CMD -n <name>` (default `ai`) in `$SHELL`, and traps an exit handler (default: the `cleanup` verb; overridable — see Hooks). The `-n <name>` is claude's session display name (visible in the prompt box, `/resume` picker, terminal title); assumes the configured launcher accepts it.
+**Pool-key auto-resolution.** `--pool` is optional; `wt` infers the key from cwd:
+1. If cwd is inside `$WORKTREE_ROOT/<key>/...` (a slot), key is the path segment.
+2. Else `git rev-parse --show-toplevel` is matched against every pool's `source:` in `<pool>/.meta/config.yaml`. Unique match wins.
+3. Zero matches or ambiguity → error listing candidates; operator passes `--pool <key>` explicitly.
 
-`--from <commit-ish>` (optional) forks the new branch from the given ref; translated to `acquire --commit <X>`. Omit to use the pool's `default_commit`. If a slot with `<name>` already exists, `go` resumes it with a loud warning (acquire flags are ignored on resume — slot stays at its existing commit); the underlying `ai` is invoked with `--continue`. Use `rm` first if you want to recreate from scratch. (Legacy alias `new` is accepted with a deprecation warning.)
+This means inside `~/Develop/myapp` (the source repo), or inside any slot of that pool, every verb works without a pool-key argument. Each repo is its own pool, so ambiguity is rare in practice.
 
-**Hooks** (env vars; let project wrappers reuse `go` for the shared 80% and inject project-specific extras):
+`go` acquires/resumes a slot, prints a banner, `cd`s into the slot, runs `$WT_LAUNCHER -n <name>` (default `ai`) in `$SHELL`, and sets an EXIT trap that runs `wt cleanup`. The `-n <name>` is claude's session display name (visible in the prompt box, `/resume` picker, terminal title); assumes the configured launcher accepts it.
 
-| Env var | Behavior |
-|---|---|
-| `WORKTREE_POOL_SESSION_CMD` | Launcher; default `ai`. Receives `-n <name>` and `--continue` (on resume) appended. |
-| `WORKTREE_POOL_SESSION_PRE_HOOK` | Shell snippet `eval`d in `cmd_go`'s shell after the banner, before launch. Non-zero exit aborts launch and triggers the cleanup trap. For deps install, dev-server start, project-specific banners. |
-| `WORKTREE_POOL_SESSION_CLEANUP_CMD` | Overrides the EXIT trap target (default `worktree-pool-session cleanup "$WT_KEY" "$WT_NAME"`). The override is responsible for delegating to `cleanup` itself if it wants the slot recycled — skipping it leaves the slot held. |
-
-Hooks see `$WT_KEY`, `$WT_NAME`, `$WT_PATH`, `$WT_FRESH` (1=fresh acquire, 0=resume) in env. **Quoting:** `CLEANUP_CMD` is a string passed to `trap`, so its `$WT_*` references must defer expansion to fire-time — escape (`\$WT_NAME`) or single-quote the assignment (`CLEANUP_CMD='just wt-cleanup "$WT_NAME"'`). Naked `"$WT_NAME"` expands at export-time (likely empty in the caller's env) and silently misroutes the trap. `PRE_HOOK` is `eval`d once at fire-time, so quoting is just normal shell.
+`--from <commit-ish>` (optional) forks the new branch from the given ref; translated to `acquire --commit <X>`. Omit to use the pool's `default_commit`. If a slot with `<name>` already exists, `go` resumes it with a loud warning (acquire flags are ignored on resume — slot stays at its existing commit); the underlying `ai` is invoked with `--continue`. Use `rm` first if you want to recreate from scratch.
 
 `rm` is the manual one-shot with the same safety checks (refuse on dirty / unmerged); used directly when the session is gone but state persists. Pass `--force` (`-f`) to discard dirty tracked changes and/or unmerged commits — applies the work-loss waiver but still refuses 🔴 BROKEN slots (no git state to release through; recover those via `rm -rf`). `--force` is intentionally an `rm`-only knob, not a `cleanup` flag: `cleanup` is the auto-invoked exit-trap classifier whose entire purpose is preserving uncommitted work on shell exit, so a force-recycle there would defeat the trap. Operators discarding work always do so explicitly via `rm --force`.
 
-`path` is the predicate query — prints `~/.worktree-pool/<key>/<name>` on stdout (always, when key + pool are valid) and exits 0 if the slot exists, 1 if it doesn't, 2 on usage / pool-not-initialized. Lets consumer recipes branch on resume vs. fresh acquire (`if path … >/dev/null; then …`) without re-stitching the pool-root path themselves. Pattern matches `git rev-parse --git-dir`, `brew --prefix`, `pyenv prefix`.
+`path` is the predicate query — prints `$WORKTREE_ROOT/<key>/<name>` on stdout (always, when key + pool are valid) and exits 0 if the slot exists, 1 if it doesn't, 2 on usage / pool-not-initialized. Lets consumer scripts branch on resume vs. fresh acquire (`if wt path … >/dev/null; then …`) without re-stitching the pool-root path themselves. Pattern matches `git rev-parse --git-dir`, `brew --prefix`, `pyenv prefix`.
 
-`sync` takes no pool-key — it operates on the current worktree's repo and finds the main worktree via `git worktree list`. See [§Sync flow](#sync-flow) below.
+`ls` / `info` are pass-throughs to `worktree-pool ls` / `worktree-pool inspect --name <n>` with the inferred pool key prefilled.
+
+`sync` takes no pool key — it operates on the current worktree's repo and finds the main worktree via `git worktree list`. See [§Sync flow](#sync-flow) below.
 
 `orient` prints the current repo's toplevel path followed by its `CLAUDE.md` to stdout. Intended for AI-agent bootstrap — answers "where am I and what are the rules here." No pool-key argument; resolved from `git rev-parse`. Refuses if not inside a git repo.
 
-Cleanup classifier (always exits 0 — it's an exit-trap target, so `wt-go`'s exit trap doesn't muddy the user's shell exit status):
+### Hooks (`<source>/.wt-hooks.sh`)
+
+If the source repo has a `.wt-hooks.sh` at its toplevel, `wt` sources it before each lifecycle verb runs. Define any subset of these bash functions to extend behavior; all are optional. Every hook sees `$WT_KEY`, `$WT_NAME`, `$WT_PATH`, `$WT_FRESH` (1=fresh acquire, 0=resume) in env.
+
+| Function | When | Failure semantics |
+|---|---|---|
+| `wt_pre_go` | After acquire/resume, before launching the shell | Non-zero aborts launch (set -e); EXIT trap then fires `cleanup` |
+| `wt_pre_rm` | After safety checks pass, before `release` | Best-effort (errors don't block release) |
+| `wt_pre_cleanup` | Before the cleanup classifier runs | Best-effort |
+| `wt_post_cleanup` | After classifier, only on the green/recycled path | Best-effort |
+| `wt_post_sync` | After `sync` succeeds; sees `$WT_MAIN_BEFORE` / `$WT_MAIN_AFTER` (full SHAs) | Best-effort |
+
+Hook scripts may also set the `WT_LAUNCHER` variable (default `ai`) to override the launcher invocation — receives `-n <name>` and `--continue` (on resume) appended.
+
+Example minimal hooks file replacing the previous `WORKTREE_POOL_SESSION_*` pattern:
+
+```bash
+# <source>/.wt-hooks.sh
+WT_LAUNCHER="ai --chrome"
+
+wt_pre_go() {
+  cd "$WT_PATH/app" && bun install --silent
+}
+wt_pre_rm()      { just _dev-stop "$WT_NAME" || true; }
+wt_pre_cleanup() { just _dev-stop "$WT_NAME" || true; }
+wt_post_cleanup() { rm -f "$WT_PATH.log"; }
+wt_post_sync() {
+  if [ -n "$(git diff --name-only "$WT_MAIN_BEFORE" "$WT_MAIN_AFTER" -- package.json bun.lock)" ]; then
+    echo "deps changed — re-run bun install in active slots." >&2
+  fi
+}
+```
+
+Cleanup classifier (always exits 0 — it's an exit-trap target, so `wt go`'s exit trap doesn't muddy the user's shell exit status):
 
 | Marker | Condition | Action |
 |---|---|---|
 | 🟢 | clean working tree AND 0 commits ahead local `main` | un-rename + delete branch + release (recycle) |
-| 🟡 | dirty / untracked files | leave personalized — resume with `session go` later |
+| 🟡 | dirty / untracked files | leave personalized — resume with `wt go` later |
 | 🔴 UNMERGED | non-zero commits ahead local `main` (unmerged) | loud refuse — operator resolves before recycling |
 | 🔴 BROKEN | slot dir exists but `<slot>/.git` is missing or dangling (ghost dir from partial cleanup debris) | loud refuse — operator recovers via `rm -rf` (the dir is unrecoverable as a worktree; nothing of value lives in `.git`-less debris) |
 
-Re-running `session go <key> <name>` resumes any 🟡 / 🔴 UNMERGED slot. 🔴 BROKEN slots can't be resumed — `go` and `rm` both refuse them.
+Re-running `wt go <name>` resumes any 🟡 / 🔴 UNMERGED slot. 🔴 BROKEN slots can't be resumed — `go` and `rm` both refuse them.
 
 ### Sync flow
 
@@ -281,33 +315,24 @@ Steps in order, refuses loudly on anything unexpected:
 8. Atomic `git update-ref refs/heads/main HEAD <expected_main>`. Refuses if a parallel slot advanced main between step 7 and here.
 9. `git -C <main_path> reset --hard HEAD` to refresh main's tree.
 
-Idempotent: re-runs are safe (no-op if `main == HEAD`). Resume after conflict = re-run sync after the manual merge commit lands. Pushing to a remote is the operator's responsibility — `wt-sync` only advances local refs.
+Idempotent: re-runs are safe (no-op if `main == HEAD`). Resume after conflict = re-run sync after the manual merge commit lands. Pushing to a remote is the operator's responsibility — `wt sync` only advances local refs.
 
 ---
 
 ## Integration patterns
 
-Each consumer wraps the pool with thin recipes pre-filling the pool key. `worktree-pool-session` is project-agnostic; pool config (source path, mirror mode) lives in `<pool>/.meta/config.yaml` written once by `init`.
+The minimal-friction integration is **no integration at all** — auto-resolution + `.wt-hooks.sh` covers the common cases. From inside the source repo or any slot, `wt go feature-x`, `wt sync`, `wt ls`, `wt rm feature-x` work without consumer wrappers. Project-specific extras live in `<source>/.wt-hooks.sh`; see [§Hooks](#hooks-source.wt-hooks.sh).
+
+Consumers only need a `just` recipe (or shell alias) when the wrapper adds *operator-facing* surface — independent verbs like `wt-meta`, `wt-dev-start` — not for pre-filling the pool key. Avoid the old pattern of a recipe per verb just to inject the key:
 
 ```bash
-# Consumer's justfile, e.g. myapp
-wt-go name *flags:
-    @worktree-pool-session go myapp {{quote(name)}} {{flags}}
-wt-rm name *flags:
-    @worktree-pool-session rm myapp {{quote(name)}} {{flags}}
-wt-cleanup name:
-    @worktree-pool-session cleanup myapp {{quote(name)}}
-wt-path name:
-    @worktree-pool-session path myapp {{quote(name)}}
-wt-ls:
-    @worktree-pool --pool myapp ls
-wt-info name:
-    @worktree-pool --pool myapp inspect --name {{quote(name)}}
-wt-sync message="":
-    @worktree-pool-session sync {{quote(message)}}
+# OLD — redundant; auto-resolution makes this unnecessary.
+wt-go name:    @wt go myapp {{quote(name)}}
+wt-rm name:    @wt rm myapp {{quote(name)}}
+# … (delete; just type `wt go feature-x` directly)
 ```
 
-Pool key is the first positional for slot-scoped verbs → project-agnostic. Same shape works for any pool. Recipes are host-agnostic — pool keys map to fixed paths under `~/.worktree-pool/<key>/`, so the same recipe runs on both server and laptop.
+Pool config (source path, mirror mode) lives in `<pool>/.meta/config.yaml` written once by `init`. Both pool config and `.wt-hooks.sh` are host-agnostic in practice — pool keys map to `$WORKTREE_ROOT/<key>/`, and the hooks file is version-controlled with the source, so the same setup runs on server and laptop.
 
 ---
 
@@ -328,7 +353,7 @@ Slots share `.git/` and `.git/modules/` with the source repo, but **not** the wo
 Cuts that simplify the design:
 
 - **No GC.** All cleanup is operator-explicit. Capacity-bound errors list the table; operator picks a slot to release.
-- **No registry.** Pool key → path mapping is convention-based (`~/.worktree-pool/<key>/`). No `~/.config/...`-tracked file, no env var.
+- **No registry.** Pool key → path mapping is convention-based (`$WORKTREE_ROOT/<key>/`). No `~/.config/...`-tracked file. `WORKTREE_ROOT` is the only env input — it picks the parent dir, not the per-pool location.
 - **No cross-host coordination.** Pools are host-local. Network-mounted shared pools are not supported (no `host`/`pid` liveness checks).
 - **No dead-process detection.** A SIGKILL'd holder leaves the lock; operator notices via `ls` and runs `release`. The exception is the init mutex (60min stale → reclaim).
 - **No auto-recovery.** Process crashes between rename and lock-write may leave orphans visible in `ls`; operator inspects and recovers manually.
@@ -351,13 +376,14 @@ If you need GC-like behavior, write a 5-line script: `worktree-pool ls` → filt
 arm64 macOS only. Two artifacts ship from `bin/`:
 
 - `bin/worktree-pool-darwin-arm64` — the Rust binary (the pool primitive). Ad-hoc codesigned (`codesign --sign - --force`).
-- `bin/worktree-pool-session` — Bash wrapper for the common dev-session lifecycle. Project-agnostic; takes `<pool-key>` as first arg.
+- `bin/wt` — Bash wrapper for the common dev-session lifecycle. Project-agnostic; auto-resolves pool key from cwd (override with `--pool`).
 
 `scripts/install.sh` (also `just install`) symlinks both into `~/.local/bin/`.
 
 ```sh
 git clone https://github.com/studio-boxcat/worktree-pool.git ~/Develop/worktree-pool
 cd ~/Develop/worktree-pool && just install
+echo 'export WORKTREE_ROOT="$HOME/.worktree-pool"' >> ~/.zshenv.local   # pick any path — fail-loud if unset
 worktree-pool doctor
 ```
 

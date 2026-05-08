@@ -43,7 +43,7 @@ bench-cli:
     BIN="$(pwd)/target/release/worktree-pool"
     TMP=$(mktemp -d)
     KEY="bench-$(date +%s)"
-    POOL="$HOME/.worktree-pool/$KEY"
+    POOL="$WORKTREE_ROOT/$KEY"
     trap "rm -rf '$TMP' '$POOL'" EXIT
     BARE=$(scripts/bench-fixture.sh "$TMP")
     "$BIN" --pool "$KEY" init --source "$BARE" --max-slots 4 --groups ios
@@ -75,7 +75,7 @@ profile:
     BIN="$(pwd)/target/release/worktree-pool"
     TMP=$(mktemp -d)
     KEY="profile-$(date +%s)"
-    POOL="$HOME/.worktree-pool/$KEY"
+    POOL="$WORKTREE_ROOT/$KEY"
     trap "rm -rf '$TMP' '$POOL'" EXIT
     BARE=$(scripts/bench-fixture.sh "$TMP")
     "$BIN" --pool "$KEY" init --source "$BARE" --max-slots 4 --groups ios

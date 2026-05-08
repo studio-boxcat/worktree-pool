@@ -2,9 +2,10 @@
 //! at call sites.
 use std::path::{Path, PathBuf};
 
-/// Pool root: `~/.worktree-pool/<key>/`. No env or registry — convention.
+/// Pool root directory: `$WORKTREE_ROOT/<key>/`. `WORKTREE_ROOT` is required —
+/// no fallback. Set it in `~/.zshenv.local` (or equivalent) per host.
 pub fn pool_root(key: &str) -> PathBuf {
-    home().join(".worktree-pool").join(key)
+    worktree_root().join(key)
 }
 
 /// `<pool>/.meta/config.yaml`.
@@ -29,9 +30,11 @@ pub fn slot_lock(worktree_gitdir: &Path) -> PathBuf {
     worktree_gitdir.join("worktree-pool/lock")
 }
 
-/// `~/`. Panics if `$HOME` is unset (we don't ship to environments where that's plausible).
-fn home() -> PathBuf {
-    std::env::var_os("HOME")
+/// `$WORKTREE_ROOT`. Panics with a clear message if the var is unset — every
+/// pool path is anchored here, so silent fallback would mis-locate state.
+pub fn worktree_root() -> PathBuf {
+    std::env::var_os("WORKTREE_ROOT")
         .map(PathBuf::from)
-        .expect("HOME is unset; worktree-pool requires a user home directory")
+        .filter(|p| !p.as_os_str().is_empty())
+        .expect("WORKTREE_ROOT is unset; add `export WORKTREE_ROOT=\"$HOME/.worktree-pool\"` to ~/.zshenv.local (or equivalent)")
 }

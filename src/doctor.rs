@@ -1,6 +1,5 @@
 //! Host-level health check. Runs without a `--pool` argument.
 use anyhow::Result;
-use std::path::Path;
 use std::process::Command;
 
 pub fn run() -> Result<()> {
@@ -64,7 +63,7 @@ fn check_git() -> CheckResult {
 }
 
 fn check_pools_dir() -> CheckResult {
-    let dir = home().join(".worktree-pool");
+    let dir = crate::fs_paths::worktree_root();
     if !dir.exists() {
         return CheckResult::Warn(format!(
             "{} not present — first init will create it",
@@ -108,8 +107,3 @@ fn check_quarantine() -> CheckResult {
     }
 }
 
-fn home() -> std::path::PathBuf {
-    std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| Path::new("/").to_path_buf())
-}

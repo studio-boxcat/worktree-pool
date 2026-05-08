@@ -18,8 +18,13 @@ fn pool_key() -> String {
 }
 
 fn pool_root(key: &str) -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
-    home.join(".worktree-pool").join(key)
+    // Mirrors src/fs_paths::worktree_root — tests inherit WORKTREE_ROOT from
+    // the parent shell (just test / cargo test); fail loud if unset.
+    let root = std::env::var_os("WORKTREE_ROOT")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .expect("WORKTREE_ROOT unset; tests inherit it from the shell — set it in ~/.zshenv.local");
+    root.join(key)
 }
 
 fn run_git(cwd: &Path, args: &[&str]) {
@@ -946,27 +951,28 @@ fn parallel_submodule_init_acquires_all() {
     );
 }
 
-// ---------- worktree-pool-session (bash wrapper) ----------
+// ---------- wt (bash wrapper) ----------
 
 fn session_script() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bin/worktree-pool-session")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bin/wt")
 }
 
-/// Build a `bash <session-script> <args...>` command with PATH augmented so
-/// the script can resolve `worktree-pool` to the test binary, plus a no-op
-/// SHELL and CLEANUP_CMD so an unexpected `cmd_go` launch succeeds quietly.
-/// That lets `cmd_go` tests rely on cmd_go's *own* exit code as the signal —
-/// without these, /usr/bin/zsh + the default cleanup trap would fire and muddy
-/// the stderr assertions.
-fn session_cmd(args: &[&str]) -> StdCommand {
+/// Build a `bash <wt> --pool <key> <verb-args...>` command with PATH augmented
+/// so the script can resolve `worktree-pool` to the test binary, plus a no-op
+/// SHELL so an unexpected `cmd_go` launch succeeds quietly. That lets cmd_go
+/// tests rely on cmd_go's *own* exit code as the signal — without it,
+/// /usr/bin/zsh would fire and muddy the stderr assertions.
+fn session_cmd(key: &str, args: &[&str]) -> StdCommand {
     let bin_path = PathBuf::from(env!("CARGO_BIN_EXE_worktree-pool"));
     let bin_dir = bin_path.parent().unwrap();
     let prev_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", bin_dir.display(), prev_path);
     let mut cmd = StdCommand::new("bash");
-    cmd.arg(session_script()).args(args).env("PATH", new_path);
+    cmd.arg(session_script())
+        .args(["--pool", key])
+        .args(args)
+        .env("PATH", new_path);
     cmd.env("SHELL", "/usr/bin/true");
-    cmd.env("WORKTREE_POOL_SESSION_CLEANUP_CMD", "true");
     cmd
 }
 
@@ -999,7 +1005,7 @@ fn session_go_refuses_broken_slot() {
 
     let path = acquire_then_break(&key, "ghost", true);
 
-    let out = session_cmd(&["go", &key, "ghost"]).output().unwrap();
+    let out = session_cmd(&key, &["go", "ghost"]).output().unwrap();
     assert!(
         !out.status.success(),
         "expected `go` to refuse broken slot; stdout={}, stderr={}",
@@ -1022,7 +1028,7 @@ fn session_cleanup_does_not_lie_on_broken_slot() {
 
     let path = acquire_then_break(&key, "ghost", true);
 
-    let out = session_cmd(&["cleanup", &key, "ghost"]).output().unwrap();
+    let out = session_cmd(&key, &["cleanup", "ghost"]).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
@@ -1049,7 +1055,7 @@ fn session_cleanup_detects_fully_orphaned_slot() {
 
     let path = acquire_then_break(&key, "ghost", false);
 
-    let out = session_cmd(&["cleanup", &key, "ghost"]).output().unwrap();
+    let out = session_cmd(&key, &["cleanup", "ghost"]).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!stdout.contains("recycled cleanly"),
@@ -1069,7 +1075,7 @@ fn session_rm_refuses_broken_slot() {
 
     let path = acquire_then_break(&key, "ghost", true);
 
-    let out = session_cmd(&["rm", &key, "ghost"]).output().unwrap();
+    let out = session_cmd(&key, &["rm", "ghost"]).output().unwrap();
     assert!(!out.status.success(),
         "rm should refuse broken slot rather than dive into release.\nstdout={}\nstderr={}",
         String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
@@ -1100,7 +1106,7 @@ fn session_rm_refuses_dirty_without_force() {
 
     let path = acquire_then_dirty(&key, "messy");
 
-    let out = session_cmd(&["rm", &key, "messy"]).output().unwrap();
+    let out = session_cmd(&key, &["rm", "messy"]).output().unwrap();
     assert!(!out.status.success(),
         "rm should refuse dirty slot without --force.\nstdout={}\nstderr={}",
         String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
@@ -1119,7 +1125,7 @@ fn session_rm_force_discards_dirty() {
 
     let path = acquire_then_dirty(&key, "messy");
 
-    let out = session_cmd(&["rm", &key, "messy", "--force"]).output().unwrap();
+    let out = session_cmd(&key, &["rm", "messy", "--force"]).output().unwrap();
     assert!(out.status.success(),
         "rm --force should succeed on dirty slot.\nstdout={}\nstderr={}",
         String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
@@ -1147,13 +1153,13 @@ fn session_rm_force_discards_unmerged_branch() {
     run_git(&path, &["commit", "--quiet", "-m", "ahead of main"]);
 
     // Without --force: refuse.
-    let out = session_cmd(&["rm", &key, "ahead"]).output().unwrap();
+    let out = session_cmd(&key, &["rm", "ahead"]).output().unwrap();
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("not in main"), "got: {stderr}");
 
     // With --force: succeed.
-    let out = session_cmd(&["rm", &key, "ahead", "--force"]).output().unwrap();
+    let out = session_cmd(&key, &["rm", "ahead", "--force"]).output().unwrap();
     assert!(out.status.success(),
         "rm --force should discard unmerged commits.\nstdout={}\nstderr={}",
         String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
@@ -1162,8 +1168,8 @@ fn session_rm_force_discards_unmerged_branch() {
 
 #[test]
 fn session_rm_force_accepted_before_positionals() {
-    // Pin the parser contract: `rm --force <key> <name>` works as well as
-    // `rm <key> <name> --force`. Operators reach for either order.
+    // Pin the parser contract: `rm --force <name>` works as well as
+    // `rm <name> --force`. Operators reach for either order.
     let key = pool_key();
     let _c = Cleanup(key.clone());
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1171,9 +1177,9 @@ fn session_rm_force_accepted_before_positionals() {
     init_pool(&key, &bare);
 
     let path = acquire_then_dirty(&key, "messy");
-    let out = session_cmd(&["rm", "--force", &key, "messy"]).output().unwrap();
+    let out = session_cmd(&key, &["rm", "--force", "messy"]).output().unwrap();
     assert!(out.status.success(),
-        "rm --force <key> <name> should succeed.\nstdout={}\nstderr={}",
+        "rm --force <name> should succeed.\nstdout={}\nstderr={}",
         String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(!path.exists());
 }
@@ -1191,7 +1197,7 @@ fn session_rm_force_still_refuses_broken_slot() {
 
     let path = acquire_then_break(&key, "ghost", true);
 
-    let out = session_cmd(&["rm", &key, "ghost", "--force"]).output().unwrap();
+    let out = session_cmd(&key, &["rm", "ghost", "--force"]).output().unwrap();
     assert!(!out.status.success(),
         "rm --force must still refuse broken slot.\nstdout={}\nstderr={}",
         String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));

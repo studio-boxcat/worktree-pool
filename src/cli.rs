@@ -5,7 +5,7 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(name = "worktree-pool", version, about, long_about = None)]
 pub struct Cli {
-    /// Pool key. Path resolves to `~/.worktree-pool/<key>/`.
+    /// Pool key. Path resolves to `$WORKTREE_ROOT/<key>/`.
     /// Required for all subcommands except `doctor`.
     #[arg(short, long, global = true)]
     pub pool: Option<String>,

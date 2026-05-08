@@ -19,7 +19,7 @@ Surfaced by efficiency-review agents during the v0.1.1 profile pass. Rust paths 
 
 ## Doc / discoverability
 
-- **`worktree-pool doctor` could check pool initialization** — currently host-level checks only (arch, git, ~/.worktree-pool dir presence, quarantine xattr). Could enumerate registered pools (subdirs of `~/.worktree-pool/` with a `.meta/config.yaml`) and validate each (config schema, source path exists, etc.).
+- **`worktree-pool doctor` could check pool initialization** — currently host-level checks only (arch, git, `$WORKTREE_ROOT` dir presence, quarantine xattr). Could enumerate registered pools (subdirs of `$WORKTREE_ROOT/` with a `.meta/config.yaml`) and validate each (config schema, source path exists, etc.).
 - **Bench fixture is too small** — `scripts/bench-fixture.sh` makes a bare repo with one commit, no submodules. Real cold-acquire cost (the dominant wall time) isn't measured. A heavier fixture with a few mock submodules would expose the parallel-submodule-recursion win when implemented.
 
 ## Surfaced by multi-agent audit (2026-05)

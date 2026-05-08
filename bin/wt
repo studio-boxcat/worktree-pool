@@ -1,20 +1,38 @@
 #!/usr/bin/env bash
-# worktree-pool-session — convenience wrapper around `worktree-pool` for the
-# common dev-session lifecycle: acquire + launch an interactive shell + safe-recycle on exit.
-# See https://github.com/studio-boxcat/worktree-pool for the underlying tool.
+# wt — convenience wrapper around `worktree-pool` for the common dev-session
+# lifecycle: acquire + launch an interactive shell + safe-recycle on exit.
+# See https://github.com/studio-boxcat/worktree-pool
 #
 # Usage:
-#   worktree-pool-session path <pool-key> <name>        # print slot path; exit 0 if exists, 1 if not, 2 on error
-#   worktree-pool-session go <pool-key> <name> [--from <commit-ish>] [pool-acquire-flags...]
-#   worktree-pool-session sync [message]                # commit + merge-back-to-main
-#   worktree-pool-session cleanup <pool-key> <name>     # 🟢/🟡/🔴 exit-trap classifier
-#   worktree-pool-session rm <pool-key> <name>          # safety-checked release
-#   worktree-pool-session orient                        # print current repo path + CLAUDE.md
+#   wt [--pool <key>] go      <name> [--from <commit-ish>] [pool-acquire-flags...]
+#   wt [--pool <key>] rm      <name> [--force]
+#   wt [--pool <key>] cleanup <name>     # 🟢/🟡/🔴 exit-trap classifier
+#   wt [--pool <key>] path    <name>     # exit 0 if exists, 1 if not, 2 on error
+#   wt [--pool <key>] ls      [--git-status]
+#   wt [--pool <key>] info    <name>
+#   wt sync   [message]                  # commit + merge-back-to-main
+#   wt orient                            # print current repo path + CLAUDE.md
 #
-# Slot-scoped verbs (path/go/cleanup/rm) take a pool-key first arg. The git-flow
-# verb (sync) takes none — it operates on the current worktree's repo and finds
-# the main worktree via `git worktree list`. Each consumer wraps with a thin
-# `just` recipe.
+# Pool root: $WORKTREE_ROOT (required — no fallback). Set in ~/.zshenv.local.
+#
+# Pool key auto-resolution (override with --pool):
+#   1. cwd inside $WORKTREE_ROOT/<key>/<name>/...  → key derived from path
+#   2. cwd inside a git repo whose toplevel matches some pool's `source:`
+#   3. error if zero or multiple matches
+#
+# Hooks: if `<source>/.wt-hooks.sh` exists, it is sourced before lifecycle
+# verbs run. Define any of these bash functions to extend behavior; all see
+# $WT_KEY $WT_NAME $WT_PATH $WT_FRESH (1=fresh acquire, 0=resume) in env:
+#
+#   wt_pre_go       — runs after acquire/resume, before launching the shell
+#   wt_pre_rm       — runs after safety checks, before `release`
+#   wt_pre_cleanup  — runs before the cleanup classifier
+#   wt_post_cleanup — runs after classifier, only on the green/recycled path
+#   wt_post_sync    — runs after sync succeeds; sees $WT_MAIN_BEFORE/$WT_MAIN_AFTER
+#
+# Hook scripts may also set:
+#   WT_LAUNCHER     — launcher invocation; default `ai`. Receives `-n <name>`
+#                     (and `--continue` on resume) appended.
 
 set -uo pipefail   # set -e is per-subcommand (cleanup must always exit 0).
 
@@ -22,9 +40,25 @@ set -uo pipefail   # set -e is per-subcommand (cleanup must always exit 0).
 
 die() { echo "${0##*/}: $*" >&2; exit 1; }
 
+# WORKTREE_ROOT is required. No fallback — every pool path is anchored here, so
+# silent default-to-$HOME/.worktree-pool would mis-locate state on hosts that
+# put the pool elsewhere (external SSD, etc.).
+[ -n "${WORKTREE_ROOT:-}" ] \
+  || die "WORKTREE_ROOT is unset. Add 'export WORKTREE_ROOT=\"\$HOME/.worktree-pool\"' to ~/.zshenv.local (or equivalent) and reopen your shell."
+
 require_arg() { [ -n "$2" ] || die "usage: $3"; }
 
-pool_root() { printf '%s/.worktree-pool/%s' "$HOME" "$1"; }
+pool_root_path() { printf '%s/%s' "$WORKTREE_ROOT" "$1"; }
+
+# Read `source:` from a pool's config and expand `~`. Empty on failure.
+pool_source_path() {
+  local cfg="$WORKTREE_ROOT/$1/.meta/config.yaml"
+  [ -f "$cfg" ] || return 1
+  local src
+  src=$(awk -F': *' '/^source:/ {print $2; exit}' "$cfg")
+  [ -n "$src" ] || return 1
+  printf '%s' "${src/#\~/$HOME}"
+}
 
 # Echo the name of any in-progress git operation (rebase, merge, cherry-pick,
 # revert) for the repo at $1. Empty if clean.
@@ -66,30 +100,84 @@ find_main_path() {
   '
 }
 
+# Auto-resolve pool key from cwd. Echoes the key on stdout, returns non-zero
+# (with stderr explanation) on ambiguity / no match.
+auto_pool_key() {
+  local cwd_real
+  cwd_real=$(pwd -P)
+
+  if [ -d "$WORKTREE_ROOT" ]; then
+    local pool_root_real
+    pool_root_real=$(cd "$WORKTREE_ROOT" && pwd -P)
+    if [[ "$cwd_real" == "$pool_root_real"/* ]]; then
+      local rel="${cwd_real#$pool_root_real/}"
+      printf '%s' "${rel%%/*}"
+      return 0
+    fi
+  fi
+
+  local toplevel
+  toplevel=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
+  toplevel=$(cd "$toplevel" && pwd -P)
+
+  local matches=() cfg key src
+  for cfg in "$WORKTREE_ROOT"/*/.meta/config.yaml; do
+    [ -f "$cfg" ] || continue
+    key=$(basename "$(dirname "$(dirname "$cfg")")")
+    src=$(pool_source_path "$key") || continue
+    src=$(cd "$src" 2>/dev/null && pwd -P) || continue
+    if [ "$src" = "$toplevel" ]; then
+      matches+=("$key")
+    fi
+  done
+
+  case ${#matches[@]} in
+    0) return 1 ;;
+    1) printf '%s' "${matches[0]}"; return 0 ;;
+    *) echo "wt: cwd matches multiple pools (${matches[*]}) — pass --pool <key>" >&2; return 2 ;;
+  esac
+}
+
+# Globals set by require_pool: POOL_KEY POOL_ROOT POOL_SOURCE
+require_pool() {
+  if [ -z "${POOL_KEY:-}" ]; then
+    POOL_KEY=$(auto_pool_key) || die "could not infer --pool from cwd. \
+Run from inside a pool's source repo or a slot, or pass --pool <key>."
+  fi
+  POOL_ROOT=$(pool_root_path "$POOL_KEY")
+  [ -d "$POOL_ROOT" ] || die "pool '$POOL_KEY' not initialized at $POOL_ROOT — \
+run: worktree-pool --pool $POOL_KEY init --source <repo> --max-slots <n> ..."
+  POOL_SOURCE=$(pool_source_path "$POOL_KEY") || die "pool '$POOL_KEY' has no source: in config.yaml"
+}
+
+# Source <hooks-base>/.wt-hooks.sh if present. Defaults to $POOL_SOURCE.
+source_hooks() {
+  local hooks_file="${1:-$POOL_SOURCE}/.wt-hooks.sh"
+  if [ -f "$hooks_file" ]; then
+    # shellcheck source=/dev/null
+    source "$hooks_file"
+  fi
+}
+
+# Call hook function $1 if defined, passing remaining args. No-op otherwise.
+call_hook() {
+  local fn="$1"; shift
+  declare -F "$fn" >/dev/null 2>&1 && "$fn" "$@"
+}
+
 # ---------- subcommands ----------
 
-# Print the absolute slot path for `<pool-key>/<name>`. Always emits the path
-# on stdout (when key+pool are valid) so callers that only need exists/not
-# can `>/dev/null` it. Exit codes:
+# Print the absolute slot path. Always emits the path on stdout (when the pool
+# is valid) so callers that only need exists/not can `>/dev/null` it. Exit:
 #   0 — slot exists at that path (resumable / introspectable)
-#   1 — pool exists but slot doesn't (caller would `acquire` to create)
+#   1 — pool exists but slot doesn't
 #   2 — usage error or pool not initialized
-# Distinct from the predicate exits so callers can branch without parsing.
 cmd_path() {
-  local key="${1:-}"; shift || true
   local name="${1:-}"; shift || true
-  if [ -z "$key" ] || [ -z "$name" ]; then
-    echo "usage: ${0##*/} path <pool-key> <name>" >&2
+  if [ -z "$name" ]; then
+    echo "usage: ${0##*/} path <name>" >&2
     exit 2
   fi
-
-  local POOL_ROOT
-  POOL_ROOT=$(pool_root "$key")
-  if [ ! -d "$POOL_ROOT" ]; then
-    echo "${0##*/}: pool '$key' not initialized at $POOL_ROOT" >&2
-    exit 2
-  fi
-
   local path="$POOL_ROOT/$name"
   printf '%s\n' "$path"
   [ -d "$path" ]
@@ -97,10 +185,28 @@ cmd_path() {
 
 cmd_go() {
   set -e
-  local key="${1:-}"; shift || true
   local name="${1:-}"; shift || true
-  require_arg key  "$key"  "session go <pool-key> <name> [--from <commit-ish>] [pool-flags...]"
-  require_arg name "$name" "session go <pool-key> <name> [--from <commit-ish>] [pool-flags...]"
+  # Bare `wt go`: show currently-held slots so the operator can see what's
+  # already in flight before typing a name, then a usage warning so the
+  # missing arg is unambiguous (vs. a silent ls). Idle/fresh rows are
+  # filtered out — uninteresting noise at this prompt.
+  if [ -z "$name" ]; then
+    local ls_out
+    ls_out=$(worktree-pool --pool "$POOL_KEY" ls)
+    local held_rows
+    held_rows=$(printf '%s\n' "$ls_out" | awk 'NR>2 && $2=="held"')
+    if [ -n "$held_rows" ]; then
+      printf '%s\n' "$ls_out" | awk 'NR<=2'
+      printf '%s\n' "$held_rows"
+    else
+      echo "(no held slots)"
+    fi
+    echo
+    local Y='' X=''
+    [ -t 2 ] && { Y=$'\e[33m'; X=$'\e[0m'; }
+    printf '%swt go: name required.%s Pick an existing slot to resume, or a new name:\n  wt go <name> [--from <commit-ish>]\n' "$Y" "$X" >&2
+    exit 2
+  fi
 
   # Translate `--from <X>` → `--commit <X>` for the underlying acquire.
   local acquire_args=() from=""
@@ -113,10 +219,6 @@ cmd_go() {
   done
   # `${arr[@]+...}` form keeps empty-array expansion safe under bash 3.2's `set -u`.
   [ -n "$from" ] && acquire_args=(--commit "$from" ${acquire_args[@]+"${acquire_args[@]}"})
-
-  local POOL_ROOT
-  POOL_ROOT=$(pool_root "$key")
-  [ -d "$POOL_ROOT" ] || die "pool '$key' not initialized at $POOL_ROOT — run: worktree-pool --pool $key init --source <repo> --max-slots <n> ..."
 
   # Refuse from inside a pool slot — `pwd -P` resolves symlinks.
   local pool_real cwd_real
@@ -141,44 +243,38 @@ Recover with: rm -rf $(printf '%q' "$path"), then re-run."
     fi
     local Y='' X=''
     [ -t 2 ] && { Y=$'\e[33m'; X=$'\e[0m'; }
-    printf '%s⚠ slot %s/%s already exists — resuming (acquire flags ignored). Use `%s rm %s %s` first to recreate.%s\n' \
-      "$Y" "$key" "$name" "${0##*/}" "$key" "$name" "$X" >&2
+    printf '%s⚠ slot %s/%s already exists — resuming (acquire flags ignored). Use `%s rm %s` first to recreate.%s\n' \
+      "$Y" "$POOL_KEY" "$name" "${0##*/}" "$name" "$X" >&2
   else
-    path=$(worktree-pool --pool "$key" acquire --name "$name" ${acquire_args[@]+"${acquire_args[@]}"} | tail -1)
+    path=$(worktree-pool --pool "$POOL_KEY" acquire --name "$name" ${acquire_args[@]+"${acquire_args[@]}"} | tail -1)
     if [[ -z "$path" || ! -d "$path" ]]; then
       die "pool returned no path."
     fi
   fi
 
   # Hook contract: WT_KEY/WT_NAME/WT_PATH/WT_FRESH (1=fresh, 0=resume) exported
-  # for both PRE_HOOK and CLEANUP_CMD; expand at fire time.
-  export WT_KEY="$key" WT_NAME="$name" WT_PATH="$path"
+  # for every hook function.
+  export WT_KEY="$POOL_KEY" WT_NAME="$name" WT_PATH="$path"
   export WT_FRESH=$([ "$existing" = 0 ] && echo 1 || echo 0)
 
-  # EXIT trap. Default = our own `cleanup` verb; override for wrappers that
-  # need extras (dev-server stop, meta sweep). $WT_KEY/$WT_NAME expand at
-  # trap-fire time, so the override sees the right slot.
-  local self trap_cmd
-  self="$0"
-  if [ -n "${WORKTREE_POOL_SESSION_CLEANUP_CMD:-}" ]; then
-    trap_cmd="$WORKTREE_POOL_SESSION_CLEANUP_CMD"
-  else
-    trap_cmd="'$self' cleanup \"\$WT_KEY\" \"\$WT_NAME\""
-  fi
-  trap "$trap_cmd" EXIT
+  # EXIT trap. Always invokes `wt cleanup`; project-specific extras are layered
+  # via wt_pre_cleanup / wt_post_cleanup hooks instead of replacing the trap.
+  # $WT_* expands at trap-fire time so the trap sees the right slot.
+  trap "'$0' --pool \"\$WT_KEY\" cleanup \"\$WT_NAME\"" EXIT
 
-  printf '\n──── session: %s/%s @ %s ────\n\n' "$key" "$name" "$path"
+  printf '\n──── session: %s/%s @ %s ────\n\n' "$POOL_KEY" "$name" "$path"
 
   # Pre-launch hook: deps install, dev-server start, project banner, etc.
-  # Eval'd in cmd_go's shell; aborts launch on non-zero (set -e). Hook reads
-  # $WT_* from env.
-  [ -n "${WORKTREE_POOL_SESSION_PRE_HOOK:-}" ] && eval "$WORKTREE_POOL_SESSION_PRE_HOOK"
+  # Aborts launch on non-zero (set -e). Hook reads $WT_* from env.
+  source_hooks
+  call_hook wt_pre_go
 
   # `-n <name>` sets claude's session display name (prompt box, /resume picker,
   # terminal title). Assumes the launcher accepts it — true for `claude` and
   # the default `ai` wrapper. printf %q quotes for the inline `zsh -ic` shell.
+  local launcher="${WT_LAUNCHER:-ai}"
   local cmd
-  printf -v cmd '%s -n %q' "${WORKTREE_POOL_SESSION_CMD:-ai}" "$name"
+  printf -v cmd '%s -n %q' "$launcher" "$name"
   [ "$existing" = 1 ] && cmd="$cmd --continue"
   (cd "$path" && exec "${SHELL:-zsh}" -ic "$cmd")
 }
@@ -229,14 +325,18 @@ cmd_sync() {
       echo "sync: dirty tracked work needs a commit message:" >&2
       git status --short >&2
       echo >&2
-      echo "  sync \"feat: <what you did>\"" >&2
-      echo "  sync wip                          # shorthand → 'WIP via sync'" >&2
+      echo "  wt sync \"feat: <what you did>\"" >&2
+      echo "  wt sync wip                        # shorthand → 'WIP via sync'" >&2
       exit 1
     fi
     [ "$msg" = "wip" ] && msg="WIP via sync"
     git add -u
     git commit -m "$msg"
   fi
+
+  # Capture pre-merge main for wt_post_sync hook.
+  local main_before
+  main_before=$(git rev-parse main)
 
   # Merge main. On conflict, halt with resume hint. On the resume path
   # (after manual conflict resolution + commit), this is "Already up to date."
@@ -267,16 +367,19 @@ cmd_sync() {
   fi
 
   echo "sync: $branch merged; main at $(git rev-parse --short HEAD)"
+
+  # Post-sync hook (deps-changed advisory etc). Source hooks from main_path
+  # since sync runs without a pool key — main_path IS the source repo.
+  export WT_MAIN_BEFORE="$main_before" WT_MAIN_AFTER="$(git rev-parse main)"
+  source_hooks "$main_path"
+  call_hook wt_post_sync || true
 }
 
 cmd_cleanup() {
-  local key="${1:-}"; shift || true
   local name="${1:-}"; shift || true
-  [ -n "$key" ] && [ -n "$name" ] || { echo "usage: cleanup <pool-key> <name>" >&2; exit 0; }
+  [ -n "$name" ] || { echo "usage: cleanup <name>" >&2; exit 0; }
 
-  local POOL_ROOT path
-  POOL_ROOT=$(pool_root "$key")
-  path="$POOL_ROOT/$name"
+  local path="$POOL_ROOT/$name"
 
   local G Y R X
   if [ -t 1 ]; then
@@ -286,20 +389,23 @@ cmd_cleanup() {
   fi
 
   if [ ! -d "$path" ]; then
-    printf '%s🟢 slot %s/%s already recycled%s\n' "$G" "$key" "$name" "$X"
+    printf '%s🟢 slot %s/%s already recycled%s\n' "$G" "$POOL_KEY" "$name" "$X"
     exit 0
   fi
 
-  # Ghost-dir guard: slot dir exists but `.git` is missing or dangling. Without
-  # this, every status/ahead check below silently reads as "clean & not ahead",
-  # falls into the recycle branch, `rm` fails inside `worktree-pool release`,
-  # and the old `|| true` swallowed it — printing 🟢 over a still-broken slot.
+  # Ghost-dir guard: slot dir exists but `.git` is missing or dangling.
   if ! slot_repo_ok "$path"; then
     printf '%s🔴 BROKEN: %s — slot dir has no valid .git (partial-cleanup debris). NOT recycling.%s\n' \
       "$R" "$name" "$X" >&2
     printf '   Recover: rm -rf %q\n' "$path" >&2
     exit 0
   fi
+
+  # Pre-cleanup hook (e.g. dev-server stop). Best-effort — failure here
+  # shouldn't block the classifier from running. Hooks see slot context.
+  export WT_KEY="$POOL_KEY" WT_NAME="$name" WT_PATH="$path" WT_FRESH=0
+  source_hooks
+  call_hook wt_pre_cleanup || true
 
   local marker
   marker=$(in_progress_marker "$path")
@@ -331,11 +437,12 @@ cmd_cleanup() {
   # Honest reporting: only print 🟢 if the underlying release actually
   # succeeded. The previous `|| true` masked release failures, so a broken
   # slot would print 🟢 and persist on disk.
-  if "$0" rm "$key" "$name"; then
-    printf '%s🟢 recycled cleanly: %s/%s%s\n' "$G" "$key" "$name" "$X"
+  if "$0" --pool "$POOL_KEY" rm "$name"; then
+    printf '%s🟢 recycled cleanly: %s/%s%s\n' "$G" "$POOL_KEY" "$name" "$X"
+    call_hook wt_post_cleanup || true
   else
     printf '%s🔴 recycle failed: %s/%s — see error above. Slot left in place.%s\n' \
-      "$R" "$key" "$name" "$X" >&2
+      "$R" "$POOL_KEY" "$name" "$X" >&2
   fi
 }
 
@@ -354,15 +461,11 @@ cmd_rm() {
   done
   set -- ${args[@]+"${args[@]}"}
 
-  local key="${1:-}"; shift || true
   local name="${1:-}"; shift || true
-  require_arg key  "$key"  "session rm <pool-key> <name> [--force]"
-  require_arg name "$name" "session rm <pool-key> <name> [--force]"
+  require_arg name "$name" "wt rm <name> [--force]"
 
-  local POOL_ROOT path
-  POOL_ROOT=$(pool_root "$key")
-  path="$POOL_ROOT/$name"
-  [ -d "$path" ] || die "no slot named '$name' in pool '$key' at $POOL_ROOT."
+  local path="$POOL_ROOT/$name"
+  [ -d "$path" ] || die "no slot named '$name' in pool '$POOL_KEY' at $POOL_ROOT."
 
   if ! slot_repo_ok "$path"; then
     die "slot '$name' at $path is broken (no valid .git). Recover with: rm -rf $(printf '%q' "$path")"
@@ -386,19 +489,18 @@ cmd_rm() {
     fi
   fi
 
+  # Pre-rm hook (e.g. dev-server stop). Best-effort.
+  export WT_KEY="$POOL_KEY" WT_NAME="$name" WT_PATH="$path" WT_FRESH=0
+  source_hooks
+  call_hook wt_pre_rm || true
+
   # Remote branch delete is delegated to release.rs's silent push_delete
-  # (best-effort). The session layer used to do its own visible push --delete
-  # for operator transparency, but the warning channel was misleading more
-  # than helpful: read-only origins (`git://` bare mirrors), races where a
-  # parallel sync/release already deleted the ref, and the daemon's
-  # fetch-vs-push ref-view divergence all surface as "remote ref does not
-  # exist" — none actionable. release.rs:66 still runs the actual delete.
-  worktree-pool --pool "$key" release --name "$name"
+  # (best-effort). See release.rs:66.
+  worktree-pool --pool "$POOL_KEY" release --name "$name"
 }
 
 # Print the current repo's toplevel path and CLAUDE.md to stdout. Intended for
-# AI-agent session bootstrap — `orient` answers "where am I and what are the
-# rules here." No pool-key argument; resolved from `git rev-parse`.
+# AI-agent session bootstrap.
 cmd_orient() {
   local repo
   repo=$(git rev-parse --show-toplevel 2>/dev/null) || die "orient: not inside a git repo"
@@ -409,20 +511,38 @@ cmd_orient() {
   fi
 }
 
+cmd_ls() {
+  exec worktree-pool --pool "$POOL_KEY" ls "$@"
+}
+
+cmd_info() {
+  local name="${1:-}"; shift || true
+  require_arg name "$name" "wt info <name>"
+  exec worktree-pool --pool "$POOL_KEY" inspect --name "$name" "$@"
+}
+
 # ---------- dispatch ----------
+
+POOL_KEY=""
+# Parse `--pool <key>` / `-p <key>` anywhere before the verb.
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --pool)   [ $# -ge 2 ] || die "--pool requires an argument"; POOL_KEY="$2"; shift 2 ;;
+    --pool=*) POOL_KEY="${1#--pool=}"; shift ;;
+    -p)       [ $# -ge 2 ] || die "-p requires an argument"; POOL_KEY="$2"; shift 2 ;;
+    *)        break ;;
+  esac
+done
 
 verb="${1:-}"; shift || true
 case "$verb" in
-  path)    cmd_path    "$@" ;;
-  go)      cmd_go      "$@" ;;
-  new)
-    Y='' X=''
-    [ -t 2 ] && { Y=$'\e[33m'; X=$'\e[0m'; }
-    printf '%s⚠ `new` is deprecated — use `go` instead.%s\n' "$Y" "$X" >&2
-    cmd_go "$@" ;;
+  path)    require_pool; cmd_path    "$@" ;;
+  go)      require_pool; cmd_go      "$@" ;;
   sync)    cmd_sync    "$@" ;;
-  cleanup) cmd_cleanup "$@" ;;
-  rm)      cmd_rm      "$@" ;;
+  cleanup) require_pool; cmd_cleanup "$@" ;;
+  rm)      require_pool; cmd_rm      "$@" ;;
   orient)  cmd_orient  "$@" ;;
-  *)       die "usage: ${0##*/} {path|go|cleanup|rm} <pool-key> <name> ... | sync [message] | orient" ;;
+  ls)      require_pool; cmd_ls      "$@" ;;
+  info)    require_pool; cmd_info    "$@" ;;
+  *)       die "usage: ${0##*/} [--pool <key>] {path|go|cleanup|rm|ls|info} <name> ... | sync [message] | orient" ;;
 esac
