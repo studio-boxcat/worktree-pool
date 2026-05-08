@@ -386,22 +386,13 @@ cmd_rm() {
     fi
   fi
 
-  # Best-effort remote branch delete at the session layer (visible). release's
-  # push_delete is the silent backstop. Skip in two cases:
-  #   1. origin uses the read-only `git://` protocol (e.g. a bare mirror) —
-  #      `ls-remote` would still succeed, but `push --delete` always fails with
-  #      a misleading "remote ref does not exist" error. CLAUDE.md §Lifecycle
-  #      (release step 4) documents the no-op-on-bare-mirror contract.
-  #   2. no matching ref exists on origin — avoids the spurious "remote ref
-  #      does not exist" error on local-only branches.
-  local push_url
-  push_url=$(git -C "$path" remote get-url --push origin 2>/dev/null || true)
-  if [[ "$push_url" != git://* ]] \
-     && git -C "$path" ls-remote --exit-code --heads origin "$name" >/dev/null 2>&1; then
-    git -C "$path" push origin --delete "$name" || \
-      echo "${0##*/}: warning: failed to delete origin/$name (continuing)." >&2
-  fi
-
+  # Remote branch delete is delegated to release.rs's silent push_delete
+  # (best-effort). The session layer used to do its own visible push --delete
+  # for operator transparency, but the warning channel was misleading more
+  # than helpful: read-only origins (`git://` bare mirrors), races where a
+  # parallel sync/release already deleted the ref, and the daemon's
+  # fetch-vs-push ref-view divergence all surface as "remote ref does not
+  # exist" — none actionable. release.rs:66 still runs the actual delete.
   worktree-pool --pool "$key" release --name "$name"
 }
 
