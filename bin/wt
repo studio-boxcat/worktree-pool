@@ -375,9 +375,11 @@ cmd_sync() {
   local main_before
   main_before=$(git rev-parse main)
 
-  # Merge main. On conflict, halt with resume hint. On the resume path
-  # (after manual conflict resolution + commit), this is "Already up to date."
-  if ! git merge --no-ff -m "Sync main into $branch" main; then
+  # Merge main. Common case (no parallel sync): main is ancestor of slot HEAD,
+  # so this is a no-op ("Already up to date.") — slot's commits will fast-forward
+  # main below. Only when a parallel slot has advanced main do we get a real
+  # 3-way merge (with potential conflicts; resume = re-run after manual commit).
+  if ! git merge -m "Sync main into $branch" main; then
     echo >&2
     echo "sync: merge halted with conflicts. Resolve and either:" >&2
     echo "  • finish: 'git add' the files, 'git commit', then re-run sync" >&2
@@ -391,7 +393,7 @@ cmd_sync() {
   # if main moved between this check and the update, update-ref refuses.
   if ! git merge-base --is-ancestor main HEAD; then
     echo "sync: main has moved past your merge base (parallel slot synced first)." >&2
-    echo "  Re-merge with 'git merge --no-ff main', resolve, commit, then re-run." >&2
+    echo "  Re-merge with 'git merge main', resolve, commit, then re-run." >&2
     exit 1
   fi
 

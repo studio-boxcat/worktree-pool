@@ -310,7 +310,7 @@ Steps in order, refuses loudly on anything unexpected:
 3. Find main via `git worktree list --porcelain`; refuse if `main` isn't checked out anywhere.
 4. Refuse if main worktree has tracked uncommitted changes (untracked there is fine — `git reset --hard HEAD` only touches tracked files).
 5. Auto-commit dirty tracked work with the supplied message. Refuses if dirty *and* no message. `wip` shorthand → `WIP via sync`.
-6. `git merge --no-ff main`. Halts on conflict — resolve, `git add`, `git commit`, then re-run sync (the merge step becomes a no-op).
+6. `git merge main`. No-op in the common case (main is ancestor of slot HEAD); slot's commits fast-forward main in step 8 — keeps history linear. A real 3-way merge only happens when a parallel slot advanced main first; halts on conflict, resolve + `git add` + `git commit`, then re-run sync.
 7. Refuse if `main` is no longer ancestor of `HEAD` (a parallel slot's sync advanced main during long conflict resolution).
 8. Atomic `git update-ref refs/heads/main HEAD <expected_main>`. Refuses if a parallel slot advanced main between step 7 and here.
 9. `git -C <main_path> reset --hard HEAD` to refresh main's tree.
