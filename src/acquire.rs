@@ -132,7 +132,7 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> 
     // both visible). Caller must `release --name <name>` to recover. The
     // explicit context message in the wrapper steers operators toward that
     // recovery instead of leaving them to discover the stuck state by hand.
-    submodules::update(&target_path, cfg, &args.exclude_submodule_tags).with_context(|| {
+    submodules::update(&target_path, cfg, &args.exclude_submodule_tags, &args.name).with_context(|| {
         format!(
             "submodule update failed for slot '{}'; the slot is left HELD with partial state. \
              Recover: `worktree-pool --pool <key> release --name {}` (the lock + working tree \

@@ -6,7 +6,7 @@ use std::path::Path;
 
 use crate::cli::ReleaseArgs;
 use crate::config::PoolConfig;
-use crate::{fs_paths, git, lock::Lock, mutex, slot};
+use crate::{fs_paths, git, lock::Lock, mutex, slot, submodules};
 
 pub fn run(pool_root: &Path, cfg: &PoolConfig, args: ReleaseArgs) -> Result<()> {
     // Pool-wide mutex serializes the find-smallest-free-N + rename window.
@@ -64,6 +64,11 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: ReleaseArgs) -> Result<()> 
     }
     let _ = git::branch_delete(&slot_path, &args.name);
     let _ = git::push_delete(&slot_path, "origin", &args.name);
+
+    // Mirror the parent cleanup into every submodule (incl. nested) — `acquire`
+    // creates a `<args.name>` branch in each so commits there have a push-ready
+    // label; release un-creates it. Best-effort, parallel per level.
+    submodules::delete_branch_recursive(&slot_path, &args.name);
 
     // Compute target canonical id. Group must come from the lock (acquire wrote it there);
     // if absent, fall back to first configured group, or groupless.

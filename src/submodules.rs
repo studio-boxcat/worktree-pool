@@ -126,15 +126,24 @@ pub fn extract_org_repo(url: &str) -> Option<String> {
 }
 
 /// Initialize and update submodules filtered by `exclude_tags` and with URL rewrites
-/// applied. Recurses into nested `.gitmodules` if present.
-pub fn update(slot: &Path, cfg: &PoolConfig, exclude_tags: &[String]) -> Result<()> {
-    update_recursive(slot, cfg, exclude_tags, "")
+/// applied. Recurses into nested `.gitmodules` if present. Each materialized submodule
+/// (top-level + nested) gets a local branch named `branch_name` force-created at HEAD,
+/// matching the parent slot's branch — gives commits in the submodule a push-ready label
+/// and a stable ref for `wt sync` to fetch by. See CLAUDE.md §Sync flow.
+pub fn update(
+    slot: &Path,
+    cfg: &PoolConfig,
+    exclude_tags: &[String],
+    branch_name: &str,
+) -> Result<()> {
+    update_recursive(slot, cfg, exclude_tags, branch_name, "")
 }
 
 fn update_recursive(
     dir: &Path,
     cfg: &PoolConfig,
     exclude_tags: &[String],
+    branch_name: &str,
     name_scope: &str,
 ) -> Result<()> {
     let entries = parse_gitmodules(dir)?;
@@ -213,9 +222,11 @@ fn update_recursive(
             })?;
         }
 
-        // Phase 2: parallel `submodule update`. Each process reads-only from parent
-        // config and writes to its own admin dir / working tree, so they don't fight
-        // for the same lockfile.
+        // Phase 2: parallel `submodule update` + branch attach. Each process
+        // reads-only from parent config and writes to its own admin dir / working
+        // tree, so they don't fight for the same lockfile. The follow-on
+        // `checkout_force_branch` writes only to the submodule's own gitdir
+        // (refs/heads/<n> + HEAD) — no contention with sibling threads.
         std::thread::scope(|scope| -> Result<()> {
             let handles: Vec<_> = included
                 .iter()
@@ -229,7 +240,17 @@ fn update_recursive(
                         .map(drop)
                         .with_context(|| {
                             format!("submodule update {} in {}", e.path, dir.display())
-                        })
+                        })?;
+                        let sub_path = dir.join(&e.path);
+                        git::checkout_force_branch(&sub_path, branch_name).with_context(
+                            || {
+                                format!(
+                                    "creating branch '{}' in submodule {}",
+                                    branch_name,
+                                    sub_path.display()
+                                )
+                            },
+                        )
                     })
                 })
                 .collect();
@@ -279,10 +300,45 @@ fn update_recursive(
             } else {
                 format!("{name_scope}/{}/modules", e.name)
             };
-            update_recursive(&child, cfg, exclude_tags, &child_scope)?;
+            update_recursive(&child, cfg, exclude_tags, branch_name, &child_scope)?;
         }
     }
     Ok(())
+}
+
+/// Best-effort recursive cleanup of the per-slot `<branch_name>` branch left by
+/// `update`. Detaches HEAD and deletes the branch in every submodule (incl.
+/// nested) so the slot's submodule gitdirs end the cycle as clean as the parent.
+/// Tag-excluded (deinit'd) submodules are silently skipped — their working dir
+/// is empty so the git ops fail lenient.
+///
+/// Parallel per-level: each submodule's gitdir is independent, so detach +
+/// branch-delete fan out without contention. Failures are absorbed (mirrors
+/// the parent's best-effort branch cleanup in `release.rs`).
+pub fn delete_branch_recursive(dir: &Path, branch_name: &str) {
+    let Ok(entries) = parse_gitmodules(dir) else {
+        return;
+    };
+    if entries.is_empty() {
+        return;
+    }
+
+    std::thread::scope(|scope| {
+        for e in &entries {
+            let sub_path = dir.join(&e.path);
+            scope.spawn(move || {
+                let _ = git::checkout_detach(&sub_path);
+                let _ = git::branch_delete(&sub_path, branch_name);
+            });
+        }
+    });
+
+    for e in &entries {
+        let child = dir.join(&e.path);
+        if child.join(".gitmodules").exists() {
+            delete_branch_recursive(&child, branch_name);
+        }
+    }
 }
 
 #[cfg(test)]

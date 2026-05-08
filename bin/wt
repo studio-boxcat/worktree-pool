@@ -404,12 +404,42 @@ cmd_sync() {
     git update-ref -m "sync from $branch" refs/heads/main HEAD "$expected_main"
     git -C "$main_path" reset --hard HEAD >/dev/null
   fi
+  local main_after
+  main_after=$(git rev-parse main)
+
+  # Propagate submodule commits into the main worktree's submodule clones.
+  # Each parent worktree (slot + main) has its own submodule gitdir, so advancing
+  # `main` and resetting the main worktree just moves the gitlinks — main's
+  # submodule clones still have the old SHA and stale workdir contents.
+  # `acquire` branched each submodule as `<slot-name>` (matches parent), so we
+  # can fetch by branch name from the slot's submodule into main's, then
+  # hard-reset main's submodule HEAD to the gitlink-expected SHA. Top-level
+  # submodules only — nested propagation deferred (see CLAUDE.md §Sync flow).
+  local slot_path moved
+  slot_path=$(git rev-parse --show-toplevel)
+  moved=$(git diff --raw "$main_before" "$main_after" | awk '$2=="160000" {print $6}')
+  if [ -n "$moved" ]; then
+    while IFS= read -r sub; do
+      [ -n "$sub" ] || continue
+      # Slot's submodule absent (tag-excluded at acquire) — nothing to propagate.
+      [ -d "$slot_path/$sub/.git" ] || continue
+      [ -d "$main_path/$sub/.git" ] \
+        || die "sync: main worktree's submodule clone missing at $main_path/$sub"
+      local new_sha
+      new_sha=$(git -C "$slot_path/$sub" rev-parse HEAD)
+      git -C "$main_path/$sub" fetch --quiet "$slot_path/$sub" "$branch" \
+        || die "sync: fetch from $slot_path/$sub into $main_path/$sub failed"
+      git -C "$main_path/$sub" reset --hard --quiet "$new_sha" \
+        || die "sync: reset $main_path/$sub to $new_sha failed"
+      echo "sync: submodule $sub → $(git -C "$main_path/$sub" rev-parse --short HEAD)"
+    done <<< "$moved"
+  fi
 
   echo "sync: $branch merged; main at $(git rev-parse --short HEAD)"
 
   # Post-sync hook (deps-changed advisory etc). Source hooks from main_path
   # since sync runs without a pool key — main_path IS the source repo.
-  export WT_MAIN_BEFORE="$main_before" WT_MAIN_AFTER="$(git rev-parse main)"
+  export WT_MAIN_BEFORE="$main_before" WT_MAIN_AFTER="$main_after"
   source_hooks "$main_path"
   call_hook wt_post_sync || true
 }

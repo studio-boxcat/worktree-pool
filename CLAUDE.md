@@ -127,7 +127,7 @@ Per-host `init` runs once per pool key. Source path differs by host (build serve
 8. Rename via `fs::rename` + `git worktree repair` (`git worktree move` refuses on slots with submodules — see `git.rs::worktree_rename`). Also rewrites every submodule admin's `core.worktree` (anchored on the pool-key segment, idempotent self-heal).
 9. Force-create branch: `git -C <pool>/<name> update-ref refs/heads/<name> HEAD && symbolic-ref HEAD refs/heads/<name>`. (Avoids `git checkout -B`'s 600ms of per-file filter-process pings on a tree that's already at the right state.)
 10. Drop pool-wide mutex (slot is now visibly held under user-name; submodule init below is per-slot work guarded by the still-held init mutex).
-11. Submodule update, two-phase to dodge `<source>/.git/config` lockfile contention: (a) sequential `git config submodule.<name>.url` writes per submodule, applying URL overrides per pool config; (b) parallel per-submodule `git submodule update <path>` via `std::thread::scope`. Tag exclusion via `--exclude-submodule-tags` against `worktreePoolTag` in `.gitmodules`.
+11. Submodule update, two-phase to dodge `<source>/.git/config` lockfile contention: (a) sequential `git config submodule.<name>.url` writes per submodule, applying URL overrides per pool config; (b) parallel per-submodule `git submodule update <path>` via `std::thread::scope`, then in the same thread `update-ref refs/heads/<name> HEAD && symbolic-ref HEAD refs/heads/<name>` to attach the submodule to a branch matching the parent slot's name (gives commits a push-ready label and a stable ref for `wt sync` to fetch by — see [§Sync flow](#sync-flow)). Recursive into nested submodules with the same branch name. Tag exclusion via `--exclude-submodule-tags` against `worktreePoolTag` in `.gitmodules`.
 12. Release init mutex; print path on stdout (last line).
 
 ### `release`
@@ -135,7 +135,7 @@ Per-host `init` runs once per pool key. Source path differs by host (build serve
 1. Take pool-wide mutex.
 2. Read lock to recover `group`.
 3. Delete lock (slot becomes idle to other acquires inside the mutex).
-4. Detach HEAD; `branch -D <name>` (local); `push --delete origin <name>` (best-effort, no-op if `origin` is a bare mirror).
+4. Detach HEAD; `branch -D <name>` (local); `push --delete origin <name>` (best-effort, no-op if `origin` is a bare mirror). Recursively mirror this in every submodule (`detach + branch -D <name>` per submodule, parallel via `std::thread::scope`) to clean up the per-slot branch step 11 of acquire created.
 5. Find smallest free `{group}-N`.
 6. Un-rename via `fs::rename` + `git worktree repair` + submodule `core.worktree` self-heal (same primitives as acquire's rename).
 7. Drop mutex.
@@ -314,6 +314,7 @@ Steps in order, refuses loudly on anything unexpected:
 7. Refuse if `main` is no longer ancestor of `HEAD` (a parallel slot's sync advanced main during long conflict resolution).
 8. Atomic `git update-ref refs/heads/main HEAD <expected_main>`. Refuses if a parallel slot advanced main between step 7 and here.
 9. `git -C <main_path> reset --hard HEAD` to refresh main's tree.
+10. Propagate moved submodule SHAs into the main worktree's submodule clones. Each parent worktree (slot + main) has its own submodule gitdir, so steps 8-9 only move the gitlinks — main's submodule clones still hold the old SHA. For each top-level submodule whose gitlink moved (`git diff --raw <main_before> <main_after> | awk '$2=="160000"'`), `git -C <main_path>/<sub> fetch <slot_path>/<sub> <branch>` then `reset --hard <new_sha>`. Skip when the slot's submodule is absent (tag-excluded at acquire); refuse loudly on fetch/reset failure. Top-level only; nested-submodule propagation is a v2 (commits at nested levels remain on the slot's per-submodule `<slot-name>` branch from acquire's step 11, so manual `git -C <main>/<top>/<nested> fetch <slot>/<top>/<nested> <branch>` recovers them when needed).
 
 Idempotent: re-runs are safe (no-op if `main == HEAD`). Resume after conflict = re-run sync after the manual merge commit lands. Pushing to a remote is the operator's responsibility — `wt sync` only advances local refs.
 

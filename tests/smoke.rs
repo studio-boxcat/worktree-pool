@@ -737,6 +737,75 @@ fn acquire_release_with_submodule_rewires_pointers() {
     assert!(slot2.join("sub/FILE").exists());
 }
 
+/// Acquire branches each submodule as `<slot-name>` (matches the parent slot's
+/// branch). This gives commits in the submodule a push-ready label and a stable
+/// ref for `wt sync` to fetch by. Release un-creates it.
+///
+/// See CLAUDE.md §Lifecycle invariants step 11 + §Sync flow.
+#[test]
+fn acquire_branches_submodule_release_cleans_up() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture_with_submodule(tmp.path());
+    init_pool(&key, &bare);
+
+    let slot_name = "feat-branch";
+    let out = Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", &key, "acquire", "--name", slot_name, "--group", "ios"])
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "acquire failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let slot = pool_root(&key).join(slot_name);
+    let sub = slot.join("sub");
+
+    // HEAD attached to refs/heads/<slot_name> (not detached).
+    let head = StdCommand::new("git")
+        .args(["symbolic-ref", "HEAD"])
+        .current_dir(&sub)
+        .output()
+        .unwrap();
+    assert!(head.status.success(), "submodule HEAD is detached, expected branch");
+    assert_eq!(
+        String::from_utf8_lossy(&head.stdout).trim(),
+        format!("refs/heads/{slot_name}"),
+    );
+
+    // Branch ref resolves at HEAD.
+    let head_sha = StdCommand::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&sub)
+        .output()
+        .unwrap();
+    let branch_sha = StdCommand::new("git")
+        .args(["rev-parse", &format!("refs/heads/{slot_name}")])
+        .current_dir(&sub)
+        .output()
+        .unwrap();
+    assert!(branch_sha.status.success(), "submodule branch ref missing");
+    assert_eq!(head_sha.stdout, branch_sha.stdout);
+
+    // Release un-creates the branch.
+    release(&key, slot_name);
+    let canonical_sub = pool_root(&key).join("ios-0").join("sub");
+    let after = StdCommand::new("git")
+        .args(["rev-parse", "--verify", &format!("refs/heads/{slot_name}")])
+        .current_dir(&canonical_sub)
+        .output()
+        .unwrap();
+    assert!(
+        !after.status.success(),
+        "submodule branch '{slot_name}' should be deleted on release; rev-parse returned: {}",
+        String::from_utf8_lossy(&after.stdout)
+    );
+}
+
 /// Make a bare repo whose tip commit registers `n` independent submodules.
 /// Each submodule is a tiny standalone bare. Returns the parent bare.
 fn make_fixture_with_n_submodules(dir: &Path, n: usize) -> PathBuf {
