@@ -946,3 +946,136 @@ fn parallel_submodule_init_acquires_all() {
     );
 }
 
+// ---------- worktree-pool-session (bash wrapper) ----------
+
+fn session_script() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bin/worktree-pool-session")
+}
+
+/// Build a `bash <session-script> <args...>` command with PATH augmented so
+/// the script can resolve `worktree-pool` to the test binary, plus a no-op
+/// SHELL and CLEANUP_CMD so an unexpected `cmd_go` launch succeeds quietly.
+/// That lets `cmd_go` tests rely on cmd_go's *own* exit code as the signal —
+/// without these, /usr/bin/zsh + the default cleanup trap would fire and muddy
+/// the stderr assertions.
+fn session_cmd(args: &[&str]) -> StdCommand {
+    let bin_path = PathBuf::from(env!("CARGO_BIN_EXE_worktree-pool"));
+    let bin_dir = bin_path.parent().unwrap();
+    let prev_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", bin_dir.display(), prev_path);
+    let mut cmd = StdCommand::new("bash");
+    cmd.arg(session_script()).args(args).env("PATH", new_path);
+    cmd.env("SHELL", "/usr/bin/true");
+    cmd.env("WORKTREE_POOL_SESSION_CLEANUP_CMD", "true");
+    cmd
+}
+
+/// Acquire a slot, then break it. `gitlink_only=true` mirrors the most common
+/// ghost-dir state (the gitlink file is gone, source-repo admin still around);
+/// `false` is the harder case where the source-repo admin was also pruned —
+/// matters because git's upward-walk on a missing `.git` could otherwise let
+/// `slot_repo_ok` falsely pass (e.g. dotfiles repo at $HOME).
+fn acquire_then_break(key: &str, name: &str, gitlink_only: bool) -> PathBuf {
+    let out = acquire_dev(key, name);
+    assert!(out.status.success(), "acquire failed: {}", String::from_utf8_lossy(&out.stderr));
+    let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    assert!(path.exists());
+    let gitlink = std::fs::read_to_string(path.join(".git")).expect("read gitlink");
+    let admin = PathBuf::from(gitlink.strip_prefix("gitdir: ").unwrap().trim());
+    std::fs::remove_file(path.join(".git")).expect("remove slot .git gitlink");
+    if !gitlink_only {
+        std::fs::remove_dir_all(&admin).expect("remove source-repo admin");
+    }
+    path
+}
+
+#[test]
+fn session_go_refuses_broken_slot() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let path = acquire_then_break(&key, "ghost", true);
+
+    let out = session_cmd(&["go", &key, "ghost"]).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "expected `go` to refuse broken slot; stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("is broken (no valid .git"),
+        "expected die message; got: {stderr}");
+    assert!(path.exists(), "go should not delete the broken slot");
+}
+
+#[test]
+fn session_cleanup_does_not_lie_on_broken_slot() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let path = acquire_then_break(&key, "ghost", true);
+
+    let out = session_cmd(&["cleanup", &key, "ghost"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Exit-trap contract: cleanup always exits 0 (per CLAUDE.md), so don't
+    // assert non-zero. But the OUTPUT must not lie about success.
+    assert!(!stdout.contains("recycled cleanly"),
+        "cleanup must not falsely claim recycle on broken slot.\nstdout={stdout}\nstderr={stderr}");
+    assert!(stderr.contains("🔴 BROKEN:"),
+        "cleanup must surface the broken state with the documented marker.\nstderr={stderr}");
+    assert!(path.exists(), "cleanup should not delete the broken slot dir");
+}
+
+/// Stress the `slot_repo_ok` predicate against the upward-walk failure mode:
+/// no gitlink AND no source-repo admin. `git -C <slot> rev-parse --git-dir`
+/// alone would walk up from the slot path; the explicit `[ -e <slot>/.git ]`
+/// prefix is what makes the predicate correct here.
+#[test]
+fn session_cleanup_detects_fully_orphaned_slot() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let path = acquire_then_break(&key, "ghost", false);
+
+    let out = session_cmd(&["cleanup", &key, "ghost"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stdout.contains("recycled cleanly"),
+        "stdout={stdout}\nstderr={stderr}");
+    assert!(stderr.contains("🔴 BROKEN:"),
+        "stderr={stderr}");
+    assert!(path.exists());
+}
+
+#[test]
+fn session_rm_refuses_broken_slot() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let path = acquire_then_break(&key, "ghost", true);
+
+    let out = session_cmd(&["rm", &key, "ghost"]).output().unwrap();
+    assert!(!out.status.success(),
+        "rm should refuse broken slot rather than dive into release.\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("is broken (no valid .git"),
+        "expected guarded refusal; got: {stderr}");
+    assert!(path.exists());
+}
+

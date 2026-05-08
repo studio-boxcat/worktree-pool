@@ -49,6 +49,13 @@ ahead_count() {
   git -C "$path" rev-list --count "main..$branch" 2>/dev/null || echo '?'
 }
 
+# True iff <slot-path>/.git exists AND resolves. The existence prefix prevents
+# git's upward-walk on a missing gitlink from passing by accident (e.g. user
+# has $HOME/.git for dotfiles).
+slot_repo_ok() {
+  [ -e "$1/.git" ] && git -C "$1" rev-parse --git-dir >/dev/null 2>&1
+}
+
 # Find the absolute path of the worktree that has refs/heads/main checked out.
 # Echoes empty string if no worktree holds main. Pool slots are themselves
 # `git worktree`s of source, so from any slot this returns the source path.
@@ -121,11 +128,17 @@ cmd_go() {
 
   # If a slot with this name already exists, resume it instead of acquiring.
   # Warn loudly — `--from` and other acquire flags are ignored on resume
-  # (slot stays at its existing commit).
+  # (slot stays at its existing commit). A dir whose `.git` gitlink is missing
+  # or dangling (ghost slot — partial cleanup debris) is NOT resumable; we
+  # refuse loudly so the operator can decide between recovery and rm -rf.
   local path existing=0
   if [ -d "$POOL_ROOT/$name" ]; then
     existing=1
     path="$POOL_ROOT/$name"
+    if ! slot_repo_ok "$path"; then
+      die "slot '$name' at $path is broken (no valid .git — likely partial-cleanup debris). \
+Recover with: rm -rf $(printf '%q' "$path"), then re-run."
+    fi
     local Y='' X=''
     [ -t 2 ] && { Y=$'\e[33m'; X=$'\e[0m'; }
     printf '%s⚠ slot %s/%s already exists — resuming (acquire flags ignored). Use `%s rm %s %s` first to recreate.%s\n' \
@@ -277,6 +290,17 @@ cmd_cleanup() {
     exit 0
   fi
 
+  # Ghost-dir guard: slot dir exists but `.git` is missing or dangling. Without
+  # this, every status/ahead check below silently reads as "clean & not ahead",
+  # falls into the recycle branch, `rm` fails inside `worktree-pool release`,
+  # and the old `|| true` swallowed it — printing 🟢 over a still-broken slot.
+  if ! slot_repo_ok "$path"; then
+    printf '%s🔴 BROKEN: %s — slot dir has no valid .git (partial-cleanup debris). NOT recycling.%s\n' \
+      "$R" "$name" "$X" >&2
+    printf '   Recover: rm -rf %q\n' "$path" >&2
+    exit 0
+  fi
+
   local marker
   marker=$(in_progress_marker "$path")
   if [ -n "$marker" ]; then
@@ -304,8 +328,15 @@ cmd_cleanup() {
     exit 0
   fi
 
-  "$0" rm "$key" "$name" || true
-  printf '%s🟢 recycled cleanly: %s/%s%s\n' "$G" "$key" "$name" "$X"
+  # Honest reporting: only print 🟢 if the underlying release actually
+  # succeeded. The previous `|| true` masked release failures, so a broken
+  # slot would print 🟢 and persist on disk.
+  if "$0" rm "$key" "$name"; then
+    printf '%s🟢 recycled cleanly: %s/%s%s\n' "$G" "$key" "$name" "$X"
+  else
+    printf '%s🔴 recycle failed: %s/%s — see error above. Slot left in place.%s\n' \
+      "$R" "$key" "$name" "$X" >&2
+  fi
 }
 
 cmd_rm() {
@@ -319,6 +350,13 @@ cmd_rm() {
   POOL_ROOT=$(pool_root "$key")
   path="$POOL_ROOT/$name"
   [ -d "$path" ] || die "no slot named '$name' in pool '$key' at $POOL_ROOT."
+
+  # Same ghost-dir guard as cmd_cleanup — without it, the silenced status/ahead
+  # checks below misread broken state as "clean", and we'd dive into a release
+  # that can't possibly succeed.
+  if ! slot_repo_ok "$path"; then
+    die "slot '$name' at $path is broken (no valid .git). Recover with: rm -rf $(printf '%q' "$path")"
+  fi
 
   local porcelain
   porcelain=$(git -C "$path" status --porcelain 2>/dev/null || true)

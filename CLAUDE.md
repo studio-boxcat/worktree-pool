@@ -257,9 +257,10 @@ Cleanup classifier (always exits 0 — it's an exit-trap target, so `wt-go`'s ex
 |---|---|---|
 | 🟢 | clean working tree AND 0 commits ahead local `main` | un-rename + delete branch + release (recycle) |
 | 🟡 | dirty / untracked files | leave personalized — resume with `session go` later |
-| 🔴 | non-zero commits ahead local `main` (unmerged) | loud refuse — operator resolves before recycling |
+| 🔴 UNMERGED | non-zero commits ahead local `main` (unmerged) | loud refuse — operator resolves before recycling |
+| 🔴 BROKEN | slot dir exists but `<slot>/.git` is missing or dangling (ghost dir from partial cleanup debris) | loud refuse — operator recovers via `rm -rf` (the dir is unrecoverable as a worktree; nothing of value lives in `.git`-less debris) |
 
-Re-running `session go <key> <name>` resumes any 🟡 / 🔴 slot.
+Re-running `session go <key> <name>` resumes any 🟡 / 🔴 UNMERGED slot. 🔴 BROKEN slots can't be resumed — `go` and `rm` both refuse them.
 
 ### Sync flow
 
