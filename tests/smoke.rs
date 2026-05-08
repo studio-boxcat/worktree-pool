@@ -996,41 +996,21 @@ fn acquire_then_break(key: &str, name: &str, gitlink_only: bool) -> PathBuf {
 }
 
 #[test]
-fn session_go_runs_launcher_when_no_hook_file_exists() {
-    // Regression: cmd_go's `set -e` + the old `declare -F fn && fn ...`
-    // form in call_hook propagated the missing-function non-zero status,
-    // aborting cmd_go BEFORE `(cd … && exec)`. From the user's terminal
-    // it looked like "claude exited immediately"; really, the launcher
-    // never ran. Pools without a .wt-hooks.sh (like meow-tower) hit this
-    // on every `wt go`. This test pins that the launcher subshell IS
-    // reached even when no hook functions are defined.
-    let key = pool_key();
-    let _c = Cleanup(key.clone());
-    let tmp = tempfile::TempDir::new().unwrap();
-    let bare = make_fixture(tmp.path());
-    init_pool(&key, &bare);
-
-    // No .wt-hooks.sh exists in the bare source; SHELL=/usr/bin/true makes
-    // the launch a no-op so we test the control flow, not real claude. The
-    // diagnostic from session_go_warns_when_launcher_exits_immediately is
-    // the proof the launcher ran (it only fires AFTER the subshell returns).
-    let out = session_cmd(&key, &["go", "no-hooks"]).output().unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stderr.contains("misfired"),
-        "launcher subshell should have been reached; got stdout={stdout}\nstderr={stderr}",
-    );
-}
-
-#[test]
-fn session_go_warns_when_launcher_exits_immediately() {
-    // session_cmd sets SHELL=/usr/bin/true → the inner launcher exits in 0s,
-    // which is exactly the user-observed failure mode (claude misfires for
-    // some env/auth reason and the EXIT trap auto-recycles silently). On a
-    // FRESH acquire, that should print a diagnostic so the operator knows
-    // the launcher didn't actually run — distinguishable from a real session
-    // the operator quit.
+fn session_go_warns_on_fast_launcher_exit() {
+    // Pins two regressions in one shot — both produce the same observable
+    // "banner → silent recycle" trace, distinguished only by whether the
+    // launcher ran:
+    //
+    //   1. call_hook with `declare -F fn && fn …` propagated the missing-
+    //      function non-zero status through cmd_go's `set -e`, aborting
+    //      BEFORE the launcher subshell. Pools without a .wt-hooks.sh hit
+    //      this every time. The misfire warning fires AFTER the subshell
+    //      returns — its presence proves the subshell was reached.
+    //   2. A misfired real launcher (auth/env/PATH) exits in 0s and the
+    //      EXIT trap recycles silently. The warning gives the operator a
+    //      breadcrumb instead of a blank "🟢 recycled cleanly".
+    //
+    // session_cmd sets SHELL=/usr/bin/true; the bare fixture has no hooks.
     let key = pool_key();
     let _c = Cleanup(key.clone());
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1042,7 +1022,7 @@ fn session_go_warns_when_launcher_exits_immediately() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stderr.contains("misfired"),
-        "expected fast-exit diagnostic on stderr; stdout={stdout}\nstderr={stderr}",
+        "expected fast-exit diagnostic; stdout={stdout}\nstderr={stderr}",
     );
 }
 

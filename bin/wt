@@ -36,6 +36,10 @@
 
 set -uo pipefail   # set -e is per-subcommand (cleanup must always exit 0).
 
+# Fresh-acquire launches that return in <N seconds are suspect — claude/ai
+# couldn't have started a real session. We warn before the EXIT trap recycles.
+readonly LAUNCH_MISFIRE_SECS=3
+
 # ---------- helpers ----------
 
 die() { echo "${0##*/}: $*" >&2; exit 1; }
@@ -147,29 +151,44 @@ Run from inside a pool's source repo or a slot, or pass --pool <key>."
   POOL_ROOT=$(pool_root_path "$POOL_KEY")
   [ -d "$POOL_ROOT" ] || die "pool '$POOL_KEY' not initialized at $POOL_ROOT — \
 run: worktree-pool --pool $POOL_KEY init --source <repo> --max-slots <n> ..."
-  POOL_SOURCE=$(pool_source_path "$POOL_KEY") || die "pool '$POOL_KEY' has no source: in config.yaml"
 }
 
-# Source <hooks-base>/.wt-hooks.sh if present. Defaults to $POOL_SOURCE.
+# Lazily resolve `source:` from pool config. Cached in POOL_SOURCE on first call
+# so verbs that don't need it (ls, info, path) skip the awk fork.
+pool_source() {
+  [ -n "${POOL_SOURCE:-}" ] && { printf '%s' "$POOL_SOURCE"; return 0; }
+  POOL_SOURCE=$(pool_source_path "$POOL_KEY") || die "pool '$POOL_KEY' has no source: in config.yaml"
+  printf '%s' "$POOL_SOURCE"
+}
+
+# Source <hooks-base>/.wt-hooks.sh if present. Defaults to the pool source repo.
 source_hooks() {
-  local hooks_file="${1:-$POOL_SOURCE}/.wt-hooks.sh"
+  local base="${1:-$(pool_source)}"
+  local hooks_file="$base/.wt-hooks.sh"
   if [ -f "$hooks_file" ]; then
     # shellcheck source=/dev/null
     source "$hooks_file"
   fi
 }
 
-# Call hook function $1 if defined, passing remaining args. No-op otherwise.
-# Always returns 0 when the hook is absent — under cmd_go's `set -e`, a bare
-# `declare -F … && fn` would abort the script when the hook isn't defined
-# (the && short-circuit propagates declare's non-zero status as the function's
-# exit code). When the hook IS defined, its exit status propagates so set -e
-# can still abort on a real hook failure.
+# Call hook function $1 if defined, passing remaining args. Returns 0 when
+# absent so callers under `set -e` aren't aborted by the missing-fn case
+# (a bare `declare -F … && fn` would propagate declare's non-zero return).
 call_hook() {
   local fn="$1"; shift
   if declare -F "$fn" >/dev/null 2>&1; then
     "$fn" "$@"
   fi
+}
+
+# Common prelude for hook fire points: export the WT_* env contract, source
+# the hooks file, then invoke the named hook. $name and $path come from the
+# enclosing function's locals (bash dynamic scoping).
+fire_hook() {
+  local hook_name="$1" fresh="$2"
+  export WT_KEY="$POOL_KEY" WT_NAME="$name" WT_PATH="$path" WT_FRESH="$fresh"
+  source_hooks
+  call_hook "$hook_name"
 }
 
 # ---------- subcommands ----------
@@ -259,22 +278,18 @@ Recover with: rm -rf $(printf '%q' "$path"), then re-run."
     fi
   fi
 
-  # Hook contract: WT_KEY/WT_NAME/WT_PATH/WT_FRESH (1=fresh, 0=resume) exported
-  # for every hook function.
-  export WT_KEY="$POOL_KEY" WT_NAME="$name" WT_PATH="$path"
-  export WT_FRESH=$([ "$existing" = 0 ] && echo 1 || echo 0)
-
   # EXIT trap. Always invokes `wt cleanup`; project-specific extras are layered
   # via wt_pre_cleanup / wt_post_cleanup hooks instead of replacing the trap.
   # $WT_* expands at trap-fire time so the trap sees the right slot.
+  export WT_KEY="$POOL_KEY" WT_NAME="$name"
   trap "'$0' --pool \"\$WT_KEY\" cleanup \"\$WT_NAME\"" EXIT
 
   printf '\n──── session: %s/%s @ %s ────\n\n' "$POOL_KEY" "$name" "$path"
 
-  # Pre-launch hook: deps install, dev-server start, project banner, etc.
-  # Aborts launch on non-zero (set -e). Hook reads $WT_* from env.
-  source_hooks
-  call_hook wt_pre_go
+  # Pre-launch hook (deps install, dev-server start, etc). Non-zero exit aborts
+  # launch under set -e and triggers the EXIT trap.
+  local fresh; fresh=$([ "$existing" = 0 ] && echo 1 || echo 0)
+  fire_hook wt_pre_go "$fresh"
 
   # `-n <name>` sets claude's session display name (prompt box, /resume picker,
   # terminal title). Assumes the launcher accepts it — true for `claude` and
@@ -284,20 +299,16 @@ Recover with: rm -rf $(printf '%q' "$path"), then re-run."
   printf -v cmd '%s -n %q' "$launcher" "$name"
   [ "$existing" = 1 ] && cmd="$cmd --continue"
 
-  # Time the inner shell so we can flag suspiciously short sessions: if the
-  # launcher dies in <3s on a FRESH acquire (no real work could've happened),
-  # the trap is about to recycle the slot and the operator would otherwise
-  # see only "🟢 recycled cleanly" — no clue the launcher misfired (auth, env,
-  # missing TTY, missing $WT_LAUNCHER on PATH). `set +e` for the subshell so a
-  # non-zero exit doesn't trip cmd_go's `set -e` before we print the warning.
+  # `set +e` for the subshell so a non-zero exit doesn't trip cmd_go's `set -e`
+  # before we can print the misfire warning below.
   local launch_start launch_dur
-  launch_start=$(date +%s)
+  launch_start=${EPOCHSECONDS:-$(date +%s)}
   set +e
   (cd "$path" && exec "${SHELL:-zsh}" -ic "$cmd")
   set -e
-  launch_dur=$(( $(date +%s) - launch_start ))
+  launch_dur=$(( ${EPOCHSECONDS:-$(date +%s)} - launch_start ))
 
-  if [ "$launch_dur" -lt 3 ] && [ "$existing" = 0 ]; then
+  if [ "$launch_dur" -lt "$LAUNCH_MISFIRE_SECS" ] && [ "$existing" = 0 ]; then
     local Y='' X=''
     [ -t 2 ] && { Y=$'\e[33m'; X=$'\e[0m'; }
     printf '%s⚠ launcher (%s) exited after %ss — likely misfired (auth, env, missing TTY, or %s not on PATH).\n  Slot will be auto-recycled by the EXIT trap. Re-run after fixing, or use `%s rm --force %s` if you need a clean retry.%s\n' \
@@ -428,10 +439,8 @@ cmd_cleanup() {
   fi
 
   # Pre-cleanup hook (e.g. dev-server stop). Best-effort — failure here
-  # shouldn't block the classifier from running. Hooks see slot context.
-  export WT_KEY="$POOL_KEY" WT_NAME="$name" WT_PATH="$path" WT_FRESH=0
-  source_hooks
-  call_hook wt_pre_cleanup || true
+  # shouldn't block the classifier from running.
+  fire_hook wt_pre_cleanup 0 || true
 
   local marker
   marker=$(in_progress_marker "$path")
@@ -460,9 +469,8 @@ cmd_cleanup() {
     exit 0
   fi
 
-  # Honest reporting: only print 🟢 if the underlying release actually
-  # succeeded. The previous `|| true` masked release failures, so a broken
-  # slot would print 🟢 and persist on disk.
+  # Only print 🟢 if release actually succeeded — silencing rm's exit code
+  # would lie about a still-broken slot.
   if "$0" --pool "$POOL_KEY" rm "$name"; then
     printf '%s🟢 recycled cleanly: %s/%s%s\n' "$G" "$POOL_KEY" "$name" "$X"
     call_hook wt_post_cleanup || true
@@ -516,12 +524,10 @@ cmd_rm() {
   fi
 
   # Pre-rm hook (e.g. dev-server stop). Best-effort.
-  export WT_KEY="$POOL_KEY" WT_NAME="$name" WT_PATH="$path" WT_FRESH=0
-  source_hooks
-  call_hook wt_pre_rm || true
+  fire_hook wt_pre_rm 0 || true
 
   # Remote branch delete is delegated to release.rs's silent push_delete
-  # (best-effort). See release.rs:66.
+  # (best-effort).
   worktree-pool --pool "$POOL_KEY" release --name "$name"
 }
 
