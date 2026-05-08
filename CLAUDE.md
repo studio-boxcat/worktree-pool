@@ -142,7 +142,10 @@ Per-host `init` runs once per pool key. Source path differs by host (build serve
 
 ### Crash recovery
 
-Writing the lock BEFORE the rename means a crash leaves the slot held at canonical `{group}-N` (clean recovery state). A crash between rename and lock-write would leave a renamed slot with no lock — operator clears via `git -C <source> worktree remove --force <slot>` and re-acquires.
+Writing the lock BEFORE the rename means a crash leaves the slot held at canonical `{group}-N` (clean recovery state). Two residual failure modes need operator action:
+
+- **Renamed but no lock** (crash between rename and lock-write — git state intact, lock missing): `git -C <source> worktree remove --force <slot>` then re-acquire.
+- **Ghost dir** (`.git` gitlink missing or dangling — typically from a half-completed `worktree remove` whose working-tree rm couldn't finish, e.g. an IDE holding a file open): no git state to release through. `worktree-pool-session go/cleanup/rm` all detect this and refuse with `🔴 BROKEN` (see [§Cleanup classifier](#worktree-pool-session-dev-session-helper)). Recover with `rm -rf <slot-path>`.
 
 ### Init mutex liveness
 
@@ -243,7 +246,7 @@ worktree-pool-session orient                        # print current repo path + 
 
 Hooks see `$WT_KEY`, `$WT_NAME`, `$WT_PATH`, `$WT_FRESH` (1=fresh acquire, 0=resume) in env. **Quoting:** `CLEANUP_CMD` is a string passed to `trap`, so its `$WT_*` references must defer expansion to fire-time — escape (`\$WT_NAME`) or single-quote the assignment (`CLEANUP_CMD='just wt-cleanup "$WT_NAME"'`). Naked `"$WT_NAME"` expands at export-time (likely empty in the caller's env) and silently misroutes the trap. `PRE_HOOK` is `eval`d once at fire-time, so quoting is just normal shell.
 
-`rm` is the manual one-shot with the same safety checks (refuse on dirty / unmerged); used directly when the session is gone but state persists. Pass `--force` (`-f`) to discard dirty tracked changes and/or unmerged commits — applies the work-loss waiver but still refuses 🔴 BROKEN slots (no git state to release through; recover those via `rm -rf`).
+`rm` is the manual one-shot with the same safety checks (refuse on dirty / unmerged); used directly when the session is gone but state persists. Pass `--force` (`-f`) to discard dirty tracked changes and/or unmerged commits — applies the work-loss waiver but still refuses 🔴 BROKEN slots (no git state to release through; recover those via `rm -rf`). `--force` is intentionally an `rm`-only knob, not a `cleanup` flag: `cleanup` is the auto-invoked exit-trap classifier whose entire purpose is preserving uncommitted work on shell exit, so a force-recycle there would defeat the trap. Operators discarding work always do so explicitly via `rm --force`.
 
 `path` is the predicate query — prints `~/.worktree-pool/<key>/<name>` on stdout (always, when key + pool are valid) and exits 0 if the slot exists, 1 if it doesn't, 2 on usage / pool-not-initialized. Lets consumer recipes branch on resume vs. fresh acquire (`if path … >/dev/null; then …`) without re-stitching the pool-root path themselves. Pattern matches `git rev-parse --git-dir`, `brew --prefix`, `pyenv prefix`.
 
