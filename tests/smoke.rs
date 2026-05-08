@@ -1079,3 +1079,124 @@ fn session_rm_refuses_broken_slot() {
     assert!(path.exists());
 }
 
+/// Acquire a slot and dirty its working tree (tracked + untracked changes).
+/// Returns the slot path.
+fn acquire_then_dirty(key: &str, name: &str) -> PathBuf {
+    let out = acquire_dev(key, name);
+    assert!(out.status.success(), "acquire failed: {}", String::from_utf8_lossy(&out.stderr));
+    let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    std::fs::write(path.join("README"), b"dirty tracked\n").unwrap();
+    std::fs::write(path.join("untracked.txt"), b"new\n").unwrap();
+    path
+}
+
+#[test]
+fn session_rm_refuses_dirty_without_force() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let path = acquire_then_dirty(&key, "messy");
+
+    let out = session_cmd(&["rm", &key, "messy"]).output().unwrap();
+    assert!(!out.status.success(),
+        "rm should refuse dirty slot without --force.\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("dirty"), "stderr should mention dirty: {stderr}");
+    assert!(path.exists());
+}
+
+#[test]
+fn session_rm_force_discards_dirty() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let path = acquire_then_dirty(&key, "messy");
+
+    let out = session_cmd(&["rm", &key, "messy", "--force"]).output().unwrap();
+    assert!(out.status.success(),
+        "rm --force should succeed on dirty slot.\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    // The slot is un-renamed back to canonical id (ios-N) — operator namespace cleared.
+    assert!(!path.exists(), "operator-named slot dir should be gone after rm --force");
+}
+
+#[test]
+fn session_rm_force_discards_unmerged_branch() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let out = acquire_dev(&key, "ahead");
+    assert!(out.status.success());
+    let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+
+    // Create a commit on the slot's branch — not in main.
+    run_git(&path, &["config", "user.email", "t@t"]);
+    run_git(&path, &["config", "user.name", "t"]);
+    std::fs::write(path.join("CHANGE"), b"new\n").unwrap();
+    run_git(&path, &["add", "CHANGE"]);
+    run_git(&path, &["commit", "--quiet", "-m", "ahead of main"]);
+
+    // Without --force: refuse.
+    let out = session_cmd(&["rm", &key, "ahead"]).output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not in main"), "got: {stderr}");
+
+    // With --force: succeed.
+    let out = session_cmd(&["rm", &key, "ahead", "--force"]).output().unwrap();
+    assert!(out.status.success(),
+        "rm --force should discard unmerged commits.\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(!path.exists());
+}
+
+#[test]
+fn session_rm_force_accepted_before_positionals() {
+    // Pin the parser contract: `rm --force <key> <name>` works as well as
+    // `rm <key> <name> --force`. Operators reach for either order.
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let path = acquire_then_dirty(&key, "messy");
+    let out = session_cmd(&["rm", "--force", &key, "messy"]).output().unwrap();
+    assert!(out.status.success(),
+        "rm --force <key> <name> should succeed.\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(!path.exists());
+}
+
+#[test]
+fn session_rm_force_still_refuses_broken_slot() {
+    // --force means "discard work I know is junk" — it does NOT mean
+    // "rm -rf a path that can't be released through git". Broken slots
+    // need explicit `rm -rf` (no git state to release).
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let path = acquire_then_break(&key, "ghost", true);
+
+    let out = session_cmd(&["rm", &key, "ghost", "--force"]).output().unwrap();
+    assert!(!out.status.success(),
+        "rm --force must still refuse broken slot.\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("is broken (no valid .git"), "got: {stderr}");
+    assert!(path.exists());
+}
+

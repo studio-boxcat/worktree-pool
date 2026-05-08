@@ -225,7 +225,7 @@ worktree-pool-session path    <pool-key> <name>     # print slot path; exit 0 if
 worktree-pool-session go      <pool-key> <name> [--from <commit-ish>] [pool-acquire-flags...]
 worktree-pool-session sync    [message]             # commit + merge-back-to-main (local-only)
 worktree-pool-session cleanup <pool-key> <name>     # 🟢/🟡/🔴 exit-trap classifier
-worktree-pool-session rm      <pool-key> <name>     # safety-checked release
+worktree-pool-session rm      <pool-key> <name> [--force]   # safety-checked release; --force discards dirty/unmerged
 worktree-pool-session orient                        # print current repo path + CLAUDE.md
 ```
 
@@ -243,7 +243,7 @@ worktree-pool-session orient                        # print current repo path + 
 
 Hooks see `$WT_KEY`, `$WT_NAME`, `$WT_PATH`, `$WT_FRESH` (1=fresh acquire, 0=resume) in env. **Quoting:** `CLEANUP_CMD` is a string passed to `trap`, so its `$WT_*` references must defer expansion to fire-time — escape (`\$WT_NAME`) or single-quote the assignment (`CLEANUP_CMD='just wt-cleanup "$WT_NAME"'`). Naked `"$WT_NAME"` expands at export-time (likely empty in the caller's env) and silently misroutes the trap. `PRE_HOOK` is `eval`d once at fire-time, so quoting is just normal shell.
 
-`rm` is the manual one-shot with the same safety checks (refuse on dirty / unmerged); used directly when the session is gone but state persists.
+`rm` is the manual one-shot with the same safety checks (refuse on dirty / unmerged); used directly when the session is gone but state persists. Pass `--force` (`-f`) to discard dirty tracked changes and/or unmerged commits — applies the work-loss waiver but still refuses 🔴 BROKEN slots (no git state to release through; recover those via `rm -rf`).
 
 `path` is the predicate query — prints `~/.worktree-pool/<key>/<name>` on stdout (always, when key + pool are valid) and exits 0 if the slot exists, 1 if it doesn't, 2 on usage / pool-not-initialized. Lets consumer recipes branch on resume vs. fresh acquire (`if path … >/dev/null; then …`) without re-stitching the pool-root path themselves. Pattern matches `git rev-parse --git-dir`, `brew --prefix`, `pyenv prefix`.
 
@@ -290,8 +290,8 @@ Each consumer wraps the pool with thin recipes pre-filling the pool key. `worktr
 # Consumer's justfile, e.g. myapp
 wt-go name *flags:
     @worktree-pool-session go myapp {{quote(name)}} {{flags}}
-wt-rm name:
-    @worktree-pool-session rm myapp {{quote(name)}}
+wt-rm name *flags:
+    @worktree-pool-session rm myapp {{quote(name)}} {{flags}}
 wt-cleanup name:
     @worktree-pool-session cleanup myapp {{quote(name)}}
 wt-path name:

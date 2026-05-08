@@ -341,37 +341,48 @@ cmd_cleanup() {
 
 cmd_rm() {
   set -e
+  # Pre-parse `--force` / `-f` so it can appear before or after positionals.
+  # `--force` skips the work-preservation safety (dirty + unmerged); the
+  # ghost-dir guard remains because release physically can't run without git
+  # state — broken slots need explicit `rm -rf`, not --force.
+  local force=0 args=() arg
+  for arg in "$@"; do
+    case "$arg" in
+      --force|-f) force=1 ;;
+      *)          args+=("$arg") ;;
+    esac
+  done
+  set -- ${args[@]+"${args[@]}"}
+
   local key="${1:-}"; shift || true
   local name="${1:-}"; shift || true
-  require_arg key  "$key"  "session rm <pool-key> <name>"
-  require_arg name "$name" "session rm <pool-key> <name>"
+  require_arg key  "$key"  "session rm <pool-key> <name> [--force]"
+  require_arg name "$name" "session rm <pool-key> <name> [--force]"
 
   local POOL_ROOT path
   POOL_ROOT=$(pool_root "$key")
   path="$POOL_ROOT/$name"
   [ -d "$path" ] || die "no slot named '$name' in pool '$key' at $POOL_ROOT."
 
-  # Same ghost-dir guard as cmd_cleanup — without it, the silenced status/ahead
-  # checks below misread broken state as "clean", and we'd dive into a release
-  # that can't possibly succeed.
   if ! slot_repo_ok "$path"; then
     die "slot '$name' at $path is broken (no valid .git). Recover with: rm -rf $(printf '%q' "$path")"
   fi
 
-  local porcelain
-  porcelain=$(git -C "$path" status --porcelain 2>/dev/null || true)
-  if [ -n "$porcelain" ]; then
-    echo "${0##*/}: '$name' is dirty — refusing." >&2
-    printf '%s\n' "$porcelain" | sed 's/^/  /' >&2
-    exit 1
-  fi
-
-  local ahead
-  if ahead=$(ahead_count "$path" "$name"); then
-    if [ "$ahead" != "0" ]; then
-      echo "${0##*/}: '$name' has $ahead commit(s) not in main — refusing." >&2
-      echo "  git branch -D $name   # to discard" >&2
+  if [ "$force" = 0 ]; then
+    local porcelain
+    porcelain=$(git -C "$path" status --porcelain 2>/dev/null || true)
+    if [ -n "$porcelain" ]; then
+      echo "${0##*/}: '$name' is dirty — refusing. Pass --force to discard." >&2
+      printf '%s\n' "$porcelain" | sed 's/^/  /' >&2
       exit 1
+    fi
+
+    local ahead
+    if ahead=$(ahead_count "$path" "$name"); then
+      if [ "$ahead" != "0" ]; then
+        echo "${0##*/}: '$name' has $ahead commit(s) not in main — refusing. Pass --force to discard." >&2
+        exit 1
+      fi
     fi
   fi
 
