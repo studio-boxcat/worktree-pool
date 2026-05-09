@@ -679,18 +679,21 @@ cmd_orient() {
 }
 
 cmd_ls() {
-  # Show only held slots — operators (and agents) almost always want "what's
-  # active right now," not the idle pool capacity. Use `worktree-pool ls`
-  # directly for the full table.
+  # Show only held slots, drop STATE + NAME — operators (and agents) almost
+  # always want "what's active right now," not idle pool capacity; STATE is
+  # constant once filtered, and NAME == ID for held slots (the slot was
+  # renamed to NAME during acquire). Use `worktree-pool ls` for the full table.
   local out held
   out=$(worktree-pool --pool "$POOL_KEY" ls "$@")
   held=$(printf '%s\n' "$out" | awk 'NR>2 && $2=="held"')
-  if [ -n "$held" ]; then
+  if [ -z "$held" ]; then
+    echo "(no held slots)"
+    return 0
+  fi
+  {
     printf '%s\n' "$out" | awk 'NR<=2'
     printf '%s\n' "$held"
-  else
-    echo "(no held slots)"
-  fi
+  } | awk '{$2=""; $3=""; print}' | column -t
 }
 
 # Initialize a pool, inferring --source from cwd's git toplevel and --pool from
