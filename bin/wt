@@ -441,14 +441,28 @@ cmd_sync() {
       (
         new_sha=$(git -C "$slot_path/$sub" rev-parse HEAD)
         git -C "$main_path/$sub" fetch --quiet "$slot_path/$sub" "$branch"
-        # Attach to main when detached, so submodule's main ref tracks the
-        # gitlink instead of lagging behind. `git submodule update` leaves
-        # submodules detached, so this is the common case. Skip when on a
-        # branch (any) — don't silently switch operator-managed branch state.
-        if ! git -C "$main_path/$sub" symbolic-ref -q HEAD >/dev/null \
-            && git -C "$main_path/$sub" show-ref --verify --quiet refs/heads/main; then
-          git -C "$main_path/$sub" checkout --quiet main \
-            || die "sync: checkout main failed in $main_path/$sub (untracked collision?)"
+        # Attach to a branch when detached, so submodule's branch ref tracks
+        # the gitlink instead of lagging behind. `git submodule update` leaves
+        # submodules detached, so this is the common case. Priority:
+        #   1. `.gitmodules` `submodule.<path>.branch` (git's per-submodule
+        #      tracking convention; lookup assumes name == path, the default
+        #      from `git submodule add`).
+        #   2. `main` (sane fallback for repos that don't declare a branch).
+        # Skip when on a branch (any) — don't silently switch operator state.
+        if ! git -C "$main_path/$sub" symbolic-ref -q HEAD >/dev/null; then
+          local sub_branch attach_target=""
+          sub_branch=$(git -C "$slot_path" config -f .gitmodules \
+            --get "submodule.$sub.branch" 2>/dev/null || true)
+          if [ -n "$sub_branch" ] \
+              && git -C "$main_path/$sub" show-ref --verify --quiet "refs/heads/$sub_branch"; then
+            attach_target="$sub_branch"
+          elif git -C "$main_path/$sub" show-ref --verify --quiet refs/heads/main; then
+            attach_target="main"
+          fi
+          if [ -n "$attach_target" ]; then
+            git -C "$main_path/$sub" checkout --quiet "$attach_target" \
+              || die "sync: checkout $attach_target failed in $main_path/$sub (untracked collision?)"
+          fi
         fi
         git -c core.hooksPath=/dev/null -C "$main_path/$sub" \
           merge --ff-only --quiet "$new_sha"

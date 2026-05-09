@@ -1562,6 +1562,74 @@ fn session_sync_attaches_detached_submodule_to_main() {
 }
 
 #[test]
+fn session_sync_attaches_detached_submodule_to_gitmodules_branch() {
+    // `.gitmodules` branch hint takes priority over the `main` fallback. If
+    // the submodule has `branch = release` declared, attach to release on
+    // detached HEAD, not main.
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    make_fixture_with_submodule(tmp.path());
+    let source = tmp.path().join("staging");
+
+    // Set up a `release` branch in the submodule + declare it in .gitmodules.
+    let main_sub = source.join("sub");
+    let head_sha = StdCommand::new("git")
+        .args(["-C", &main_sub.display().to_string(), "rev-parse", "HEAD"])
+        .output().unwrap();
+    let sha = String::from_utf8_lossy(&head_sha.stdout).trim().to_string();
+    run_git(&main_sub, &["branch", "release", &sha]);
+    run_git(&source, &["config", "-f", ".gitmodules", "submodule.sub.branch", "release"]);
+    run_git(&source, &["config", "user.email", "t@t"]);
+    run_git(&source, &["config", "user.name", "t"]);
+    run_git(&source, &["add", ".gitmodules"]);
+    run_git(&source, &["commit", "--quiet", "-m", "track release branch for sub"]);
+    run_git(&source, &["push", "--quiet", "origin", "main"]);
+    // Detach source/sub at gitlink SHA (post-`submodule update` state).
+    run_git(&main_sub, &["checkout", "--quiet", "--detach", &sha]);
+
+    let out = Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", &key, "init", "--source"])
+        .arg(&source)
+        .args(["--max-slots", "4", "--groups", "ios,android"])
+        .output().unwrap();
+    assert!(out.status.success(), "init: {}", String::from_utf8_lossy(&out.stderr));
+
+    let out = Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", &key, "acquire", "--name", "feat", "--group", "ios"])
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .output().unwrap();
+    assert!(out.status.success(), "acquire: {}", String::from_utf8_lossy(&out.stderr));
+    let slot_path = pool_root(&key).join("feat");
+    let slot_sub = slot_path.join("sub");
+
+    run_git(&slot_sub, &["config", "user.email", "t@t"]);
+    run_git(&slot_sub, &["config", "user.name", "t"]);
+    std::fs::write(slot_sub.join("X"), b"x\n").unwrap();
+    run_git(&slot_sub, &["add", "X"]);
+    run_git(&slot_sub, &["commit", "--quiet", "-m", "x"]);
+    run_git(&slot_path, &["config", "user.email", "t@t"]);
+    run_git(&slot_path, &["config", "user.name", "t"]);
+    run_git(&slot_path, &["add", "sub"]);
+    run_git(&slot_path, &["commit", "--quiet", "-m", "bump sub"]);
+
+    let out = session_cmd_cwd(&slot_path, &["sync"]).output().unwrap();
+    assert!(out.status.success(),
+        "sync: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+
+    let head_ref = StdCommand::new("git")
+        .args(["-C", &main_sub.display().to_string(), "symbolic-ref", "HEAD"])
+        .output().unwrap();
+    assert!(head_ref.status.success(), "main_sub HEAD detached after sync");
+    assert_eq!(String::from_utf8_lossy(&head_ref.stdout).trim(),
+               "refs/heads/release",
+               "expected attach to release per .gitmodules, not main");
+}
+
+#[test]
 fn session_sync_propagates_submodule_to_main() {
     // Pin against `702d3ba`-era dead `[ -d $sub/.git ]` check: submodule
     // `.git` is a gitlink *file*, not a directory, so the loop body was
