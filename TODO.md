@@ -32,6 +32,11 @@ Surfaced by efficiency-review agents during the v0.1.1 profile pass. Rust paths 
 - **Precheck refuses on any submodule-internal `M` status.** `git -C <main_path> status --porcelain | awk '!/^\?\?/'` shows ` M sub` whenever a submodule has untracked / dirty content (default git config), blocking sync even when the submodule has no commit work to merge. Operators silence per-submodule via `git config submodule.<name>.ignore untracked` (the test does this), but a friendlier default would be `git status --ignore-submodules=untracked` in the precheck — matches what the ff-only safety net already protects against.
 - **Sync output interleaves under parallel submodule propagation.** Acceptable for now; revisit if operators complain. Could buffer stdout per subshell into `mktemp` and concatenate after `wait`.
 
+## Test scaffolding
+
+- **`acquire_dev` doesn't accept `GIT_ALLOW_PROTOCOL=file`** — every submodule-using test (~6 sites: smoke.rs:666, 714, 754 + the two new sync tests) bypasses it with an open-coded `Command::cargo_bin(...).args(...).env("GIT_ALLOW_PROTOCOL", "file").output()`. Add an `acquire_dev_sub(key, name)` variant or thread an optional env via builder; cuts ~6 lines per call site.
+- **Repeated `git config user.email/user.name`** — every test that commits against a fresh fixture sets these by hand (4× in this commit alone). A `git_commit(dir, msg)` helper that sets `GIT_AUTHOR_*` / `GIT_COMMITTER_*` env once would deduplicate widely.
+
 ## Surfaced by multi-agent audit (2026-05)
 
 Reviewers ran over the perf changes (`a504730`..`c17a34b`). Real bugs fixed inline (`5af9237`, `<this-commit>`); these are remaining deferred follow-ups.
