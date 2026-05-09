@@ -346,8 +346,9 @@ cmd_sync() {
   main_path=$(find_main_path)
   [ -n "$main_path" ] || die "sync: main is not checked out in any worktree"
 
-  # `git reset --hard HEAD` only touches tracked files, so untracked content
-  # in main survives the post-merge refresh; ignore `??` here.
+  # `merge --ff-only` refuses if untracked files would be overwritten, so
+  # untracked content in main is preserved; ignore `??` here when checking
+  # for tracked-uncommitted state.
   local main_dirty
   main_dirty=$(git -C "$main_path" status --porcelain | awk '!/^\?\?/')
   if [ -n "$main_dirty" ]; then
@@ -387,30 +388,37 @@ cmd_sync() {
     exit 1
   fi
 
-  # Advance main + refresh main worktree. A parallel slot's sync could have
-  # advanced main during a long conflict resolution; refuse rather than
-  # clobber. The atomic update-ref's <expected_main> is the second guard —
-  # if main moved between this check and the update, update-ref refuses.
+  # Refuse if a parallel slot's sync advanced main past our merge base during
+  # conflict resolution — `merge --ff-only` below would also catch this, but
+  # this gives the operator a precise message.
   if ! git merge-base --is-ancestor main HEAD; then
     echo "sync: main has moved past your merge base (parallel slot synced first)." >&2
     echo "  Re-merge with 'git merge main', resolve, commit, then re-run." >&2
     exit 1
   fi
 
-  local expected_main
-  expected_main=$(git rev-parse main)
+  local slot_head
+  slot_head=$(git rev-parse HEAD)
   # Skip the no-op so re-runs are idempotent (e.g. after manual conflict resolution).
-  if [ "$expected_main" != "$(git rev-parse HEAD)" ]; then
-    git update-ref -m "sync from $branch" refs/heads/main HEAD "$expected_main"
-    git -C "$main_path" reset --hard HEAD >/dev/null
+  if [ "$main_before" != "$slot_head" ]; then
+    # `merge --ff-only` advances whatever HEAD points to, not refs/heads/main
+    # by name — so anchor on the symref before letting it run.
+    local main_ref
+    main_ref=$(git -C "$main_path" symbolic-ref HEAD 2>/dev/null || true)
+    [ "$main_ref" = "refs/heads/main" ] \
+      || die "sync: $main_path has $main_ref checked out, expected refs/heads/main"
+    # core.hooksPath=/dev/null: don't fire user repos' post-merge —
+    # wt_post_sync is the documented hook surface.
+    git -c core.hooksPath=/dev/null -C "$main_path" merge --ff-only --quiet "$slot_head" \
+      || die "sync: fast-forwarding main in $main_path failed (untracked collision, or parallel sync)"
   fi
   local main_after
   main_after=$(git rev-parse main)
 
   # Propagate submodule commits into the main worktree's submodule clones.
-  # Each parent worktree (slot + main) has its own submodule gitdir, so advancing
-  # `main` and resetting the main worktree just moves the gitlinks — main's
-  # submodule clones still have the old SHA and stale workdir contents.
+  # Each parent worktree (slot + main) has its own submodule gitdir, so the
+  # parent ff-merge above just moves the gitlinks — main's submodule clones
+  # still have the old SHA and stale workdir contents.
   # `acquire` branched each submodule as `<slot-name>` (matches parent), so we
   # can fetch by branch name from the slot's submodule into main's, then
   # hard-reset main's submodule HEAD to the gitlink-expected SHA. Top-level

@@ -1306,3 +1306,152 @@ fn session_rm_force_still_refuses_broken_slot() {
     assert!(path.exists());
 }
 
+/// Build a `bash <wt> <verb-args>` command rooted at `cwd`, used for verbs that
+/// auto-resolve the pool key from cwd (e.g. `wt sync`, which takes no `--pool`).
+fn session_cmd_cwd(cwd: &Path, args: &[&str]) -> StdCommand {
+    let bin_path = PathBuf::from(env!("CARGO_BIN_EXE_worktree-pool"));
+    let bin_dir = bin_path.parent().unwrap();
+    let prev_path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", bin_dir.display(), prev_path);
+    let mut cmd = StdCommand::new("bash");
+    cmd.arg(session_script())
+        .args(args)
+        .current_dir(cwd)
+        .env("PATH", new_path)
+        .env("SHELL", "/usr/bin/true");
+    cmd
+}
+
+#[test]
+fn session_sync_preserves_untracked_in_main_on_collision() {
+    // Regression: `reset --hard` silently clobbered untracked main scratch
+    // at colliding paths; `merge --ff-only` refuses instead.
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    // `wt sync` requires main to be checked out as a worktree of source. The
+    // bare fixture has none by default, so wire one alongside.
+    let main_path = tmp.path().join("main-wt");
+    run_git_root(&[
+        "-C", &bare.display().to_string(),
+        "worktree", "add", "--quiet",
+        &main_path.display().to_string(), "main",
+    ]);
+
+    let out = acquire_dev(&key, "feat");
+    assert!(out.status.success(), "acquire: {}", String::from_utf8_lossy(&out.stderr));
+    let slot_path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+
+    // Slot adds tracked COLLIDE.
+    run_git(&slot_path, &["config", "user.email", "t@t"]);
+    run_git(&slot_path, &["config", "user.name", "t"]);
+    std::fs::write(slot_path.join("COLLIDE"), b"slot version\n").unwrap();
+    run_git(&slot_path, &["add", "COLLIDE"]);
+    run_git(&slot_path, &["commit", "--quiet", "-m", "add collide"]);
+
+    // Operator scratches at the same path in main worktree (untracked).
+    let scratch = b"operator scratch -- must not be lost\n";
+    std::fs::write(main_path.join("COLLIDE"), scratch).unwrap();
+
+    let out = session_cmd_cwd(&slot_path, &["sync"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Sync must refuse loudly (not silently advance main + clobber).
+    assert!(!out.status.success(),
+        "sync should refuse on untracked-file collision in main; \
+         stdout={stdout}\nstderr={stderr}");
+
+    // Untracked file is the load-bearing assertion: refusal w/o preservation
+    // would still be a regression.
+    let preserved = std::fs::read(main_path.join("COLLIDE"))
+        .expect("untracked file deleted by sync");
+    assert_eq!(preserved, scratch,
+        "untracked file in main was overwritten; stdout={stdout}\nstderr={stderr}");
+}
+
+#[test]
+fn session_sync_advances_main_on_clean_path() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let main_path = tmp.path().join("main-wt");
+    run_git_root(&[
+        "-C", &bare.display().to_string(),
+        "worktree", "add", "--quiet",
+        &main_path.display().to_string(), "main",
+    ]);
+
+    let out = acquire_dev(&key, "feat");
+    assert!(out.status.success());
+    let slot_path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+
+    run_git(&slot_path, &["config", "user.email", "t@t"]);
+    run_git(&slot_path, &["config", "user.name", "t"]);
+    std::fs::write(slot_path.join("NEW"), b"slot-added\n").unwrap();
+    run_git(&slot_path, &["add", "NEW"]);
+    run_git(&slot_path, &["commit", "--quiet", "-m", "add new"]);
+
+    let out = session_cmd_cwd(&slot_path, &["sync"]).output().unwrap();
+    assert!(out.status.success(),
+        "sync should succeed; stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+
+    // Tree-landed in main implies ref advanced (ff-only is atomic).
+    let landed = std::fs::read(main_path.join("NEW")).expect("NEW missing in main");
+    assert_eq!(landed, b"slot-added\n");
+}
+
+#[test]
+fn session_sync_refuses_when_main_worktree_on_other_branch() {
+    // Operator detour: if main_path has a different branch checked out, sync
+    // must refuse — `merge --ff-only` would otherwise advance the wrong branch.
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let main_path = tmp.path().join("main-wt");
+    run_git_root(&[
+        "-C", &bare.display().to_string(),
+        "worktree", "add", "--quiet",
+        &main_path.display().to_string(), "main",
+    ]);
+    // Operator detour: check out a different branch in the main worktree.
+    run_git(&main_path, &["checkout", "--quiet", "-b", "operator-side"]);
+
+    let out = acquire_dev(&key, "feat");
+    assert!(out.status.success());
+    let slot_path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    run_git(&slot_path, &["config", "user.email", "t@t"]);
+    run_git(&slot_path, &["config", "user.name", "t"]);
+    std::fs::write(slot_path.join("X"), b"x\n").unwrap();
+    run_git(&slot_path, &["add", "X"]);
+    run_git(&slot_path, &["commit", "--quiet", "-m", "x"]);
+
+    // `find_main_path` parses `worktree list --porcelain` for `branch refs/heads/main`;
+    // after the operator's checkout, that line is gone, so sync errors with
+    // "main is not checked out in any worktree". Either that or the symref
+    // guard would catch it — load-bearing assertion is the operator branch
+    // didn't move.
+    let main_before = StdCommand::new("git")
+        .args(["-C", &main_path.display().to_string(), "rev-parse", "operator-side"])
+        .output().unwrap();
+    let out = session_cmd_cwd(&slot_path, &["sync"]).output().unwrap();
+    assert!(!out.status.success(),
+        "sync must refuse; stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let main_after = StdCommand::new("git")
+        .args(["-C", &main_path.display().to_string(), "rev-parse", "operator-side"])
+        .output().unwrap();
+    assert_eq!(main_before.stdout, main_after.stdout,
+        "operator-side branch must not move");
+}
+

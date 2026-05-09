@@ -22,6 +22,10 @@ Surfaced by efficiency-review agents during the v0.1.1 profile pass. Rust paths 
 - **`worktree-pool doctor` could check pool initialization** — currently host-level checks only (arch, git, `$WORKTREE_ROOT` dir presence, quarantine xattr). Could enumerate registered pools (subdirs of `$WORKTREE_ROOT/` with a `.meta/config.yaml`) and validate each (config schema, source path exists, etc.).
 - **Bench fixture is too small** — `scripts/bench-fixture.sh` makes a bare repo with one commit, no submodules. Real cold-acquire cost (the dominant wall time) isn't measured. A heavier fixture with a few mock submodules would expose the parallel-submodule-recursion win when implemented.
 
+## Lint
+
+- **`clippy::type-complexity` in `src/submodules.rs:51`** — pre-existing; `HashMap<String, (Option<String>, Option<String>, Vec<String>)>` triggers `-D warnings`. Hoist into a `type ByName = ...` alias or restructure into a struct.
+
 ## Surfaced by multi-agent audit (2026-05)
 
 Reviewers ran over the perf changes (`a504730`..`c17a34b`). Real bugs fixed inline (`5af9237`, `<this-commit>`); these are remaining deferred follow-ups.
