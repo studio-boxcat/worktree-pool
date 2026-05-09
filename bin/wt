@@ -12,6 +12,7 @@
 #   wt [--pool <key>] ls      [--git-status]
 #   wt [--pool <key>] info    <name>
 #   wt sync   [message]                  # commit + merge-back-to-main
+#   wt whoami                            # cwd context: slot|source|none + path
 #   wt orient                            # print current repo path + CLAUDE.md
 #
 # `init` infers --source from `git rev-parse --show-toplevel` and --pool from
@@ -620,6 +621,51 @@ cmd_rm() {
   worktree-pool --pool "$POOL_KEY" release --name "$name"
 }
 
+# Print the cwd context for an AI-agent bootstrap. One of:
+#   slot    ~/.worktree-pool/<key>/<name>      — cwd is inside a pool slot
+#   source  ~/Develop/<key>                    — cwd is inside a registered pool's source repo
+#   none                                       — neither (no pool root, not in any registered repo)
+# Path uses `~` for $HOME. Always exits 0.
+cmd_whoami() {
+  local cwd_real
+  cwd_real=$(pwd -P)
+
+  # Slot: cwd is somewhere under $WORKTREE_ROOT/<key>/<name>/.
+  if inside_dir "$WORKTREE_ROOT"; then
+    local pool_root_real rel key rest name
+    pool_root_real=$(cd "$WORKTREE_ROOT" && pwd -P)
+    rel="${cwd_real#"$pool_root_real"/}"
+    key="${rel%%/*}"
+    rest="${rel#*/}"
+    name="${rest%%/*}"
+    # Bare cwd == pool root (no key) or cwd at $WORKTREE_ROOT/<key> with no slot
+    # below: not a slot context. Fall through to none.
+    if [ -n "$key" ] && [ "$rel" != "$key" ] && [ -n "$name" ]; then
+      printf 'slot\t%s\n' "$WORKTREE_ROOT/$key/$name" | sed "s|$HOME|~|"
+      return 0
+    fi
+  fi
+
+  # Source: git toplevel matches some pool's `source:`.
+  local toplevel
+  toplevel=$(git rev-parse --show-toplevel 2>/dev/null) || { echo none; return 0; }
+  toplevel=$(cd "$toplevel" && pwd -P)
+
+  local cfg key src
+  for cfg in "$WORKTREE_ROOT"/*/.meta/config.yaml; do
+    [ -f "$cfg" ] || continue
+    key=$(basename "$(dirname "$(dirname "$cfg")")")
+    src=$(pool_source_path "$key") || continue
+    src=$(cd "$src" 2>/dev/null && pwd -P) || continue
+    if [ "$src" = "$toplevel" ]; then
+      printf 'source\t%s\n' "$toplevel" | sed "s|$HOME|~|"
+      return 0
+    fi
+  done
+
+  echo none
+}
+
 # Print the current repo's toplevel path and CLAUDE.md to stdout. Intended for
 # AI-agent session bootstrap.
 cmd_orient() {
@@ -685,7 +731,8 @@ case "$verb" in
   cleanup) require_pool; cmd_cleanup "$@" ;;
   rm)      require_pool; cmd_rm      "$@" ;;
   orient)  cmd_orient  "$@" ;;
+  whoami)  cmd_whoami  "$@" ;;
   ls)      require_pool; cmd_ls      "$@" ;;
   info)    require_pool; cmd_info    "$@" ;;
-  *)       die "usage: ${0##*/} [--pool <key>] {init|path|go|cleanup|rm|ls|info} ... | sync [message] | orient" ;;
+  *)       die "usage: ${0##*/} [--pool <key>] {init|path|go|cleanup|rm|ls|info} ... | sync [message] | whoami | orient" ;;
 esac
