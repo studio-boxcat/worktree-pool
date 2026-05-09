@@ -1442,6 +1442,114 @@ fn session_sync_is_idempotent_on_rerun() {
 }
 
 #[test]
+fn session_sync_preserves_untracked_in_submodule_on_collision() {
+    // Same untracked-clobber bug as the parent-level fix, but at the submodule
+    // propagation step (`reset --hard <new_sha>` in main's submodule clone).
+    // Critical for projects with many actively-edited submodules (e.g. Unity
+    // Packages).
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    // Real-world setup: source is a non-bare working clone where main IS the
+    // source's primary checkout (slots' per-worktree modules live separately).
+    // A bare-with-extra-worktree fixture would share `<bare>/modules/sub` with
+    // the slot, contaminating the test.
+    make_fixture_with_submodule(tmp.path()); // builds <tmp>/source.git + <tmp>/staging
+    let source = tmp.path().join("staging");
+    // Real-world projects with active submodule editing typically silence the
+    // "M sub" noise from untracked content inside submodules — without this,
+    // sync's precheck refuses before reaching the propagation block.
+    run_git(&source, &["config", "submodule.sub.ignore", "untracked"]);
+    init_pool(&key, &source);
+
+    let out = Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", &key, "acquire", "--name", "feat", "--group", "ios"])
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .output().unwrap();
+    assert!(out.status.success(), "acquire: {}", String::from_utf8_lossy(&out.stderr));
+    let slot_path = pool_root(&key).join("feat");
+    let slot_sub = slot_path.join("sub");
+
+    // Slot adds tracked COLLIDE in submodule, commits, advances parent gitlink.
+    run_git(&slot_sub, &["config", "user.email", "t@t"]);
+    run_git(&slot_sub, &["config", "user.name", "t"]);
+    std::fs::write(slot_sub.join("COLLIDE"), b"slot version\n").unwrap();
+    run_git(&slot_sub, &["add", "COLLIDE"]);
+    run_git(&slot_sub, &["commit", "--quiet", "-m", "add collide in sub"]);
+    run_git(&slot_path, &["config", "user.email", "t@t"]);
+    run_git(&slot_path, &["config", "user.name", "t"]);
+    run_git(&slot_path, &["add", "sub"]);
+    run_git(&slot_path, &["commit", "--quiet", "-m", "bump sub"]);
+
+    // Operator scratches at COLLIDE in main's submodule clone (untracked).
+    let main_sub = source.join("sub");
+    let scratch = b"operator scratch in submodule -- must not be lost\n";
+    std::fs::write(main_sub.join("COLLIDE"), scratch).unwrap();
+
+    let out = session_cmd_cwd(&slot_path, &["sync"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    let preserved = std::fs::read(main_sub.join("COLLIDE"))
+        .expect("untracked submodule file deleted by sync");
+    assert_eq!(preserved, scratch,
+        "untracked submodule scratch was overwritten; \
+         success={} stdout={stdout}\nstderr={stderr}", out.status.success());
+}
+
+#[test]
+fn session_sync_propagates_submodule_to_main() {
+    // Pin against `702d3ba`-era dead `[ -d $sub/.git ]` check: submodule
+    // `.git` is a gitlink *file*, not a directory, so the loop body was
+    // skipped on every sync. Catches future regressions where propagation
+    // silently no-ops while the parent advances.
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    make_fixture_with_submodule(tmp.path());
+    let source = tmp.path().join("staging");
+    init_pool(&key, &source);
+
+    let out = Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", &key, "acquire", "--name", "feat", "--group", "ios"])
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .output().unwrap();
+    assert!(out.status.success(), "acquire: {}", String::from_utf8_lossy(&out.stderr));
+    let slot_path = pool_root(&key).join("feat");
+    let slot_sub = slot_path.join("sub");
+
+    run_git(&slot_sub, &["config", "user.email", "t@t"]);
+    run_git(&slot_sub, &["config", "user.name", "t"]);
+    std::fs::write(slot_sub.join("NEW"), b"x\n").unwrap();
+    run_git(&slot_sub, &["add", "NEW"]);
+    run_git(&slot_sub, &["commit", "--quiet", "-m", "x"]);
+    run_git(&slot_path, &["config", "user.email", "t@t"]);
+    run_git(&slot_path, &["config", "user.name", "t"]);
+    run_git(&slot_path, &["add", "sub"]);
+    run_git(&slot_path, &["commit", "--quiet", "-m", "bump sub"]);
+
+    let slot_sub_head = StdCommand::new("git")
+        .args(["-C", &slot_sub.display().to_string(), "rev-parse", "HEAD"])
+        .output().unwrap();
+
+    let out = session_cmd_cwd(&slot_path, &["sync"]).output().unwrap();
+    assert!(out.status.success(),
+        "sync: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+
+    let main_sub = source.join("sub");
+    let main_sub_head = StdCommand::new("git")
+        .args(["-C", &main_sub.display().to_string(), "rev-parse", "HEAD"])
+        .output().unwrap();
+    assert_eq!(main_sub_head.stdout, slot_sub_head.stdout,
+        "main's submodule clone was not propagated to slot's HEAD");
+    assert!(main_sub.join("NEW").exists(),
+        "submodule's new tracked file did not land in main worktree");
+}
+
+#[test]
 fn session_sync_refuses_when_main_worktree_on_other_branch() {
     // Operator detour: if main_path has a different branch checked out, sync
     // must refuse — `merge --ff-only` would otherwise advance the wrong branch.

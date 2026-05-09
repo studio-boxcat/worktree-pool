@@ -421,26 +421,38 @@ cmd_sync() {
   # still have the old SHA and stale workdir contents.
   # `acquire` branched each submodule as `<slot-name>` (matches parent), so we
   # can fetch by branch name from the slot's submodule into main's, then
-  # hard-reset main's submodule HEAD to the gitlink-expected SHA. Top-level
-  # submodules only — nested propagation deferred (see CLAUDE.md §Sync flow).
+  # ff-merge main's submodule HEAD to the gitlink-expected SHA. ff-only refuses
+  # on untracked-overwrite (preserves operator scratch in main's submodule
+  # clones — Unity Packages etc.). Use `-e` not `-d`: a submodule's `.git` is
+  # a gitlink *file*, never a directory, so `-d` would silently skip every
+  # submodule (regression caught by session_sync_propagates_submodule_to_main).
+  # Loop runs submodules in parallel via background subshells — meow-tower-class
+  # projects (7+ submodules) get a Nx fetch+merge speedup. Output interleaves.
+  # Top-level submodules only — nested propagation deferred (see CLAUDE.md §Sync flow).
   local slot_path moved
   slot_path=$(git rev-parse --show-toplevel)
   moved=$(git diff --raw "$main_before" "$main_after" | awk '$2=="160000" {print $6}')
   if [ -n "$moved" ]; then
+    local pids=() pid sub_failed=0
     while IFS= read -r sub; do
       [ -n "$sub" ] || continue
       # Slot's submodule absent (tag-excluded at acquire) — nothing to propagate.
-      [ -d "$slot_path/$sub/.git" ] || continue
-      [ -d "$main_path/$sub/.git" ] \
+      [ -e "$slot_path/$sub/.git" ] || continue
+      [ -e "$main_path/$sub/.git" ] \
         || die "sync: main worktree's submodule clone missing at $main_path/$sub"
-      local new_sha
-      new_sha=$(git -C "$slot_path/$sub" rev-parse HEAD)
-      git -C "$main_path/$sub" fetch --quiet "$slot_path/$sub" "$branch" \
-        || die "sync: fetch from $slot_path/$sub into $main_path/$sub failed"
-      git -C "$main_path/$sub" reset --hard --quiet "$new_sha" \
-        || die "sync: reset $main_path/$sub to $new_sha failed"
-      echo "sync: submodule $sub → $(git -C "$main_path/$sub" rev-parse --short HEAD)"
+      (
+        set -e
+        new_sha=$(git -C "$slot_path/$sub" rev-parse HEAD)
+        git -C "$main_path/$sub" fetch --quiet "$slot_path/$sub" "$branch"
+        git -c core.hooksPath=/dev/null -C "$main_path/$sub" \
+          merge --ff-only --quiet "$new_sha"
+        echo "sync: submodule $sub → $(git -C "$main_path/$sub" rev-parse --short HEAD)"
+      ) &
+      pids+=($!)
     done <<< "$moved"
+    for pid in "${pids[@]}"; do wait "$pid" || sub_failed=1; done
+    [ "$sub_failed" = 0 ] \
+      || die "sync: one or more submodule propagations failed (see above) — re-run after resolving"
   fi
 
   echo "sync: $branch merged; main at $(git rev-parse --short HEAD)"
