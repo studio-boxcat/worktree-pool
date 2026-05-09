@@ -28,7 +28,6 @@ Surfaced by efficiency-review agents during the v0.1.1 profile pass. Rust paths 
 
 ## `wt sync` follow-ups
 
-- **No recovery from partial submodule-propagation failure.** If submodule N fails mid-loop, the parent ff-merge already advanced. Re-running sync sees `main_before == slot_head` and skips the parent block, so `moved` is computed against an unchanged range and is empty — the failed submodules never get re-propagated. Operator has to manually `git -C <main>/<sub> fetch <slot>/<sub> <branch> && merge --ff-only <new_sha>` per failure. Fix: capture the parent's pre-sync `main_before` separately (e.g., in a marker file under `.git/wt-sync-resume/`) so re-runs can detect "parent advanced last time, submodules incomplete" and retry just the submodule loop.
 - **Precheck refuses on any submodule-internal `M` status.** `git -C <main_path> status --porcelain | awk '!/^\?\?/'` shows ` M sub` whenever a submodule has untracked / dirty content (default git config), blocking sync even when the submodule has no commit work to merge. Operators silence per-submodule via `git config submodule.<name>.ignore untracked` (the test does this), but a friendlier default would be `git status --ignore-submodules=untracked` in the precheck — matches what the ff-only safety net already protects against.
 - **Sync output interleaves under parallel submodule propagation.** Acceptable for now; revisit if operators complain. Could buffer stdout per subshell into `mktemp` and concatenate after `wait`.
 

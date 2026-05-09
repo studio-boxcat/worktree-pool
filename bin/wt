@@ -397,39 +397,25 @@ cmd_sync() {
     exit 1
   fi
 
-  local slot_head
+  local slot_head slot_path
   slot_head=$(git rev-parse HEAD)
-  # Skip the no-op so re-runs are idempotent (e.g. after manual conflict resolution).
-  if [ "$main_before" != "$slot_head" ]; then
-    # `merge --ff-only` advances whatever HEAD points to, not refs/heads/main
-    # by name — so anchor on the symref before letting it run.
-    local main_ref
-    main_ref=$(git -C "$main_path" symbolic-ref HEAD 2>/dev/null || true)
-    [ "$main_ref" = "refs/heads/main" ] \
-      || die "sync: $main_path has $main_ref checked out, expected refs/heads/main"
-    # core.hooksPath=/dev/null: don't fire user repos' post-merge —
-    # wt_post_sync is the documented hook surface.
-    git -c core.hooksPath=/dev/null -C "$main_path" merge --ff-only --quiet "$slot_head" \
-      || die "sync: fast-forward refused in $main_path — likely an untracked file at a path the slot adds; move/remove it and re-run"
-  fi
-  local main_after
-  main_after=$(git rev-parse main)
-
-  # Propagate submodule commits into the main worktree's submodule clones.
-  # Each parent worktree (slot + main) has its own submodule gitdir, so the
-  # parent ff-merge above just moves the gitlinks — main's submodule clones
-  # still have the old SHA and stale workdir contents.
-  # `acquire` branched each submodule as `<slot-name>` (matches parent), so we
-  # fetch by branch name from the slot's submodule into main's, then ff-merge
-  # main's submodule HEAD to the gitlink-expected SHA. ff-only refuses on
-  # untracked-overwrite — preserves operator scratch in actively-edited
-  # submodule clones. `-e` not `-d`: a submodule's `.git` is a gitlink *file*,
-  # never a directory. Submodules propagate in parallel via background
-  # subshells (Nx speedup at 7+ submodules; output interleaves). Top-level only;
-  # nested propagation deferred (see CLAUDE.md §Sync flow).
-  local slot_path moved
   slot_path=$(git rev-parse --show-toplevel)
-  moved=$(git diff --raw "$main_before" "$main_after" | awk '$2=="160000" {print $6}')
+
+  # Order: submodule propagation BEFORE parent ff-merge. If propagation fails,
+  # parent stays at main_before and re-running sync retries cleanly (each
+  # submodule's fetch+attach+ff is idempotent — already-advanced submodules
+  # no-op). The reverse order would strand the operator: parent advanced,
+  # `moved` empty next time, failed submodules never retried.
+  #
+  # `acquire` branched each submodule as `<slot-name>`, so we fetch by branch
+  # name from the slot's submodule into main's, then ff-merge to the gitlink-
+  # expected SHA. ff-only refuses on untracked-overwrite — preserves operator
+  # scratch in actively-edited submodule clones. `-e` not `-d`: a submodule's
+  # `.git` is a gitlink *file*, never a directory. Parallel via background
+  # subshells (Nx speedup at 7+ submodules; output interleaves). Top-level
+  # only; nested propagation deferred (see CLAUDE.md §Sync flow).
+  local moved
+  moved=$(git diff --raw "$main_before" "$slot_head" | awk '$2=="160000" {print $6}')
   if [ -n "$moved" ]; then
     local pids=() pid sub_failed=0
     while IFS= read -r sub; do
@@ -467,13 +453,25 @@ cmd_sync() {
       pids+=($!)
     done <<< "$moved"
     for pid in "${pids[@]}"; do wait "$pid" || sub_failed=1; done
-    # Parent ff-merge already landed; re-running sync will see no moved
-    # gitlinks and skip propagation. Operator must recover failed submodules
-    # by hand: `git -C <main>/<sub> fetch <slot>/<sub> <branch> && git -C
-    # <main>/<sub> merge --ff-only <new_sha>`. See TODO.md for the proper fix.
     [ "$sub_failed" = 0 ] \
-      || die "sync: submodule propagation failed (see above); main already advanced — recover failed submodules manually"
+      || die "sync: submodule propagation failed (see above); main NOT advanced — fix and re-run sync"
   fi
+
+  # Skip the no-op so re-runs are idempotent (e.g. after manual conflict resolution).
+  if [ "$main_before" != "$slot_head" ]; then
+    # `merge --ff-only` advances whatever HEAD points to, not refs/heads/main
+    # by name — so anchor on the symref before letting it run.
+    local main_ref
+    main_ref=$(git -C "$main_path" symbolic-ref HEAD 2>/dev/null || true)
+    [ "$main_ref" = "refs/heads/main" ] \
+      || die "sync: $main_path has $main_ref checked out, expected refs/heads/main"
+    # core.hooksPath=/dev/null: don't fire user repos' post-merge —
+    # wt_post_sync is the documented hook surface.
+    git -c core.hooksPath=/dev/null -C "$main_path" merge --ff-only --quiet "$slot_head" \
+      || die "sync: fast-forward refused in $main_path — likely an untracked file at a path the slot adds; move/remove it and re-run"
+  fi
+  local main_after
+  main_after=$(git rev-parse main)
 
   echo "sync: $branch merged; main at $(git rev-parse --short HEAD)"
 

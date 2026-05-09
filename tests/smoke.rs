@@ -1496,6 +1496,92 @@ fn session_sync_preserves_untracked_in_submodule_on_collision() {
     assert_eq!(preserved, scratch,
         "untracked submodule scratch was overwritten; \
          success={} stdout={stdout}\nstderr={stderr}", out.status.success());
+
+    // Critical: parent main MUST NOT have advanced. If it did, re-running
+    // sync would see no `moved` gitlinks and skip the submodule loop —
+    // failed submodules would never get retried.
+    let main_after = StdCommand::new("git")
+        .args(["-C", &source.display().to_string(), "rev-parse", "main"])
+        .output().unwrap();
+    let main_initial = StdCommand::new("git")
+        .args(["-C", &source.display().to_string(), "rev-parse", "main@{1}"])
+        .output();
+    // Read main's current SHA and compare against the slot's parent commit
+    // (which would be the post-sync target if the parent had advanced).
+    let slot_head = StdCommand::new("git")
+        .args(["-C", &slot_path.display().to_string(), "rev-parse", "HEAD"])
+        .output().unwrap();
+    assert_ne!(main_after.stdout, slot_head.stdout,
+        "parent main advanced despite submodule-propagation failure — \
+         operator can't recover via re-run");
+    let _ = main_initial;
+}
+
+#[test]
+fn session_sync_recovers_after_submodule_collision_resolved() {
+    // After a collision-failed sync, removing the offending untracked file
+    // and re-running sync must complete cleanly: submodule advances + parent
+    // advances. Pins the order-reversal contract: submodule work happens
+    // before parent ff-merge so partial failures stay recoverable.
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    make_fixture_with_submodule(tmp.path());
+    let source = tmp.path().join("staging");
+    run_git(&source, &["config", "submodule.sub.ignore", "untracked"]);
+    init_pool(&key, &source);
+
+    let out = Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", &key, "acquire", "--name", "feat", "--group", "ios"])
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .output().unwrap();
+    assert!(out.status.success());
+    let slot_path = pool_root(&key).join("feat");
+    let slot_sub = slot_path.join("sub");
+
+    run_git(&slot_sub, &["config", "user.email", "t@t"]);
+    run_git(&slot_sub, &["config", "user.name", "t"]);
+    std::fs::write(slot_sub.join("COLLIDE"), b"slot version\n").unwrap();
+    run_git(&slot_sub, &["add", "COLLIDE"]);
+    run_git(&slot_sub, &["commit", "--quiet", "-m", "add collide"]);
+    run_git(&slot_path, &["config", "user.email", "t@t"]);
+    run_git(&slot_path, &["config", "user.name", "t"]);
+    run_git(&slot_path, &["add", "sub"]);
+    run_git(&slot_path, &["commit", "--quiet", "-m", "bump sub"]);
+
+    let main_sub = source.join("sub");
+    std::fs::write(main_sub.join("COLLIDE"), b"scratch\n").unwrap();
+
+    // First run fails (collision).
+    let out = session_cmd_cwd(&slot_path, &["sync"]).output().unwrap();
+    assert!(!out.status.success(), "first sync should fail on collision");
+
+    // Operator resolves: remove the untracked file.
+    std::fs::remove_file(main_sub.join("COLLIDE")).unwrap();
+
+    // Second run succeeds.
+    let out = session_cmd_cwd(&slot_path, &["sync"]).output().unwrap();
+    assert!(out.status.success(),
+        "second sync should succeed after collision cleared; \
+         stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+
+    // Sub + parent both advanced.
+    let slot_sub_head = StdCommand::new("git")
+        .args(["-C", &slot_sub.display().to_string(), "rev-parse", "HEAD"])
+        .output().unwrap();
+    let main_sub_head = StdCommand::new("git")
+        .args(["-C", &main_sub.display().to_string(), "rev-parse", "HEAD"])
+        .output().unwrap();
+    assert_eq!(main_sub_head.stdout, slot_sub_head.stdout, "submodule did not advance");
+    let slot_head = StdCommand::new("git")
+        .args(["-C", &slot_path.display().to_string(), "rev-parse", "HEAD"])
+        .output().unwrap();
+    let main_head = StdCommand::new("git")
+        .args(["-C", &source.display().to_string(), "rev-parse", "main"])
+        .output().unwrap();
+    assert_eq!(main_head.stdout, slot_head.stdout, "parent main did not advance");
 }
 
 #[test]
