@@ -505,6 +505,61 @@ fn stale_pool_mutex_reclaimed_by_acquire() {
     );
 }
 
+/// Pool mutex with a dead-holder PID must be reclaimed immediately, even when
+/// the file's mtime is fresh (well below the 120s mtime-stale threshold). This
+/// is the cmd+W / SIGHUP / panic=abort case: holder process terminates without
+/// running Drop, leaks pool.lock, and the next acquire would otherwise eat the
+/// full 60s busy-wait before bailing.
+#[test]
+fn dead_holder_pid_in_pool_mutex_reclaimed_immediately() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    // Spawn-and-reap to obtain a definitely-dead PID.
+    let dead_pid = {
+        let mut child = StdCommand::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    };
+
+    // Plant pool.lock with the dead PID and FRESH mtime — mtime-based stale
+    // recovery would NOT fire here (file is seconds old, threshold is 120s).
+    // Only PID liveness can recover this fast.
+    let pool_lock = pool_root(&key).join(".meta/pool.lock");
+    std::fs::create_dir_all(pool_lock.parent().unwrap()).unwrap();
+    std::fs::write(&pool_lock, format!("{dead_pid}\n")).unwrap();
+
+    let start = std::time::Instant::now();
+    let out = Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", &key, "acquire", "--name", "after-dead-holder", "--group", "ios"])
+        .output()
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    assert!(
+        out.status.success(),
+        "acquire should reclaim dead-holder pool mutex; got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Sanity: we must NOT have eaten the 60s busy-wait. Allow generous slack
+    // for cargo-test cold start; the win is "seconds, not minutes".
+    assert!(
+        elapsed.as_secs() < 15,
+        "expected fast reclaim (<15s), took {}s",
+        elapsed.as_secs()
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no longer running") || stderr.contains("dead holder"),
+        "expected dead-holder reclaim warning; got: {stderr}"
+    );
+}
+
 /// `unstick --pool-mutex` force-clears the pool-wide mutex without waiting for
 /// the auto-reclaim threshold. The flag is intended for impatient operators —
 /// the test just confirms it removes the file when the flag is present and

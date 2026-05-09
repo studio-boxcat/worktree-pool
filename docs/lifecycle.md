@@ -34,9 +34,11 @@ Writing the lock BEFORE the rename means a crash leaves the slot held at canonic
 - **Renamed but no lock** (crash between rename and lock-write — git state intact, lock missing): `git -C <source> worktree remove --force <slot>` then re-acquire.
 - **Ghost dir** (`.git` gitlink missing or dangling — typically from a half-completed `worktree remove` whose working-tree rm couldn't finish, e.g. an IDE holding a file open): no git state to release through. `wt go/cleanup/rm` all detect this and refuse with `🔴 BROKEN` (see [[wt.md#cleanup-classifier]]). Recover with `rm -rf <slot-path>`.
 
-## Init mutex liveness
+## Mutex liveness
 
-mtime-heartbeated every 30s during init; reclaimable by another acquire after 60min of no heartbeat (covers SIGKILL'd cold submodule clones), with a stderr warning logged. Manual cleanup via `worktree-pool --pool <key> unstick [--slot <id>]`.
+**Pool-wide mutex** (`<pool>/.meta/pool.lock`): the holder writes its PID into the file at create time. On contention, a new acquire reads the PID and probes `kill(pid, 0)` — if the holder process is gone (cmd+W → SIGHUP, SIGKILL, OOM, panic under `panic=abort`), the lock is reclaimed immediately. Mtime ≥ `POOL_MUTEX_STALE_AFTER` (120s) is kept as a fallback for legacy lock files and the microsecond create-then-write-PID race window.
+
+**Init mutex** (`<pool>/.meta/init/<slot-id>.lock`): mtime-heartbeated every 30s during init; reclaimable by another acquire after 60min of no heartbeat (covers SIGKILL'd cold submodule clones), with a stderr warning logged. Manual cleanup via `worktree-pool --pool <key> unstick [--slot <id>]`.
 
 ## Capacity-bound failures
 

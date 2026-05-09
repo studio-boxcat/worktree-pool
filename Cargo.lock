@@ -1067,6 +1067,7 @@ dependencies = [
  "chrono",
  "clap",
  "criterion",
+ "libc",
  "tempfile",
 ]
 

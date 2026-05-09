@@ -89,6 +89,24 @@ impl InitMutex {
             .map(drop)
     }
 
+    /// O_EXCL create, then write our PID. Used by PoolMutex so contenders can
+    /// detect a dead holder without waiting for the mtime-stale threshold. If
+    /// the PID-write fails post-create (rare — disk full mid-write), unlink so
+    /// we don't leave an empty file that wedges contenders on the mtime fallback.
+    fn create_excl_with_pid(path: &Path) -> std::io::Result<()> {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        if let Err(e) = writeln!(f, "{}", std::process::id()) {
+            std::fs::remove_file(path).ok();
+            return Err(e);
+        }
+        Ok(())
+    }
+
     fn is_stale(path: &Path) -> Result<bool> {
         Ok(age_of(path)? >= STALE_AFTER)
     }
@@ -101,6 +119,27 @@ pub fn age_of(path: &Path) -> Result<Duration> {
     Ok(SystemTime::now()
         .duration_since(mtime)
         .unwrap_or(Duration::ZERO))
+}
+
+/// Read a u32 PID from a single-line lock file. None on empty/garbled —
+/// callers fall back to mtime-based stale recovery.
+fn read_pid_file(path: &Path) -> Option<u32> {
+    let s = std::fs::read_to_string(path).ok()?;
+    s.trim().parse().ok()
+}
+
+/// Liveness probe via `kill(pid, 0)`. Pool is local-only (single-host invariant),
+/// so PID without bootid is sufficient — the only remaining risk is PID reuse,
+/// and legitimate pool-mutex holds are sub-second so the reuse window is
+/// effectively zero in practice.
+fn pid_alive(pid: u32) -> bool {
+    // SAFETY: kill(pid, 0) is a probe, not a signal — no side effect on the target.
+    // EPERM (process exists, different uid) is treated as alive — a foreign-uid
+    // PID collision shouldn't trigger a false reclaim of our own lock file.
+    match unsafe { libc::kill(pid as libc::pid_t, 0) } {
+        0 => true,
+        _ => std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM),
+    }
 }
 
 impl Drop for InitMutex {
@@ -136,15 +175,25 @@ impl PoolMutex {
         let max_wait = Duration::from_secs(60);
         let step = Duration::from_millis(100);
         loop {
-            match InitMutex::create_excl(&path) {
+            match InitMutex::create_excl_with_pid(&path) {
                 Ok(()) => return Ok(Self { path }),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Self-reclaim a stale (likely SIGKILL'd) holder. Without this,
-                    // any crash inside the held window wedges every consumer of the
-                    // pool until manual `rm <pool>/.meta/pool.lock`. The threshold
-                    // is well above legitimate hold time (scan + rename = ~2s tops)
-                    // and well below the busy-wait timeout, so a real wedge surfaces
-                    // automatically without operator intervention.
+                    // Liveness check first — closes the gap when the holder died
+                    // without running Drop (cmd+W → SIGHUP, SIGKILL, OOM, panic
+                    // under panic=abort). PID-aware reclaim is immediate; the
+                    // mtime fallback below catches pre-PID-aware lock files and
+                    // the microsecond create-then-write-PID race window.
+                    if let Some(pid) = read_pid_file(&path)
+                        && !pid_alive(pid)
+                    {
+                        eprintln!(
+                            "warn: reclaiming pool mutex {} (holder pid {} no longer running)",
+                            path.display(),
+                            pid
+                        );
+                        std::fs::remove_file(&path).ok();
+                        continue;
+                    }
                     if let Ok(age) = age_of(&path)
                         && age >= POOL_MUTEX_STALE_AFTER
                     {
