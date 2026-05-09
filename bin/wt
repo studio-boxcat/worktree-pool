@@ -12,7 +12,7 @@
 #   wt [--pool <key>] ls      [--git-status]
 #   wt [--pool <key>] info    <name>
 #   wt sync   [message]                  # commit + merge-back-to-main
-#   wt whoami                            # cwd context: slot|source|none + path
+#   wt whoami                            # cwd context: worktree|source|none + path
 #   wt orient                            # print current repo path + CLAUDE.md
 #
 # `init` infers --source from `git rev-parse --show-toplevel` and --pool from
@@ -622,15 +622,15 @@ cmd_rm() {
 }
 
 # Print the cwd context for an AI-agent bootstrap. One of:
-#   slot    ~/.worktree-pool/<key>/<name>      — cwd is inside a pool slot
-#   source  ~/Develop/<key>                    — cwd is inside a registered pool's source repo
+#   worktree  ~/.worktree-pool/<key>/<name>    — cwd is inside a pool slot (feature worktree)
+#   source    ~/Develop/<key>                  — cwd is inside a registered pool's source repo
 #   none                                       — neither (no pool root, not in any registered repo)
 # Path uses `~` for $HOME. Always exits 0.
 cmd_whoami() {
   local cwd_real
   cwd_real=$(pwd -P)
 
-  # Slot: cwd is somewhere under $WORKTREE_ROOT/<key>/<name>/.
+  # Worktree: cwd is somewhere under $WORKTREE_ROOT/<key>/<name>/.
   if inside_dir "$WORKTREE_ROOT"; then
     local pool_root_real rel key rest name
     pool_root_real=$(cd "$WORKTREE_ROOT" && pwd -P)
@@ -639,9 +639,9 @@ cmd_whoami() {
     rest="${rel#*/}"
     name="${rest%%/*}"
     # Bare cwd == pool root (no key) or cwd at $WORKTREE_ROOT/<key> with no slot
-    # below: not a slot context. Fall through to none.
+    # below: not a worktree context. Fall through to none.
     if [ -n "$key" ] && [ "$rel" != "$key" ] && [ -n "$name" ]; then
-      printf 'slot\t%s\n' "$WORKTREE_ROOT/$key/$name" | sed "s|$HOME|~|"
+      printf 'worktree\t%s\n' "$WORKTREE_ROOT/$key/$name" | sed "s|$HOME|~|"
       return 0
     fi
   fi
