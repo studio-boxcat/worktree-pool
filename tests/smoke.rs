@@ -1409,6 +1409,39 @@ fn session_sync_advances_main_on_clean_path() {
 }
 
 #[test]
+fn session_sync_is_idempotent_on_rerun() {
+    // Running sync twice in a row: second run hits the `main_before == slot_head`
+    // skip and exits 0 (the "resume after manual conflict resolution" contract).
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let main_path = tmp.path().join("main-wt");
+    run_git_root(&[
+        "-C", &bare.display().to_string(),
+        "worktree", "add", "--quiet",
+        &main_path.display().to_string(), "main",
+    ]);
+
+    let out = acquire_dev(&key, "feat");
+    assert!(out.status.success());
+    let slot_path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    run_git(&slot_path, &["config", "user.email", "t@t"]);
+    run_git(&slot_path, &["config", "user.name", "t"]);
+    std::fs::write(slot_path.join("F"), b"f\n").unwrap();
+    run_git(&slot_path, &["add", "F"]);
+    run_git(&slot_path, &["commit", "--quiet", "-m", "f"]);
+
+    assert!(session_cmd_cwd(&slot_path, &["sync"]).output().unwrap().status.success());
+    let out = session_cmd_cwd(&slot_path, &["sync"]).output().unwrap();
+    assert!(out.status.success(),
+        "second sync should no-op cleanly; stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
 fn session_sync_refuses_when_main_worktree_on_other_branch() {
     // Operator detour: if main_path has a different branch checked out, sync
     // must refuse — `merge --ff-only` would otherwise advance the wrong branch.

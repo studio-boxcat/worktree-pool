@@ -410,7 +410,7 @@ cmd_sync() {
     # core.hooksPath=/dev/null: don't fire user repos' post-merge —
     # wt_post_sync is the documented hook surface.
     git -c core.hooksPath=/dev/null -C "$main_path" merge --ff-only --quiet "$slot_head" \
-      || die "sync: fast-forwarding main in $main_path failed (untracked collision, or parallel sync)"
+      || die "sync: fast-forward refused in $main_path — likely an untracked file at a path the slot adds; move/remove it and re-run"
   fi
   local main_after
   main_after=$(git rev-parse main)
