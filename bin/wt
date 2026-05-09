@@ -4,6 +4,7 @@
 # See https://github.com/studio-boxcat/worktree-pool
 #
 # Usage:
+#   wt [--pool <key>] init    --max-slots <n> [pool-init-flags...]
 #   wt [--pool <key>] go      <name> [--from <commit-ish>] [pool-acquire-flags...]
 #   wt [--pool <key>] rm      <name> [--force]
 #   wt [--pool <key>] cleanup <name>     # 🟢/🟡/🔴 exit-trap classifier
@@ -12,6 +13,9 @@
 #   wt [--pool <key>] info    <name>
 #   wt sync   [message]                  # commit + merge-back-to-main
 #   wt orient                            # print current repo path + CLAUDE.md
+#
+# `init` infers --source from `git rev-parse --show-toplevel` and --pool from
+# its basename; pass --pool <key> to override. All other init flags pass through.
 #
 # Pool root: $WORKTREE_ROOT (required — no fallback). Set in ~/.zshenv.local.
 #
@@ -94,6 +98,16 @@ slot_repo_ok() {
   [ -e "$1/.git" ] && git -C "$1" rev-parse --git-dir >/dev/null 2>&1
 }
 
+# True iff cwd is somewhere under $1 (after symlink resolution on both sides).
+# Returns 1 if $1 doesn't exist — caller decides whether that's a refuse or a pass.
+inside_dir() {
+  [ -d "$1" ] || return 1
+  local cwd_real root_real
+  cwd_real=$(pwd -P)
+  root_real=$(cd "$1" && pwd -P)
+  [[ "$cwd_real" == "$root_real"/* ]]
+}
+
 # Find the absolute path of the worktree that has refs/heads/main checked out.
 # Echoes empty string if no worktree holds main. Pool slots are themselves
 # `git worktree`s of source, so from any slot this returns the source path.
@@ -150,7 +164,7 @@ Run from inside a pool's source repo or a slot, or pass --pool <key>."
   fi
   POOL_ROOT=$(pool_root_path "$POOL_KEY")
   [ -d "$POOL_ROOT" ] || die "pool '$POOL_KEY' not initialized at $POOL_ROOT — \
-run: worktree-pool --pool $POOL_KEY init --source <repo> --max-slots <n> ..."
+from inside the source repo, run: wt init --max-slots <n> [--groups ...]"
 }
 
 # Lazily resolve `source:` from pool config. Cached in POOL_SOURCE on first call
@@ -246,13 +260,7 @@ cmd_go() {
   # `${arr[@]+...}` form keeps empty-array expansion safe under bash 3.2's `set -u`.
   [ -n "$from" ] && acquire_args=(--commit "$from" ${acquire_args[@]+"${acquire_args[@]}"})
 
-  # Refuse from inside a pool slot — `pwd -P` resolves symlinks.
-  local pool_real cwd_real
-  pool_real=$(cd "$POOL_ROOT" && pwd -P)
-  cwd_real=$(pwd -P)
-  if [[ "$cwd_real" == "$pool_real"/* ]]; then
-    die "refusing to nest — already inside a pool slot."
-  fi
+  inside_dir "$POOL_ROOT" && die "refusing to nest — already inside a pool slot."
 
   # If a slot with this name already exists, resume it instead of acquiring.
   # Warn loudly — `--from` and other acquire flags are ignored on resume
@@ -620,6 +628,27 @@ cmd_ls() {
   exec worktree-pool --pool "$POOL_KEY" ls "$@"
 }
 
+# Initialize a pool, inferring --source from cwd's git toplevel and --pool from
+# its basename (override via `wt --pool <key> init`). All other flags pass
+# through to `worktree-pool init` — `--max-slots <n>` is required there.
+cmd_init() {
+  set -e
+
+  # Refuse from inside any existing pool — `git rev-parse --show-toplevel` would
+  # resolve to the slot, not the underlying source repo.
+  inside_dir "$WORKTREE_ROOT" \
+    && die "init: refusing to run from inside a pool slot — cd into the source repo first."
+
+  local source
+  source=$(git rev-parse --show-toplevel 2>/dev/null) \
+    || die "init: not inside a git repo — cd into the source repo first."
+  source=$(cd "$source" && pwd -P)
+
+  local key="${POOL_KEY:-$(basename "$source")}"
+
+  exec worktree-pool --pool "$key" init --source "$source" "$@"
+}
+
 cmd_info() {
   local name="${1:-}"; shift || true
   require_arg name "$name" "wt info <name>"
@@ -641,6 +670,7 @@ done
 
 verb="${1:-}"; shift || true
 case "$verb" in
+  init)    cmd_init    "$@" ;;
   path)    require_pool; cmd_path    "$@" ;;
   go)      require_pool; cmd_go      "$@" ;;
   sync)    cmd_sync    "$@" ;;
@@ -649,5 +679,5 @@ case "$verb" in
   orient)  cmd_orient  "$@" ;;
   ls)      require_pool; cmd_ls      "$@" ;;
   info)    require_pool; cmd_info    "$@" ;;
-  *)       die "usage: ${0##*/} [--pool <key>] {path|go|cleanup|rm|ls|info} <name> ... | sync [message] | orient" ;;
+  *)       die "usage: ${0##*/} [--pool <key>] {init|path|go|cleanup|rm|ls|info} ... | sync [message] | orient" ;;
 esac
