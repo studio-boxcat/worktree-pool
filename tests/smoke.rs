@@ -1499,6 +1499,69 @@ fn session_sync_preserves_untracked_in_submodule_on_collision() {
 }
 
 #[test]
+fn session_sync_attaches_detached_submodule_to_main() {
+    // `git submodule update` leaves submodules detached; without an explicit
+    // attach, ff-only would advance HEAD only and leave `main` ref lagging.
+    // Verifies the detached → main attach path before the ff-merge.
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    make_fixture_with_submodule(tmp.path());
+    let source = tmp.path().join("staging");
+    init_pool(&key, &source);
+
+    // Simulate `git submodule update` aftermath: detach source/sub at gitlink SHA.
+    let main_sub = source.join("sub");
+    let head_sha = StdCommand::new("git")
+        .args(["-C", &main_sub.display().to_string(), "rev-parse", "HEAD"])
+        .output().unwrap();
+    let sha = String::from_utf8_lossy(&head_sha.stdout).trim().to_string();
+    run_git(&main_sub, &["checkout", "--quiet", "--detach", &sha]);
+
+    let out = Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", &key, "acquire", "--name", "feat", "--group", "ios"])
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .output().unwrap();
+    assert!(out.status.success());
+    let slot_path = pool_root(&key).join("feat");
+    let slot_sub = slot_path.join("sub");
+
+    run_git(&slot_sub, &["config", "user.email", "t@t"]);
+    run_git(&slot_sub, &["config", "user.name", "t"]);
+    std::fs::write(slot_sub.join("NEW"), b"x\n").unwrap();
+    run_git(&slot_sub, &["add", "NEW"]);
+    run_git(&slot_sub, &["commit", "--quiet", "-m", "x"]);
+    run_git(&slot_path, &["config", "user.email", "t@t"]);
+    run_git(&slot_path, &["config", "user.name", "t"]);
+    run_git(&slot_path, &["add", "sub"]);
+    run_git(&slot_path, &["commit", "--quiet", "-m", "bump sub"]);
+
+    let slot_sub_head = StdCommand::new("git")
+        .args(["-C", &slot_sub.display().to_string(), "rev-parse", "HEAD"])
+        .output().unwrap();
+
+    let out = session_cmd_cwd(&slot_path, &["sync"]).output().unwrap();
+    assert!(out.status.success(),
+        "sync: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+
+    // HEAD must now be on refs/heads/main (re-attached).
+    let head_ref = StdCommand::new("git")
+        .args(["-C", &main_sub.display().to_string(), "symbolic-ref", "HEAD"])
+        .output().unwrap();
+    assert!(head_ref.status.success(),
+        "main_sub HEAD is still detached after sync");
+    assert_eq!(String::from_utf8_lossy(&head_ref.stdout).trim(), "refs/heads/main");
+
+    // And main ref must equal slot's submodule HEAD.
+    let main_ref_sha = StdCommand::new("git")
+        .args(["-C", &main_sub.display().to_string(), "rev-parse", "refs/heads/main"])
+        .output().unwrap();
+    assert_eq!(main_ref_sha.stdout, slot_sub_head.stdout);
+}
+
+#[test]
 fn session_sync_propagates_submodule_to_main() {
     // Pin against `702d3ba`-era dead `[ -d $sub/.git ]` check: submodule
     // `.git` is a gitlink *file*, not a directory, so the loop body was

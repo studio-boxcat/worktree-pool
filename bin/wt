@@ -441,6 +441,15 @@ cmd_sync() {
       (
         new_sha=$(git -C "$slot_path/$sub" rev-parse HEAD)
         git -C "$main_path/$sub" fetch --quiet "$slot_path/$sub" "$branch"
+        # Attach to main when detached, so submodule's main ref tracks the
+        # gitlink instead of lagging behind. `git submodule update` leaves
+        # submodules detached, so this is the common case. Skip when on a
+        # branch (any) — don't silently switch operator-managed branch state.
+        if ! git -C "$main_path/$sub" symbolic-ref -q HEAD >/dev/null \
+            && git -C "$main_path/$sub" show-ref --verify --quiet refs/heads/main; then
+          git -C "$main_path/$sub" checkout --quiet main \
+            || die "sync: checkout main failed in $main_path/$sub (untracked collision?)"
+        fi
         git -c core.hooksPath=/dev/null -C "$main_path/$sub" \
           merge --ff-only --quiet "$new_sha"
         echo "sync: submodule $sub → ${new_sha:0:7}"
