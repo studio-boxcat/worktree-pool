@@ -300,11 +300,19 @@ Recover with: rm -rf $(printf '%q' "$path"), then re-run."
   fire_hook wt_pre_go "$fresh"
 
   # `-n <name>` sets claude's session display name (prompt box, /resume picker,
-  # terminal title). Assumes the launcher accepts it — true for `claude` and
-  # the default `ai` wrapper. printf %q quotes for the inline `zsh -ic` shell.
+  # terminal title). `--append-system-prompt` warns subagents about the
+  # cross-worktree refs/stash race (the per-slot alias enforces it; this is the
+  # in-band reminder so models pick the right pattern up front). Both flags
+  # assume the launcher accepts them — true for `claude` and the default `ai`
+  # wrapper. printf %q quotes for the inline `zsh -ic` shell.
   local launcher="${WT_LAUNCHER:-ai}"
+  local wt_prompt
+  wt_prompt="You are inside a worktree-pool slot ($POOL_KEY/$name). Never run \`git stash\` here — \
+the per-slot alias refuses it anyway because refs/stash is shared across worktrees of the same repo. \
+For save/restore around tests use commit + soft-reset instead: \
+\`git add -A && git commit -m wip ; ... ; git reset --soft HEAD^\`."
   local cmd
-  printf -v cmd '%s -n %q' "$launcher" "$name"
+  printf -v cmd '%s -n %q --append-system-prompt %q' "$launcher" "$name" "$wt_prompt"
   [ "$existing" = 1 ] && cmd="$cmd --continue"
 
   # `set +e` for the subshell so a non-zero exit doesn't trip cmd_go's `set -e`
