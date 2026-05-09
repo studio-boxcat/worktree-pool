@@ -441,16 +441,12 @@ cmd_sync() {
       (
         new_sha=$(git -C "$slot_path/$sub" rev-parse HEAD)
         git -C "$main_path/$sub" fetch --quiet "$slot_path/$sub" "$branch"
-        # Attach to a branch when detached, so submodule's branch ref tracks
-        # the gitlink instead of lagging behind. `git submodule update` leaves
-        # submodules detached, so this is the common case. Priority:
-        #   1. `.gitmodules` `submodule.<path>.branch` (git's per-submodule
-        #      tracking convention; lookup assumes name == path, the default
-        #      from `git submodule add`).
-        #   2. `main` (sane fallback for repos that don't declare a branch).
-        # Skip when on a branch (any) — don't silently switch operator state.
+        # Attach detached HEAD before ff-merge so the branch ref tracks the
+        # gitlink (post-`git submodule update` is detached → ff-only on
+        # detached only moves HEAD). `.gitmodules` lookup assumes name == path
+        # (the `git submodule add` default).
         if ! git -C "$main_path/$sub" symbolic-ref -q HEAD >/dev/null; then
-          local sub_branch attach_target=""
+          local sub_branch="" attach_target=""
           sub_branch=$(git -C "$slot_path" config -f .gitmodules \
             --get "submodule.$sub.branch" 2>/dev/null || true)
           if [ -n "$sub_branch" ] \

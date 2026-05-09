@@ -1572,7 +1572,6 @@ fn session_sync_attaches_detached_submodule_to_gitmodules_branch() {
     make_fixture_with_submodule(tmp.path());
     let source = tmp.path().join("staging");
 
-    // Set up a `release` branch in the submodule + declare it in .gitmodules.
     let main_sub = source.join("sub");
     let head_sha = StdCommand::new("git")
         .args(["-C", &main_sub.display().to_string(), "rev-parse", "HEAD"])
@@ -1585,16 +1584,9 @@ fn session_sync_attaches_detached_submodule_to_gitmodules_branch() {
     run_git(&source, &["add", ".gitmodules"]);
     run_git(&source, &["commit", "--quiet", "-m", "track release branch for sub"]);
     run_git(&source, &["push", "--quiet", "origin", "main"]);
-    // Detach source/sub at gitlink SHA (post-`submodule update` state).
     run_git(&main_sub, &["checkout", "--quiet", "--detach", &sha]);
 
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
-        .args(["--pool", &key, "init", "--source"])
-        .arg(&source)
-        .args(["--max-slots", "4", "--groups", "ios,android"])
-        .output().unwrap();
-    assert!(out.status.success(), "init: {}", String::from_utf8_lossy(&out.stderr));
+    init_pool(&key, &source);
 
     let out = Command::cargo_bin("worktree-pool")
         .unwrap()
