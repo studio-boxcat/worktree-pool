@@ -422,6 +422,27 @@ cmd_land() {
     exit 1
   fi
 
+  # Reorder parents on the auto-generated merge so main's first-parent history
+  # stays on mainline (`git merge main` from the slot puts slot tip as first
+  # parent — inverted vs. the conventional "merge feature into main" topology).
+  # Gate: HEAD moved (skip no-op merges) AND first parent == pre-merge slot tip
+  # (skip operator-authored resume commits whose custom message must survive).
+  # Cheap string compare first short-circuits the rev-parse fork on no-ops.
+  local post_merge_head
+  post_merge_head=$(git rev-parse HEAD)
+  if [ "$post_merge_head" != "$slot_head_pre_merge" ] \
+      && [ "$(git rev-parse HEAD^1)" = "$slot_head_pre_merge" ]; then
+    local main_now new_merge
+    main_now=$(git rev-parse HEAD^2)
+    new_merge=$(git commit-tree "$(git rev-parse HEAD^{tree})" \
+      -p "$main_now" -p "$slot_head_pre_merge" \
+      -m "Merge $branch into main") \
+      || die "land: commit-tree failed while reordering merge parents"
+    git update-ref -m "wt land: reorder merge parents" \
+      "refs/heads/$branch" "$new_merge" "$post_merge_head" \
+      || die "land: update-ref failed while reordering merge parents (raced?)"
+  fi
+
   local slot_head slot_path
   slot_head=$(git rev-parse HEAD)
   slot_path=$(git rev-parse --show-toplevel)
