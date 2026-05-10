@@ -62,12 +62,7 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> 
 
     // Iterate acquirable Ns (fresh + recycled-idle), try the init mutex on each.
     let entries = slot::enumerate(pool_root, cfg)?;
-    let renamed_held: Vec<String> = entries
-        .iter()
-        .filter(|e| matches!(e.kind, slot::SlotEntryKind::Renamed))
-        .map(|e| e.name.clone())
-        .collect();
-    let candidates = slot::acquirable_ns(pool_root, group, cfg.max_slots, &renamed_held)?;
+    let candidates = slot::acquirable_ns(pool_root, group, cfg.max_slots, &entries)?;
 
     let mut acquired_mutex: Option<(String, mutex::InitMutex)> = None;
     for n in candidates {

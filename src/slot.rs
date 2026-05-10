@@ -48,30 +48,31 @@ pub fn resolve_group<'a>(cfg: &'a PoolConfig, requested: Option<&str>) -> Result
     }
 }
 
-/// Find the smallest N in `0..max_slots` such that `<pool>/{canonical_id(group, N)}`
-/// does not exist on disk and is not used as the current name of any held slot.
-/// Used by `release` to pick the un-rename target; doesn't consider lock state because
-/// release-mutex serializes the call.
+/// Find the smallest N such that `<pool>/{canonical_id(group, N)}` does not
+/// exist on disk and is not used as the current name of any held slot.
+/// Used by `release` to pick the un-rename target; doesn't consider lock state
+/// because release-mutex serializes the call.
+///
+/// **Not bounded by `max_slots`.** `max_slots` caps concurrently-held slots,
+/// not the canonical-N search space. In over-provisioned states — `max_slots`
+/// reduced after materialization, or `reclaim_stale` having filled `0..max_slots`
+/// with idle canonicals while a held name persists — release must still find a
+/// landing N. Returning N >= max_slots is acceptable: the surplus dir is picked
+/// up by `acquirable_ns` as recycled-idle on the next acquire, self-healing
+/// over time. The alternative (failing release) leaves the pool stuck.
 pub fn smallest_free_n(
     pool_root: &Path,
     group: Option<&str>,
-    max_slots: u32,
     held_names: &[String],
 ) -> Result<u32> {
-    for n in 0..max_slots {
+    for n in 0u32.. {
         let id = canonical_id(group, n);
         let p = pool_root.join(&id);
-        // Free if dir doesn't exist AND no held slot is currently using this name
-        // (could happen if a previous release renamed back to {group}-N and crashed).
         if !p.exists() && !held_names.iter().any(|h| h == &id) {
             return Ok(n);
         }
     }
-    bail!(
-        "no free slot in {}/{:?}: all {max_slots} are in use",
-        pool_root.display(),
-        group
-    )
+    unreachable!("smallest_free_n: u32 N space exhausted")
 }
 
 /// Iterator-friendly enumeration of canonical slot Ns that are currently *acquirable*:
@@ -82,16 +83,28 @@ pub fn smallest_free_n(
 /// Acquire iterates this in order and tries the init mutex on each; the first mutex it
 /// successfully creates is its slot. Lets two parallel acquires fall through to different
 /// Ns without the spurious "mutex contended" error.
+///
+/// **Fresh vs recycled in over-provisioned pools.** Fresh creation is bounded by
+/// `0..max_slots` (never grow the pool past max_slots). But recycled-idle dirs at
+/// N >= max_slots can exist (release un-renamed there when 0..max_slots was full,
+/// or max_slots was reduced after materialization) and are surfaced here as
+/// acquirable — reusing them eats down the surplus, paired with `smallest_free_n`
+/// no longer being bounded by max_slots.
 pub fn acquirable_ns(
     pool_root: &Path,
     group: Option<&str>,
     max_slots: u32,
-    renamed_held: &[String],
+    entries: &[SlotEntry],
 ) -> Result<Vec<u32>> {
-    let mut out = Vec::new();
+    let renamed_held: Vec<&str> = entries
+        .iter()
+        .filter(|e| matches!(e.kind, SlotEntryKind::Renamed))
+        .map(|e| e.name.as_str())
+        .collect();
+    let mut out: Vec<u32> = Vec::new();
     for n in 0..max_slots {
         let id = canonical_id(group, n);
-        if renamed_held.iter().any(|h| h == &id) {
+        if renamed_held.iter().any(|h| *h == id) {
             continue;
         }
         let p = pool_root.join(&id);
@@ -99,16 +112,34 @@ pub fn acquirable_ns(
             out.push(n); // fresh — will `worktree add`
             continue;
         }
-        // Dir exists. Held iff there's a lock at the worktree's gitdir; idle otherwise.
-        let held = match git::worktree_gitdir(&p) {
-            Ok(gd) => fs_paths::slot_lock(&gd).exists(),
-            Err(_) => true, // can't resolve gitdir → treat as held (don't stomp)
-        };
-        if !held {
+        if !is_held_at(&p) {
             out.push(n); // recycled idle — will `reset --hard`
         }
     }
+    // Surplus canonical-N (N >= max_slots) — reuse-only, never fresh. Iteration
+    // order of `entries` follows fs::read_dir (undefined); sort at the end so
+    // acquire still tries candidates smallest-first.
+    for entry in entries {
+        if let SlotEntryKind::Canonical { group: eg, n } = &entry.kind
+            && eg.as_deref() == group
+            && *n >= max_slots
+            && !is_held_at(&entry.path)
+        {
+            out.push(*n);
+        }
+    }
+    out.sort_unstable();
     Ok(out)
+}
+
+/// True iff the canonical-named slot dir at `path` has a held marker at its
+/// gitdir. Returns `true` on resolution failure too — refuses to stomp on a
+/// dir whose state we can't read.
+fn is_held_at(path: &Path) -> bool {
+    match git::worktree_gitdir(path) {
+        Ok(gd) => fs_paths::slot_lock(&gd).exists(),
+        Err(_) => true,
+    }
 }
 
 /// Count slots occupying capacity in `requested_group`. A slot is "occupying"
@@ -271,7 +302,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::create_dir(tmp.path().join("ios-0")).unwrap();
         std::fs::create_dir(tmp.path().join("ios-2")).unwrap();
-        let n = smallest_free_n(tmp.path(), Some("ios"), 4, &[]).unwrap();
+        let n = smallest_free_n(tmp.path(), Some("ios"), &[]).unwrap();
         assert_eq!(n, 1);
     }
 
@@ -279,7 +310,17 @@ mod tests {
     fn smallest_free_n_avoids_held_names_at_canonical() {
         let tmp = tempfile::TempDir::new().unwrap();
         // No dirs exist, but `ios-0` is in the held list (mid-rename, etc.).
-        let n = smallest_free_n(tmp.path(), Some("ios"), 4, &["ios-0".into()]).unwrap();
+        let n = smallest_free_n(tmp.path(), Some("ios"), &["ios-0".into()]).unwrap();
         assert_eq!(n, 1);
+    }
+
+    /// Regression for the over-provisioned case — see `smallest_free_n` doc.
+    #[test]
+    fn smallest_free_n_finds_free_above_max_slots_when_all_canonicals_occupied() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("slot-0")).unwrap();
+        std::fs::create_dir(tmp.path().join("slot-1")).unwrap();
+        let n = smallest_free_n(tmp.path(), None, &[]).unwrap();
+        assert_eq!(n, 2);
     }
 }

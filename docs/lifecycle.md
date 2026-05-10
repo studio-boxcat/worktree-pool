@@ -7,7 +7,7 @@
 1. Resolve `--commit` (default `default_commit` from config) against source repo → full SHA.
 2. Take pool-wide mutex.
 3. If `--unique-sha`, scan held locks for matching `full_sha`; refuse on hit.
-4. Check capacity (`count_occupying_in_group >= max_slots` → refuse with the slot table inline). Counts every `Renamed` slot — held-with-lock against its lock's group, zombies (no/bad lock) against every group conservatively, so unrecoverable zombies surface as a loud capacity error rather than letting the pool grow past `max_slots`.
+4. Check capacity (`count_occupying_in_group >= max_slots` → refuse with the slot table inline). Counts every `Renamed` slot — held-with-lock against its lock's group, zombies (no/bad lock) against every group conservatively. With `smallest_free_n` no longer bounded by `max_slots` (see [[#over-provisioned-pools]]), the prior-step `reclaim_stale` always relocates zombies first, so zombie-counting is defense-in-depth rather than the primary line.
 5. Iterate acquirable Ns (fresh + recycled-idle, smallest first). Try per-slot init mutex on each (`O_EXCL`); first success wins. Heartbeat mtime every 30s during init.
 6. Materialize: fresh → `git worktree add --detach <pool>/{group}-N <full_sha>`; recycled → `git -C <slot> reset --hard <full_sha>`. **Never `git clean`** — untracked files are caller's warmth.
 7. Write lock at `<source>/.git/worktrees/<id>/worktree-pool/lock` (atomic; tempfile + rename) — held marker lands BEFORE the rename.
@@ -24,7 +24,7 @@
 3. Short-circuit: if the slot dir doesn't exist (already released, or just reclaimed), exit 0.
 4. Read lock to recover `group`.
 5. Detach HEAD; `branch -D <name>` (local); `push --delete origin <name>` (best-effort, no-op if `origin` is a bare mirror). Recursively mirror this in every submodule (`detach + branch -D <name>` per submodule, parallel via `std::thread::scope`) to clean up the per-slot branch step 11 of acquire created.
-6. Find smallest free `{group}-N`.
+6. Find smallest free `{group}-N` (unbounded search — see [[#over-provisioned-pools]]; release lands at surplus N >= `max_slots` if every N in `0..max_slots` is occupied).
 7. Un-rename via `fs::rename` + `git worktree repair` + submodule `core.worktree` self-heal (same primitives as acquire's rename).
 8. **Delete lock LAST.** This is the only step that transitions the slot from held → idle on disk; all earlier steps preserve the lock as the authoritative "still owned" signal so a crash mid-flight is recoverable by replay.
 9. Drop mutex.
@@ -76,6 +76,19 @@ Release one with: worktree-pool --pool myapp release --name <n>
 ```
 
 There is no GC. The operator releases manually based on the table.
+
+---
+
+## Over-provisioned pools
+
+A pool is **over-provisioned** when total dirs in `<pool>/` exceeds `max_slots`. Reachable through two paths:
+
+- **Zombie storm**: a SIGINT mid-release leaves a `Renamed`-no-lock zombie. Reclaim relocates it to a canonical-N, growing idle-canonical count. With enough such zombies, `0..max_slots` fills with idle canonicals while at least one named slot is still held — total dirs = max_slots + held_count.
+- **Reduced `max_slots`**: operator edits `<pool>/.meta/config.yaml` to lower `max_slots` after slots were materialized.
+
+`smallest_free_n` is unbounded — release lands at the smallest free N regardless of `max_slots`, including N >= max_slots (surplus). `acquirable_ns` is bounded for *fresh* dirs (`0..max_slots`, so the pool never grows past max_slots via fresh creation) but unbounded for *recycled-idle* dirs (surplus N's get reused on acquire, eating down the over-provision over time). Together: release never wedges, and the pool self-heals via subsequent acquire activity.
+
+There is currently no operator-facing GC for surplus dirs that the operator wants permanently gone (e.g. after reducing `max_slots`). Manual: `git -C <source> worktree remove --force <pool>/slot-N` for the surplus N's.
 
 ---
 

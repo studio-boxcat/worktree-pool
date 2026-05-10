@@ -103,7 +103,7 @@ fn release_tail(
         .map(|e| e.name)
         .collect();
 
-    let n = slot::smallest_free_n(pool_root, group, cfg.max_slots, &held)?;
+    let n = slot::smallest_free_n(pool_root, group, &held)?;
     let canonical = pool_root.join(slot::canonical_id(group, n));
 
     git::worktree_rename(&cfg.source, slot_path, &canonical).with_context(|| {
