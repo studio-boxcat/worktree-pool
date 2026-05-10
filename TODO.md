@@ -30,6 +30,8 @@ Surfaced by efficiency-review agents during the v0.1.1 profile pass. Rust paths 
 
 - **Precheck refuses on any submodule-internal `M` status.** `git -C <main_path> status --porcelain | awk '!/^\?\?/'` shows ` M sub` whenever a submodule has untracked / dirty content (default git config), blocking land even when the submodule has no commit work to merge. Operators silence per-submodule via `git config submodule.<name>.ignore untracked` (the test does this), but a friendlier default would be `git status --ignore-submodules=untracked` in the precheck — matches what the ff-only safety net already protects against.
 - **`wt land`'s output interleaves under parallel submodule propagation.** Acceptable for now; revisit if operators complain. Could buffer stdout per subshell into `mktemp` and concatenate after `wait`.
+- **`cmd_land` reuse: collapse repeated `echo "land: ..." >&2; exit 1` pattern.** ~9 sites in `bin/wt`. A `warn_land() { echo "land: $*" >&2; }` helper (and tighter `die "land: ..."` calls) would dedupe. Pre-existing; surfaced by simplify-agent during the verb-rename audit.
+- **`cmd_land` reuse: factor `git -c core.hooksPath=/dev/null`.** Repeated 3× in `bin/wt` (`bin/wt:464, 487, 502`). A `git_no_hooks()` wrapper would dedupe. Pre-existing; surfaced by simplify-agent during the verb-rename audit.
 
 ## Test scaffolding
 
