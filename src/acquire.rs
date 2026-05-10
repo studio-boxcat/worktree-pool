@@ -45,8 +45,10 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> 
         );
     }
 
-    // Capacity gate. Renamed slots hide their home N (no `slot_id` in lock) so we
-    // can't infer budget from canonical-dir presence alone — count held-in-group locks.
+    // Capacity gate. Counts every Renamed entry that occupies a slot of capacity:
+    // held-with-lock against its lock's group, zombies (no/bad lock) against every
+    // group conservatively so unrecoverable zombies surface as a loud refusal
+    // rather than silently growing the pool past max_slots.
     let occupying = slot::count_occupying_in_group(pool_root, cfg, group)?;
     if occupying >= cfg.max_slots as usize {
         let entries = slot::enumerate(pool_root, cfg)?;

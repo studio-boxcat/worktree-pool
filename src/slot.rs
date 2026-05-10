@@ -138,6 +138,8 @@ pub fn count_occupying_in_group(
         }
         match crate::lock::Lock::read(&lock_path) {
             Ok(lock) if lock.group.as_deref() == requested_group => count += 1,
+            // `Lock::write` is atomic (tempfile + rename), so an Err here is real
+            // corruption (manual edit, schema drift) — count conservatively.
             Err(_) => count += 1,
             _ => {}
         }

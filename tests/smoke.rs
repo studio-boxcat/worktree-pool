@@ -2066,6 +2066,37 @@ fn release_replay_completes_with_submodules() {
         "submodule's feat-sub branch should be cleaned: {sub_branches_after:?}");
 }
 
+/// Acquire+release each `name` once to materialize its canonical-N dir on
+/// disk as an idle slot. Used by capacity tests that need `reclaim_stale`'s
+/// `smallest_free_n` to find every canonical-N already occupied.
+fn materialize_idle_canonicals(key: &str, group: Option<&str>, names: &[&str]) {
+    for n in names {
+        let mut acq = Command::cargo_bin("worktree-pool").unwrap();
+        acq.args(["--pool", key, "acquire", "--name", n]);
+        if let Some(g) = group {
+            acq.args(["--group", g]);
+        }
+        acq.output().unwrap();
+    }
+    for n in names {
+        Command::cargo_bin("worktree-pool").unwrap()
+            .args(["--pool", key, "release", "--name", n])
+            .assert().success();
+    }
+}
+
+/// Plant an unrecoverable-zombie shape at `<pool>/<name>` via direct
+/// `git worktree add --detach` — produces a Renamed dir with no lock at its
+/// gitdir and detached HEAD, exactly the shape `reclaim_stale` would handle.
+fn plant_zombie(bare: &Path, pool: &Path, name: &str) {
+    let st = StdCommand::new("git")
+        .args(["-C", &bare.display().to_string(),
+               "worktree", "add", "--detach",
+               &pool.join(name).display().to_string(), "main"])
+        .status().unwrap();
+    assert!(st.success(), "plant_zombie: `git worktree add` failed for {name}");
+}
+
 /// **Capacity-leak bug** (residual after the lock-last release-recovery overhaul).
 ///
 /// Pre-condition: the pool has reached an over-provisioned state — more `Renamed`
@@ -2093,39 +2124,16 @@ fn capacity_check_counts_unrecoverable_zombies() {
         .args(["--max-slots", "2"])
         .assert().success();
 
-    // Cycle two acquires + releases to materialize slot-0 and slot-1 as idle
-    // canonical dirs on disk.
-    for name in ["warm-1", "warm-2"] {
-        Command::cargo_bin("worktree-pool")
-            .unwrap()
-            .args(["--pool", &key, "acquire", "--name", name])
-            .output().unwrap();
-    }
-    Command::cargo_bin("worktree-pool")
-        .unwrap()
-        .args(["--pool", &key, "release", "--name", "warm-1"])
-        .assert().success();
-    Command::cargo_bin("worktree-pool")
-        .unwrap()
-        .args(["--pool", &key, "release", "--name", "warm-2"])
-        .assert().success();
-
     let pool = pool_root(&key);
+    materialize_idle_canonicals(&key, None, &["warm-1", "warm-2"]);
     assert!(pool.join("slot-0").exists(), "slot-0 idle canonical present");
     assert!(pool.join("slot-1").exists(), "slot-1 idle canonical present");
 
-    // Plant TWO unrecoverable zombies via direct `git worktree add`. With
-    // max_slots=2 and slot-0/slot-1 already on disk as idle canonicals,
-    // `reclaim_stale` can't relocate either zombie — every canonical-N in the
-    // 0..max_slots range is occupied. Pre-existing renamed count = 2 = max.
-    for name in ["z1", "z2"] {
-        StdCommand::new("git")
-            .args(["-C", &bare.display().to_string(),
-                   "worktree", "add", "--detach",
-                   &pool.join(name).display().to_string(), "main"])
-            .status().unwrap();
-    }
-    assert!(pool.join("z1").exists() && pool.join("z2").exists());
+    // With max_slots=2 and slot-0/slot-1 already on disk as idle canonicals,
+    // two zombies put renamed_count at max with reclaim unable to relocate
+    // either (every canonical-N in 0..max_slots is occupied).
+    plant_zombie(&bare, &pool, "z1");
+    plant_zombie(&bare, &pool, "z2");
 
     // The bug: pool already has 2 Renamed dirs (z1, z2 zombies). Any acquire
     // MUST refuse — but pre-fix `count_held_in_group` returns 0 (no locks
@@ -2143,4 +2151,44 @@ fn capacity_check_counts_unrecoverable_zombies() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("are held") || stderr.contains("in use") || stderr.contains("capacity"),
         "expected capacity-style error, got: {stderr}");
+}
+
+/// Grouped variant: a zombie's group is unknown (no lock to read), so it
+/// must count against every group's capacity. Locks in the conservative
+/// "loud refusal" semantic — without it, a zombie of unknown origin would
+/// silently permit any group to over-allocate.
+#[test]
+fn capacity_check_counts_zombies_against_every_group() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+
+    // max_slots=1 per group so a single zombie immediately consumes the
+    // group's entire capacity.
+    Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", &key, "init"])
+        .arg("--source").arg(&bare)
+        .args(["--max-slots", "1", "--groups", "ios,android"])
+        .assert().success();
+
+    // Materialize ios-0 and android-0 as idle canonicals so reclaim has
+    // nowhere to relocate the zombie in either group.
+    materialize_idle_canonicals(&key, Some("ios"), &["warm-ios"]);
+    materialize_idle_canonicals(&key, Some("android"), &["warm-android"]);
+    let pool = pool_root(&key);
+    plant_zombie(&bare, &pool, "z-mystery");
+
+    // Both groups must refuse: the zombie counts toward each conservatively.
+    for grp in ["ios", "android"] {
+        let out = Command::cargo_bin("worktree-pool").unwrap()
+            .args(["--pool", &key, "acquire", "--name", &format!("blocked-{grp}"), "--group", grp])
+            .output().unwrap();
+        assert!(!out.status.success(),
+            "acquire --group {grp} must refuse — unknown-group zombie counts against it. \
+             stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr));
+    }
 }
