@@ -1860,3 +1860,208 @@ fn session_land_refuses_when_main_worktree_on_other_branch() {
         "operator-side branch must not move");
 }
 
+
+// ---------- crash-recovery tests (release reorder + reclaim_stale) ----------
+//
+// We compose each post-crash on-disk shape directly via fs ops, then verify
+// the next acquire/release converges to a clean state.
+
+fn slot_gitdir_path(slot: &Path) -> PathBuf {
+    let text = std::fs::read_to_string(slot.join(".git")).unwrap();
+    let rest = text.strip_prefix("gitdir: ").unwrap().trim();
+    PathBuf::from(rest)
+}
+
+fn run_git_capture(cwd: &Path, args: &[&str]) -> String {
+    let out = StdCommand::new("git").args(args).current_dir(cwd).output().unwrap();
+    assert!(out.status.success(), "git {} failed: {}",
+        args.join(" "), String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn reclaim_legacy_zombie_at_acquire() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let out = acquire_dev(&key, "feat-zombie");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let slot = pool_root(&key).join("feat-zombie");
+    let gitdir = slot_gitdir_path(&slot);
+    std::fs::remove_file(gitdir.join("worktree-pool/lock")).unwrap();
+    run_git(&slot, &["checkout", "--quiet", "--detach"]);
+    run_git(&slot, &["branch", "-D", "feat-zombie"]);
+    assert!(slot.exists());
+    assert!(!gitdir.join("worktree-pool/lock").exists());
+
+    let out = acquire_dev(&key, "feat-fresh");
+    assert!(out.status.success(),
+        "acquire must succeed (zombie reclaimed first); stderr={}",
+        String::from_utf8_lossy(&out.stderr));
+    assert!(!slot.exists(), "zombie should have been un-renamed away from feat-zombie");
+}
+
+#[test]
+fn release_replay_completes_after_slow_ops_crash() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let out = acquire_dev(&key, "feat-half");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let slot = pool_root(&key).join("feat-half");
+    run_git(&slot, &["checkout", "--quiet", "--detach"]);
+    run_git(&slot, &["branch", "-D", "feat-half"]);
+    assert!(slot_gitdir_path(&slot).join("worktree-pool/lock").exists(),
+        "lock still present (new-ordering crash invariant)");
+
+    release(&key, "feat-half");
+
+    assert!(!slot.exists(), "feat-half dir should be un-renamed by replay");
+    let out = acquire_dev(&key, "feat-after");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn reclaim_orphan_lock_after_post_rename_crash() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let out = acquire_dev(&key, "feat-postrename");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let slot = pool_root(&key).join("feat-postrename");
+    let gitdir = slot_gitdir_path(&slot);
+
+    release(&key, "feat-postrename");
+    let canonical = pool_root(&key).join("ios-0");
+    assert!(canonical.exists(), "released slot lives at ios-0");
+    assert_eq!(gitdir, slot_gitdir_path(&canonical), "gitdir stable across rename");
+
+    let lock_path = gitdir.join("worktree-pool/lock");
+    std::fs::write(&lock_path,
+        "started_at: 2026-01-01T00:00:00Z\nfull_sha: 0000000000000000000000000000000000000000\ngroup: ios\n",
+    ).unwrap();
+
+    // Trigger reclaim_stale via release of an unrelated name (does not write a
+    // new lock to ios-0's gitdir, so we can check the orphan is actually gone).
+    Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", &key, "release", "--name", "no-such-slot"])
+        .assert()
+        .success();
+    assert!(!lock_path.exists(),
+        "reclaim_stale must remove the orphan lock at {}", lock_path.display());
+
+    // And the canonical ios-0 slot is now correctly classified as idle and
+    // available — fresh acquire reuses it (recycled-warm path).
+    let out = acquire_dev(&key, "feat-after-orphan");
+    assert!(out.status.success(),
+        "acquire after reclaim must succeed; stderr={}",
+        String::from_utf8_lossy(&out.stderr));
+    let acquired_path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(acquired_path.ends_with("/feat-after-orphan"));
+}
+
+#[test]
+fn reclaim_does_not_disturb_live_held_slot() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let out = acquire_dev(&key, "live-1");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let live_slot = pool_root(&key).join("live-1");
+    let live_gitdir = slot_gitdir_path(&live_slot);
+    let live_lock_before = std::fs::read(live_gitdir.join("worktree-pool/lock")).unwrap();
+
+    let out = acquire_dev(&key, "live-2");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    assert!(live_slot.exists(), "live held slot must remain at user-name");
+    let live_lock_after = std::fs::read(live_gitdir.join("worktree-pool/lock")).unwrap();
+    assert_eq!(live_lock_before, live_lock_after, "live lock must not be touched");
+    let head = run_git_capture(&live_slot, &["symbolic-ref", "--short", "HEAD"]);
+    assert_eq!(head.trim(), "live-1", "live slot's HEAD must still be on its branch");
+}
+
+#[test]
+fn reclaim_multiple_legacy_zombies_in_one_sweep() {
+    // Mirrors the user's actual pspec pool state: three SIGINT-induced zombies
+    // present simultaneously when the next acquire/release runs. Each must be
+    // reclaimed independently in the single sweep.
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    for name in ["z1", "z2", "z3"] {
+        let out = acquire_dev(&key, name);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let slot = pool_root(&key).join(name);
+        let gitdir = slot_gitdir_path(&slot);
+        std::fs::remove_file(gitdir.join("worktree-pool/lock")).unwrap();
+        run_git(&slot, &["checkout", "--quiet", "--detach"]);
+        run_git(&slot, &["branch", "-D", name]);
+    }
+
+    // One sweep (triggered by acquire) must reclaim all three.
+    let out = acquire_dev(&key, "fresh");
+    assert!(out.status.success(),
+        "acquire must succeed with three zombies present; stderr={}",
+        String::from_utf8_lossy(&out.stderr));
+
+    for name in ["z1", "z2", "z3"] {
+        assert!(!pool_root(&key).join(name).exists(),
+            "zombie '{name}' should have been un-renamed");
+    }
+}
+
+/// The user's actual pspec crash was in a submodule-bearing pool — release's
+/// `submodules::delete_branch_recursive` (the slowest step in the new ordering)
+/// is exactly the SIGINT-prone window. Verify replay completes the submodule
+/// branch deletes cleanly when the slot is half-released.
+#[test]
+fn release_replay_completes_with_submodules() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture_with_submodule(tmp.path());
+    init_pool(&key, &bare);
+
+    let out = acquire_dev(&key, "feat-sub");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let slot = pool_root(&key).join("feat-sub");
+
+    // Submodule is initialized; acquire created a `feat-sub` branch in it.
+    let sub = slot.join("sub");
+    assert!(sub.join(".git").exists(), "submodule should be initialized");
+    let sub_branches_before = run_git_capture(&sub, &["branch", "--list", "feat-sub"]);
+    assert!(sub_branches_before.contains("feat-sub"),
+        "submodule should have feat-sub branch: {sub_branches_before:?}");
+
+    // Compose new-ordering crash: parent branch deleted, lock still present.
+    run_git(&slot, &["checkout", "--quiet", "--detach"]);
+    run_git(&slot, &["branch", "-D", "feat-sub"]);
+    assert!(slot_gitdir_path(&slot).join("worktree-pool/lock").exists());
+
+    // Replay completes the un-rename + submodule branch cleanup.
+    release(&key, "feat-sub");
+    assert!(!slot.exists(), "feat-sub should be un-renamed by replay");
+
+    // Submodule's per-slot branch should be gone too.
+    let canonical_sub = pool_root(&key).join("ios-0").join("sub");
+    let sub_branches_after = run_git_capture(&canonical_sub, &["branch", "--list", "feat-sub"]);
+    assert!(sub_branches_after.trim().is_empty(),
+        "submodule's feat-sub branch should be cleaned: {sub_branches_after:?}");
+}

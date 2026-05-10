@@ -5,6 +5,8 @@
 //!   No lock file at its gitdir.
 //! - **Held**: directory at `<pool>/<name>` (renamed from canonical at acquire).
 //!   Lock file present at `<gitdir>/worktree-pool/lock`.
+//!
+//! Transient post-crash states are reconciled by `release::reclaim_stale`.
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
@@ -198,6 +200,7 @@ fn classify(name: &str, cfg: &PoolConfig) -> SlotEntryKind {
     }
     SlotEntryKind::Renamed
 }
+
 
 #[cfg(test)]
 mod tests {

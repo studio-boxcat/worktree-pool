@@ -6,7 +6,7 @@ use std::path::Path;
 
 use crate::cli::AcquireArgs;
 use crate::config::PoolConfig;
-use crate::{fs_paths, git, lock::Lock, mutex, slot, submodules};
+use crate::{fs_paths, git, lock::Lock, mutex, release, slot, submodules};
 
 pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> {
     let group = slot::resolve_group(cfg, args.group.as_deref())?;
@@ -27,6 +27,10 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> 
     // before the slow ops (`worktree add`, submodule init) that only need the per-slot mutex.
     let pool_mu = mutex::PoolMutex::acquire(fs_paths::pool_mutex(pool_root))
         .context("acquiring pool-wide mutex for slot allocation")?;
+
+    if let Err(e) = release::reclaim_stale(pool_root, cfg) {
+        eprintln!("warn: reclaim_stale during acquire: {e:#}");
+    }
 
     if args.unique_sha
         && let Some(holder) = find_same_sha_holder(pool_root, cfg, &full_sha)?

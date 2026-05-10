@@ -1,6 +1,13 @@
 //! `release` orchestration. Un-renames the slot to the smallest free `{group}-N`,
 //! deletes the branch (local + remote best-effort), drops the lock.
 //! See CLAUDE.md §Lifecycle for the spec.
+//!
+//! **Crash-safety invariant:** the lock file is removed LAST, after `worktree_rename`
+//! completes. All earlier steps (detach, branch deletes, push delete, submodule
+//! deletes) leave the slot semantically "held" — re-running release converges
+//! because every step is idempotent. The post-rename + pre-lock-removal window
+//! leaves a stale lock at the canonical-N gitdir; `reclaim_stale` (run at
+//! every acquire/release startup) detects and removes it.
 use anyhow::{Context, Result};
 use std::path::Path;
 
@@ -13,16 +20,32 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: ReleaseArgs) -> Result<()> 
     let _pool_mu = mutex::PoolMutex::acquire(fs_paths::pool_mutex(pool_root))
         .context("acquiring pool mutex for release")?;
 
+    if let Err(e) = reclaim_stale(pool_root, cfg) {
+        eprintln!("warn: reclaim_stale during release: {e:#}");
+    }
+
     let slot_path = pool_root.join(&args.name);
     if !slot_path.exists() {
-        // Idempotent: re-running on an already-released name succeeds silently.
+        // Re-run on an already-released name — succeed silently for idempotency.
         eprintln!("release '{}': slot not present (already released)", args.name);
         return Ok(());
     }
 
-    // Read the lock to recover the slot's group (for un-rename namespace).
-    let gitdir = git::worktree_gitdir(&slot_path)?;
+    release_tail(pool_root, cfg, &slot_path, &args.name)
+}
+
+/// The release body without the pool mutex or the early-exit short-circuit.
+/// Callable from `reclaim_stale`. Crash-safety invariant lives in the
+/// module header above.
+fn release_tail(
+    pool_root: &Path,
+    cfg: &PoolConfig,
+    slot_path: &Path,
+    name: &str,
+) -> Result<()> {
+    let gitdir = git::worktree_gitdir(slot_path)?;
     let lock_path = fs_paths::slot_lock(&gitdir);
+
     let group_from_lock: Option<String> = if lock_path.exists() {
         match Lock::read(&lock_path) {
             Ok(l) => l.group,
@@ -39,36 +62,29 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: ReleaseArgs) -> Result<()> 
         eprintln!(
             "warn: no lock at {} for slot '{}'; releasing anyway",
             lock_path.display(),
-            args.name
+            name
         );
         None
     };
 
-    // Drop the lock first. After this point, the slot is "idle" from another acquire's
-    // perspective — but we still hold the pool-wide release mutex, so no one is scanning.
-    if lock_path.exists() {
-        std::fs::remove_file(&lock_path)
-            .with_context(|| format!("removing lock {}", lock_path.display()))?;
-    }
-
     // Best-effort branch cleanup: detach, delete local branch, delete remote.
     // Order matters: can't delete the branch we're currently on; must detach first.
-    let (detach_ok, _, detach_err) = git::checkout_detach(&slot_path)?;
+    let (detach_ok, _, detach_err) = git::checkout_detach(slot_path)?;
     if !detach_ok {
         eprintln!(
             "warn: 'git checkout --detach' failed in {}; branch '{}' may persist as a dangling ref. {}",
             slot_path.display(),
-            args.name,
+            name,
             detach_err
         );
     }
-    let _ = git::branch_delete(&slot_path, &args.name);
-    let _ = git::push_delete(&slot_path, "origin", &args.name);
+    let _ = git::branch_delete(slot_path, name);
+    let _ = git::push_delete(slot_path, "origin", name);
 
     // Mirror the parent cleanup into every submodule (incl. nested) — `acquire`
-    // creates a `<args.name>` branch in each so commits there have a push-ready
+    // creates a `<name>` branch in each so commits there have a push-ready
     // label; release un-creates it. Best-effort, parallel per level.
-    submodules::delete_branch_recursive(&slot_path, &args.name);
+    submodules::delete_branch_recursive(slot_path, name);
 
     // Compute target canonical id. Group must come from the lock (acquire wrote it there);
     // if absent, fall back to first configured group, or groupless.
@@ -82,7 +98,7 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: ReleaseArgs) -> Result<()> 
     // EXCLUDING the one we're releasing (which is about to vanish).
     let held: Vec<String> = slot::enumerate(pool_root, cfg)?
         .into_iter()
-        .filter(|e| e.name != args.name)
+        .filter(|e| e.name != name)
         .filter(|e| matches!(e.kind, slot::SlotEntryKind::Renamed))
         .map(|e| e.name)
         .collect();
@@ -90,7 +106,7 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: ReleaseArgs) -> Result<()> 
     let n = slot::smallest_free_n(pool_root, group, cfg.max_slots, &held)?;
     let canonical = pool_root.join(slot::canonical_id(group, n));
 
-    git::worktree_rename(&cfg.source, &slot_path, &canonical).with_context(|| {
+    git::worktree_rename(&cfg.source, slot_path, &canonical).with_context(|| {
         format!(
             "moving {} → {} (un-rename on release)",
             slot_path.display(),
@@ -98,10 +114,83 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: ReleaseArgs) -> Result<()> 
         )
     })?;
 
+    // Lock removal LAST — the only step that flips held → idle on disk.
+    // (Crash here leaves an orphan lock at canonical; `reclaim_stale` clears it.)
+    match std::fs::remove_file(&lock_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(anyhow::Error::new(e))
+                .with_context(|| format!("removing lock {}", lock_path.display()));
+        }
+    }
+
     eprintln!(
         "released '{}' → {}",
-        args.name,
+        name,
         canonical.file_name().and_then(|s| s.to_str()).unwrap_or("?")
     );
     Ok(())
+}
+
+
+/// Recovery sweep: detect and fix leftover state from crashed `acquire`/`release`.
+/// Runs under the pool mutex at the start of every acquire/release so it never
+/// races live mutators. Best-effort: failures log and continue.
+/// See [[lifecycle.md#crash-recovery]] for the state table this implements.
+pub fn reclaim_stale(pool_root: &Path, cfg: &PoolConfig) -> Result<()> {
+    let entries = slot::enumerate(pool_root, cfg)?;
+    for entry in entries {
+        let gitdir = match git::worktree_gitdir(&entry.path) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("reclaim_stale: '{}': worktree_gitdir failed ({e:#}); skipping", entry.name);
+                continue;
+            }
+        };
+        let lock_path = fs_paths::slot_lock(&gitdir);
+        let lock_present = lock_path.exists();
+        match (&entry.kind, lock_present) {
+            (slot::SlotEntryKind::Renamed, false) => {
+                eprintln!(
+                    "reclaim_stale: legacy zombie '{}' (renamed dir, no lock) — completing release",
+                    entry.name
+                );
+                if let Err(e) = release_tail(pool_root, cfg, &entry.path, &entry.name) {
+                    eprintln!("reclaim_stale: '{}' replay failed: {e:#}", entry.name);
+                }
+            }
+            (slot::SlotEntryKind::Canonical { .. }, true) => {
+                if is_post_release_orphan(&entry.path) {
+                    eprintln!(
+                        "reclaim_stale: orphan lock at '{}' (canonical, HEAD detached) — removing",
+                        entry.name
+                    );
+                    if let Err(e) = std::fs::remove_file(&lock_path)
+                        && e.kind() != std::io::ErrorKind::NotFound
+                    {
+                        eprintln!("reclaim_stale: removing {}: {e:#}", lock_path.display());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// True iff the slot's HEAD is not attached to a branch (detached, missing, or
+/// otherwise unreadable by `symbolic-ref`). A live held slot is on a branch
+/// (acquire's `checkout_force_branch`); a canonical-named dir whose HEAD is
+/// off-branch with a lock present is unambiguously a post-release orphan or
+/// an acquire that crashed before attaching the branch — both safe to reclaim.
+fn is_post_release_orphan(slot: &Path) -> bool {
+    match git::run_lenient(slot, &["symbolic-ref", "--quiet", "HEAD"]) {
+        Ok((on_branch, _, _)) => !on_branch,
+        Err(e) => {
+            eprintln!("reclaim_stale: probing HEAD in {} failed ({e:#}); leaving lock alone",
+                slot.display());
+            false
+        }
+    }
 }

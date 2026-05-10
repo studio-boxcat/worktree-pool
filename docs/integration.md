@@ -38,8 +38,7 @@ Cuts that simplify the design:
 - **No GC.** All cleanup is operator-explicit. Capacity-bound errors list the table; operator picks a slot to release.
 - **No registry.** Pool key → path mapping is convention-based (`$WORKTREE_ROOT/<key>/`). No `~/.config/...`-tracked file.
 - **No cross-host coordination.** Pools are host-local. Network-mounted shared pools are not supported (no `host`/`pid` liveness checks).
-- **No held-slot reclaim on holder death.** A SIGKILL'd holder leaves the slot's held marker; operator notices via `ls` and runs `release`. (Mutex liveness is separate — see [[lifecycle.md#mutex-liveness]].)
-- **No auto-recovery.** Process crashes between rename and lock-write may leave orphans visible in `ls`; operator inspects and recovers manually.
+- **No reclaim on holder death.** A SIGKILL'd holder leaves a held marker; operator notices via `ls` and runs `release`. (Distinct from protocol-crash recovery, which IS automatic — see [[lifecycle.md#crash-recovery]].)
 - **No `--fresh` / `--volatile` flags.** Caller wipes warmth itself if needed; release is the only "give back" verb.
 
 If you need GC-like behavior, write a 5-line script: `worktree-pool ls` → filter → `release --name <X>` per match. Keeps the binary lean.

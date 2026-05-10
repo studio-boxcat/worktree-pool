@@ -20,19 +20,39 @@
 ## `release`
 
 1. Take pool-wide mutex.
-2. Read lock to recover `group`.
-3. Delete lock (slot becomes idle to other acquires inside the mutex).
-4. Detach HEAD; `branch -D <name>` (local); `push --delete origin <name>` (best-effort, no-op if `origin` is a bare mirror). Recursively mirror this in every submodule (`detach + branch -D <name>` per submodule, parallel via `std::thread::scope`) to clean up the per-slot branch step 11 of acquire created.
-5. Find smallest free `{group}-N`.
-6. Un-rename via `fs::rename` + `git worktree repair` + submodule `core.worktree` self-heal (same primitives as acquire's rename).
-7. Drop mutex.
+2. Run `slot::reclaim_stale` to fix any leftover state from a prior crash (see [[#crash-recovery]]).
+3. Short-circuit: if the slot dir doesn't exist (already released, or just reclaimed), exit 0.
+4. Read lock to recover `group`.
+5. Detach HEAD; `branch -D <name>` (local); `push --delete origin <name>` (best-effort, no-op if `origin` is a bare mirror). Recursively mirror this in every submodule (`detach + branch -D <name>` per submodule, parallel via `std::thread::scope`) to clean up the per-slot branch step 11 of acquire created.
+6. Find smallest free `{group}-N`.
+7. Un-rename via `fs::rename` + `git worktree repair` + submodule `core.worktree` self-heal (same primitives as acquire's rename).
+8. **Delete lock LAST.** This is the only step that transitions the slot from held → idle on disk; all earlier steps preserve the lock as the authoritative "still owned" signal so a crash mid-flight is recoverable by replay.
+9. Drop mutex.
 
 ## Crash recovery
 
-Writing the lock BEFORE the rename means a crash leaves the slot held at canonical `{group}-N` (clean recovery state). Two residual failure modes need operator action:
+The on-disk encoding is built so any crash leaves a state that the next `acquire` or `release` can finish. Both operations call `slot::reclaim_stale` immediately after taking the pool mutex, before reading any other state.
 
-- **Renamed but no lock** (crash between rename and lock-write — git state intact, lock missing): `git -C <source> worktree remove --force <slot>` then re-acquire.
-- **Ghost dir** (`.git` gitlink missing or dangling — typically from a half-completed `worktree remove` whose working-tree rm couldn't finish, e.g. an IDE holding a file open): no git state to release through. `wt go/cleanup/rm` all detect this and refuse with `🔴 BROKEN` (see [[wt.md#cleanup-classifier]]). Recover with `rm -rf <slot-path>`.
+**Invariants by source.**
+
+- **acquire** writes the lock BEFORE the rename. A crash before the rename leaves the slot at canonical `{group}-N` with lock + detached HEAD; a crash after the rename but before `checkout_force_branch` leaves it at user-name with lock + detached HEAD. Both are reachable by reclaim (canonical case via the HEAD-detached disambiguator; user-name case via re-running `release --name <user-name>`).
+- **release** removes the lock AFTER the un-rename. A crash before the rename leaves the slot at user-name with lock present (every step replayable); a crash between rename and lock removal leaves an orphan lock at canonical (reclaim disambiguates by HEAD state and removes it).
+
+**`reclaim_stale` rules.**
+
+| dir name | lock | HEAD | meaning | action |
+|---|---|---|---|---|
+| renamed | present | any | held (or release crashed mid-slow-ops) | leave; replay if user re-runs `release` |
+| renamed | absent | any | **legacy zombie** (pre-fix release crash) | replay release tail directly: detach, delete branch, `worktree_rename` to canonical |
+| canonical | present | on branch | live held (or acquire crashed late) | leave |
+| canonical | present | detached | **post-rename orphan lock** (release crashed late) | remove lock |
+| canonical | absent | any | idle | leave |
+
+The HEAD-detached check is the disambiguator: a live held slot is on its branch (`acquire::checkout_force_branch`); a canonical-named dir with detached HEAD never reached that step (or reached it then was undone by release). See `slot::is_post_release_orphan`.
+
+**One residual mode still needs operator action:**
+
+- **Ghost dir** (`.git` gitlink missing or dangling — typically from a half-completed `worktree remove` whose working-tree rm couldn't finish, e.g. an IDE holding a file open): no git state to reach the slot through. `wt go/cleanup/rm` all detect this and refuse with `🔴 BROKEN` (see [[wt.md#cleanup-classifier]]). Recover with `rm -rf <slot-path>`.
 
 ## Mutex liveness
 

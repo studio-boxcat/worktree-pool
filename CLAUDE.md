@@ -43,7 +43,7 @@ The held marker lives in the source repo's per-worktree gitdir (which stays stab
 
 ## Slot state
 
-A slot is **held** iff the lock file exists; **idle** otherwise. Lock body is line-oriented YAML, scalars only:
+A slot is **held** iff the lock file exists; **idle** otherwise. (Transient post-crash states are reconciled by `reclaim_stale` — see [[lifecycle.md#crash-recovery]].) Lock body is line-oriented YAML, scalars only:
 
 ```yaml
 started_at: 2026-05-05T03:34:56Z   # UTC, RFC3339; always present
