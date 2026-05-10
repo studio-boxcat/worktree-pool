@@ -66,10 +66,21 @@ fn cmd_init(pool_key: &str, pool_path: &std::path::Path, args: cli::InitArgs) ->
     }
     let cfg = config::PoolConfig::from_init_args(&args)?;
     config::write(pool_path, &cfg).context("writing pool config")?;
+    let groups = if cfg.groups.is_empty() {
+        "none".to_string()
+    } else {
+        cfg.groups.join(",")
+    };
+    let mirror = match (cfg.submodule_mirror_mode, &cfg.submodule_mirror_base) {
+        (Some(m), Some(b)) => format!(", submodule_mirror={}@{}", m.as_str(), b.display()),
+        _ => String::new(),
+    };
     eprintln!(
-        "initialized pool '{pool_key}' at {} (source: {})",
+        "initialized pool '{pool_key}' at {} (source={}, max_slots={}, groups={groups}, default_commit={}{mirror})",
         pool_path.display(),
-        cfg.source.display()
+        cfg.source.display(),
+        cfg.max_slots,
+        cfg.default_commit,
     );
     Ok(())
 }

@@ -42,10 +42,7 @@ impl PoolConfig {
     fn serialize(&self) -> String {
         let mode = self
             .submodule_mirror_mode
-            .map(|m| match m {
-                cli::SubmoduleMirrorMode::BareMirror => "bare-mirror",
-                cli::SubmoduleMirrorMode::GitModules => "git-modules",
-            })
+            .map(|m| m.as_str())
             .unwrap_or("")
             .to_string();
         let base = self

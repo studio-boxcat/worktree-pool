@@ -76,6 +76,15 @@ pub enum SubmoduleMirrorMode {
     GitModules,
 }
 
+impl SubmoduleMirrorMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BareMirror => "bare-mirror",
+            Self::GitModules => "git-modules",
+        }
+    }
+}
+
 #[derive(clap::Args, Debug)]
 pub struct AcquireArgs {
     /// Slot identity post-rename + branch name.
