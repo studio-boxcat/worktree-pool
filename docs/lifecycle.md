@@ -1,6 +1,6 @@
 # Lifecycle invariants
 
-> **Related:** [[../CLAUDE.md]], [[cli.md]], [[wt.md]] (sync flow + cleanup classifier)
+> **Related:** [[../CLAUDE.md]], [[cli.md]], [[wt.md]] (land flow + cleanup classifier)
 
 ## `acquire`
 
@@ -14,7 +14,7 @@
 8. Rename via `fs::rename` + `git worktree repair` (`git worktree move` refuses on slots with submodules — see `git.rs::worktree_rename`). Also rewrites every submodule admin's `core.worktree` (anchored on the pool-key segment, idempotent self-heal).
 9. Force-create branch: `git -C <pool>/<name> update-ref refs/heads/<name> HEAD && symbolic-ref HEAD refs/heads/<name>`. (Avoids `git checkout -B`'s 600ms of per-file filter-process pings on a tree that's already at the right state.)
 10. Drop pool-wide mutex (slot is now visibly held under user-name; submodule init below is per-slot work guarded by the still-held init mutex).
-11. Submodule update, two-phase to dodge `<source>/.git/config` lockfile contention: (a) sequential `git config submodule.<name>.url` writes per submodule, applying URL overrides per pool config; (b) parallel per-submodule `git submodule update <path>` via `std::thread::scope`, then in the same thread `update-ref refs/heads/<name> HEAD && symbolic-ref HEAD refs/heads/<name>` to attach the submodule to a branch matching the parent slot's name (gives commits a push-ready label and a stable ref for `wt sync` to fetch by — see [[wt.md#sync-flow]]). Recursive into nested submodules with the same branch name. Tag exclusion via `--exclude-submodule-tags` against `worktreePoolTag` in `.gitmodules`.
+11. Submodule update, two-phase to dodge `<source>/.git/config` lockfile contention: (a) sequential `git config submodule.<name>.url` writes per submodule, applying URL overrides per pool config; (b) parallel per-submodule `git submodule update <path>` via `std::thread::scope`, then in the same thread `update-ref refs/heads/<name> HEAD && symbolic-ref HEAD refs/heads/<name>` to attach the submodule to a branch matching the parent slot's name (gives commits a push-ready label and a stable ref for `wt land` to fetch by — see [[wt.md#land-flow]]). Recursive into nested submodules with the same branch name. Tag exclusion via `--exclude-submodule-tags` against `worktreePoolTag` in `.gitmodules`.
 12. Release init mutex; print path on stdout (last line).
 
 ## `release`

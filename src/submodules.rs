@@ -129,7 +129,7 @@ pub fn extract_org_repo(url: &str) -> Option<String> {
 /// applied. Recurses into nested `.gitmodules` if present. Each materialized submodule
 /// (top-level + nested) gets a local branch named `branch_name` force-created at HEAD,
 /// matching the parent slot's branch — gives commits in the submodule a push-ready label
-/// and a stable ref for `wt sync` to fetch by. See CLAUDE.md §Sync flow.
+/// and a stable ref for `wt land` to fetch by. See [[docs/wt.md#land-flow]].
 pub fn update(
     slot: &Path,
     cfg: &PoolConfig,

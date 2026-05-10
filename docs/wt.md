@@ -12,7 +12,7 @@ wt [--pool <key>] rm      <name> [--force]   # safety-checked release; --force d
 wt [--pool <key>] cleanup <name>     # 🟢/🟡/🔴 exit-trap classifier
 wt [--pool <key>] ls      [--git-status]
 wt [--pool <key>] info    <name>
-wt sync   [message]                  # commit + merge-back-to-main (local-only)
+wt land   [message]                  # ff slot's commits onto local main (local-only; no push, no PR)
 wt whoami                            # cwd context: worktree|source|none + path
 wt orient                            # print current repo path + CLAUDE.md
 ```
@@ -36,7 +36,7 @@ This means inside `~/Develop/myapp` (the source repo), or inside any slot of tha
 
 `ls` filters `worktree-pool ls` to held slots only — operators almost always want "what's active right now," not idle capacity. `--git-status` is forwarded. Use `worktree-pool ls` directly for the full table including idle rows. `info` is a pass-through to `worktree-pool inspect --name <n>` with the inferred pool key prefilled.
 
-`sync` takes no pool key — it operates on the current worktree's repo and finds the main worktree via `git worktree list`. See [§Sync flow](#sync-flow) below.
+`land` takes no pool key — it operates on the current worktree's repo and finds the main worktree via `git worktree list`. See [§Land flow](#land-flow) below.
 
 `whoami` prints the cwd context for AI-agent bootstrap: `worktree <path>`, `source <path>`, or `none`. Path uses `~` for `$HOME`. Works in any cwd; never errors.
 
@@ -52,7 +52,7 @@ If the source repo has a `.wt-hooks.sh` at its toplevel, `wt` sources it before 
 | `wt_pre_rm` | After safety checks pass, before `release` | Best-effort (errors don't block release) |
 | `wt_pre_cleanup` | Before the cleanup classifier runs | Best-effort |
 | `wt_post_cleanup` | After classifier, only on the green/recycled path | Best-effort |
-| `wt_post_sync` | After `sync` succeeds; sees `$WT_MAIN_BEFORE` / `$WT_MAIN_AFTER` (full SHAs) | Best-effort |
+| `wt_post_land` | After `land` succeeds; sees `$WT_MAIN_BEFORE` / `$WT_MAIN_AFTER` (full SHAs) | Best-effort |
 
 Hook scripts may also set the `WT_LAUNCHER` variable (default `ai`) to override the launcher invocation — receives `-n <name>` and `--continue` (on resume) appended.
 
@@ -68,7 +68,7 @@ wt_pre_go() {
 wt_pre_rm()      { just _dev-stop "$WT_NAME" || true; }
 wt_pre_cleanup() { just _dev-stop "$WT_NAME" || true; }
 wt_post_cleanup() { rm -f "$WT_PATH.log"; }
-wt_post_sync() {
+wt_post_land() {
   if [ -n "$(git diff --name-only "$WT_MAIN_BEFORE" "$WT_MAIN_AFTER" -- package.json bun.lock)" ]; then
     echo "deps changed — re-run bun install in active slots." >&2
   fi
@@ -88,9 +88,9 @@ Always exits 0 — it's an exit-trap target, so `wt go`'s exit trap doesn't mudd
 
 Re-running `wt go <name>` resumes any 🟡 / 🔴 UNMERGED slot. 🔴 BROKEN slots can't be resumed — `go` and `rm` both refuse them.
 
-## Sync flow
+## Land flow
 
-Strict merge-back-to-local-`main`. Local-only; no fetch, no push. Idempotent re-run after manual conflict resolution. Auto-discovers the main worktree via `git worktree list`; no pool-key needed since the operation is git-only.
+**Local-only — never fetches, never pushes, never opens a PR.** Lands the slot's commits onto local `refs/heads/main` via fast-forward. Idempotent re-run after manual conflict resolution. Auto-discovers the main worktree via `git worktree list`; no pool-key needed since the operation is git-only. Pushing to a remote (or opening a PR) is the operator's separate responsibility.
 
 Steps in order, refuses loudly on anything unexpected:
 
@@ -98,10 +98,10 @@ Steps in order, refuses loudly on anything unexpected:
 2. Refuse if any non-ignored untracked files exist in the current worktree (`git ls-files --others --exclude-standard`).
 3. Find main via `git worktree list --porcelain`; refuse if `main` isn't checked out anywhere.
 4. Refuse if main worktree has tracked uncommitted changes (untracked there is fine — `merge --ff-only` in step 8 refuses if untracked files would be overwritten, so operator scratch survives).
-5. Auto-commit dirty tracked work with the supplied message. Refuses if dirty *and* no message. `wip` shorthand → `WIP via sync`.
-6. `git merge main`. No-op in the common case (main is ancestor of slot HEAD); slot's commits fast-forward main in step 9 — keeps history linear. A real 3-way merge only happens when a parallel slot advanced main first; halts on conflict, resolve + `git add` + `git commit`, then re-run sync.
-7. Refuse if `main` is no longer ancestor of `HEAD` (a parallel slot's sync advanced main during long conflict resolution).
-8. **Propagate submodule commits before parent advance.** For each top-level submodule whose gitlink moved between `<main_before>` and slot HEAD (`git diff --raw <main_before> <slot_head> | awk '$2=="160000"'`), `git -C <main_path>/<sub> fetch <slot_path>/<sub> <branch>`. Then if main_path/sub is detached, attach to a branch before the ff-merge so its ref tracks the gitlink instead of lagging (the typical post-`git submodule update` state is detached, and ff-only on detached HEAD only moves HEAD). Attach-target priority: `.gitmodules` `submodule.<path>.branch` if set and that branch exists in the submodule clone; else `main`; else skip the attach. Lookup assumes name==path (the `git submodule add` default). Skip the attach when on any branch (don't silently switch operator-managed branch state). Then `git -c core.hooksPath=/dev/null merge --ff-only <new_sha>`. Both checkout and ff-only refuse on untracked-collision — preserves operator scratch in actively-edited submodule clones. Skip when the slot's submodule is absent (tag-excluded at acquire — gate via `[ -e .../.git ]` since submodules' `.git` is a gitlink *file*, not a directory). Run all submodules in parallel via background subshells (Nx speedup at 7+ submodules; output interleaves). On any single failure, refuse loudly with main NOT advanced — re-running sync after fixing retries cleanly: each submodule's fetch+attach+ff is idempotent, so already-advanced submodules no-op. (The reverse order — parent first — would strand the operator with `moved` empty next time.) Top-level only; nested-submodule propagation is a v2 (commits at nested levels remain on the slot's per-submodule `<slot-name>` branch from acquire's step 11, so manual `git -C <main>/<top>/<nested> fetch <slot>/<top>/<nested> <branch>` recovers them when needed).
-9. `git -C <main_path> -c core.hooksPath=/dev/null merge --ff-only <slot_HEAD>` — advances `refs/heads/main` and refreshes main's working tree atomically. Pre-guarded by `git -C <main_path> symbolic-ref HEAD == refs/heads/main` so the operator manually checking out another branch in main_path can't silently fast-forward the wrong branch. `--ff-only` refuses on untracked-file collision (preserves operator scratch — `reset --hard` would silently delete) and on a parallel sync that advanced main past our base. `core.hooksPath=/dev/null` suppresses `post-merge` so user repos don't get a surprise hook firing — `wt_post_sync` is the documented extension point.
+5. Auto-commit dirty tracked work with the supplied message. Refuses if dirty *and* no message. `wip` shorthand → `WIP via land`.
+6. `git merge main`. No-op in the common case (main is ancestor of slot HEAD); slot's commits fast-forward main in step 9 — keeps history linear. A real 3-way merge only happens when a parallel slot advanced main first; halts on conflict, resolve + `git add` + `git commit`, then re-run land.
+7. Refuse if `main` is no longer ancestor of `HEAD` (a parallel slot's land advanced main during long conflict resolution).
+8. **Propagate submodule commits before parent advance.** For each top-level submodule whose gitlink moved between `<main_before>` and slot HEAD (`git diff --raw <main_before> <slot_head> | awk '$2=="160000"'`), `git -C <main_path>/<sub> fetch <slot_path>/<sub> <branch>`. Then if main_path/sub is detached, attach to a branch before the ff-merge so its ref tracks the gitlink instead of lagging (the typical post-`git submodule update` state is detached, and ff-only on detached HEAD only moves HEAD). Attach-target priority: `.gitmodules` `submodule.<path>.branch` if set and that branch exists in the submodule clone; else `main`; else skip the attach. Lookup assumes name==path (the `git submodule add` default). Skip the attach when on any branch (don't silently switch operator-managed branch state). Then `git -c core.hooksPath=/dev/null merge --ff-only <new_sha>`. Both checkout and ff-only refuse on untracked-collision — preserves operator scratch in actively-edited submodule clones. Skip when the slot's submodule is absent (tag-excluded at acquire — gate via `[ -e .../.git ]` since submodules' `.git` is a gitlink *file*, not a directory). Run all submodules in parallel via background subshells (Nx speedup at 7+ submodules; output interleaves). On any single failure, refuse loudly with main NOT advanced — re-running land after fixing retries cleanly: each submodule's fetch+attach+ff is idempotent, so already-advanced submodules no-op. (The reverse order — parent first — would strand the operator with `moved` empty next time.) Top-level only; nested-submodule propagation is a v2 (commits at nested levels remain on the slot's per-submodule `<slot-name>` branch from acquire's step 11, so manual `git -C <main>/<top>/<nested> fetch <slot>/<top>/<nested> <branch>` recovers them when needed).
+9. `git -C <main_path> -c core.hooksPath=/dev/null merge --ff-only <slot_HEAD>` — advances `refs/heads/main` and refreshes main's working tree atomically. Pre-guarded by `git -C <main_path> symbolic-ref HEAD == refs/heads/main` so the operator manually checking out another branch in main_path can't silently fast-forward the wrong branch. `--ff-only` refuses on untracked-file collision (preserves operator scratch — `reset --hard` would silently delete) and on a parallel land that advanced main past our base. `core.hooksPath=/dev/null` suppresses `post-merge` so user repos don't get a surprise hook firing — `wt_post_land` is the documented extension point.
 
-Idempotent: re-runs are safe (no-op if `main == HEAD`). Resume after conflict = re-run sync after the manual merge commit lands. Pushing to a remote is the operator's responsibility — `wt sync` only advances local refs.
+Idempotent: re-runs are safe (no-op if `main == HEAD`). Resume after conflict = re-run land after the manual merge commit lands. Pushing to a remote (or opening a PR) is the operator's separate responsibility — `wt land` only advances local refs.

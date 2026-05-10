@@ -794,9 +794,9 @@ fn acquire_release_with_submodule_rewires_pointers() {
 
 /// Acquire branches each submodule as `<slot-name>` (matches the parent slot's
 /// branch). This gives commits in the submodule a push-ready label and a stable
-/// ref for `wt sync` to fetch by. Release un-creates it.
+/// ref for `wt land` to fetch by. Release un-creates it.
 ///
-/// See CLAUDE.md §Lifecycle invariants step 11 + §Sync flow.
+/// See CLAUDE.md §Lifecycle invariants step 11 + §Land flow.
 #[test]
 fn acquire_branches_submodule_release_cleans_up() {
     let key = pool_key();
@@ -1362,7 +1362,7 @@ fn session_rm_force_still_refuses_broken_slot() {
 }
 
 /// Build a `bash <wt> <verb-args>` command rooted at `cwd`, used for verbs that
-/// auto-resolve the pool key from cwd (e.g. `wt sync`, which takes no `--pool`).
+/// auto-resolve the pool key from cwd (e.g. `wt land`, which takes no `--pool`).
 fn session_cmd_cwd(cwd: &Path, args: &[&str]) -> StdCommand {
     let bin_path = PathBuf::from(env!("CARGO_BIN_EXE_worktree-pool"));
     let bin_dir = bin_path.parent().unwrap();
@@ -1378,7 +1378,7 @@ fn session_cmd_cwd(cwd: &Path, args: &[&str]) -> StdCommand {
 }
 
 #[test]
-fn session_sync_preserves_untracked_in_main_on_collision() {
+fn session_land_preserves_untracked_in_main_on_collision() {
     // Regression: `reset --hard` silently clobbered untracked main scratch
     // at colliding paths; `merge --ff-only` refuses instead.
     let key = pool_key();
@@ -1387,7 +1387,7 @@ fn session_sync_preserves_untracked_in_main_on_collision() {
     let bare = make_fixture(tmp.path());
     init_pool(&key, &bare);
 
-    // `wt sync` requires main to be checked out as a worktree of source. The
+    // `wt land` requires main to be checked out as a worktree of source. The
     // bare fixture has none by default, so wire one alongside.
     let main_path = tmp.path().join("main-wt");
     run_git_root(&[
@@ -1411,25 +1411,25 @@ fn session_sync_preserves_untracked_in_main_on_collision() {
     let scratch = b"operator scratch -- must not be lost\n";
     std::fs::write(main_path.join("COLLIDE"), scratch).unwrap();
 
-    let out = session_cmd_cwd(&slot_path, &["sync"]).output().unwrap();
+    let out = session_cmd_cwd(&slot_path, &["land"]).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
-    // Sync must refuse loudly (not silently advance main + clobber).
+    // Land must refuse loudly (not silently advance main + clobber).
     assert!(!out.status.success(),
-        "sync should refuse on untracked-file collision in main; \
+        "land should refuse on untracked-file collision in main; \
          stdout={stdout}\nstderr={stderr}");
 
     // Untracked file is the load-bearing assertion: refusal w/o preservation
     // would still be a regression.
     let preserved = std::fs::read(main_path.join("COLLIDE"))
-        .expect("untracked file deleted by sync");
+        .expect("untracked file deleted by land");
     assert_eq!(preserved, scratch,
         "untracked file in main was overwritten; stdout={stdout}\nstderr={stderr}");
 }
 
 #[test]
-fn session_sync_advances_main_on_clean_path() {
+fn session_land_advances_main_on_clean_path() {
     let key = pool_key();
     let _c = Cleanup(key.clone());
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1453,9 +1453,9 @@ fn session_sync_advances_main_on_clean_path() {
     run_git(&slot_path, &["add", "NEW"]);
     run_git(&slot_path, &["commit", "--quiet", "-m", "add new"]);
 
-    let out = session_cmd_cwd(&slot_path, &["sync"]).output().unwrap();
+    let out = session_cmd_cwd(&slot_path, &["land"]).output().unwrap();
     assert!(out.status.success(),
-        "sync should succeed; stdout={}\nstderr={}",
+        "land should succeed; stdout={}\nstderr={}",
         String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
 
     // Tree-landed in main implies ref advanced (ff-only is atomic).
@@ -1464,8 +1464,8 @@ fn session_sync_advances_main_on_clean_path() {
 }
 
 #[test]
-fn session_sync_is_idempotent_on_rerun() {
-    // Running sync twice in a row: second run hits the `main_before == slot_head`
+fn session_land_is_idempotent_on_rerun() {
+    // Running land twice in a row: second run hits the `main_before == slot_head`
     // skip and exits 0 (the "resume after manual conflict resolution" contract).
     let key = pool_key();
     let _c = Cleanup(key.clone());
@@ -1489,15 +1489,15 @@ fn session_sync_is_idempotent_on_rerun() {
     run_git(&slot_path, &["add", "F"]);
     run_git(&slot_path, &["commit", "--quiet", "-m", "f"]);
 
-    assert!(session_cmd_cwd(&slot_path, &["sync"]).output().unwrap().status.success());
-    let out = session_cmd_cwd(&slot_path, &["sync"]).output().unwrap();
+    assert!(session_cmd_cwd(&slot_path, &["land"]).output().unwrap().status.success());
+    let out = session_cmd_cwd(&slot_path, &["land"]).output().unwrap();
     assert!(out.status.success(),
-        "second sync should no-op cleanly; stdout={}\nstderr={}",
+        "second land should no-op cleanly; stdout={}\nstderr={}",
         String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
 }
 
 #[test]
-fn session_sync_preserves_untracked_in_submodule_on_collision() {
+fn session_land_preserves_untracked_in_submodule_on_collision() {
     // Same untracked-clobber bug as the parent-level fix, but at the submodule
     // propagation step (`reset --hard <new_sha>` in main's submodule clone).
     // Critical for projects with many actively-edited submodules (e.g. Unity
@@ -1513,7 +1513,7 @@ fn session_sync_preserves_untracked_in_submodule_on_collision() {
     let source = tmp.path().join("staging");
     // Real-world projects with active submodule editing typically silence the
     // "M sub" noise from untracked content inside submodules — without this,
-    // sync's precheck refuses before reaching the propagation block.
+    // land's precheck refuses before reaching the propagation block.
     run_git(&source, &["config", "submodule.sub.ignore", "untracked"]);
     init_pool(&key, &source);
 
@@ -1542,18 +1542,18 @@ fn session_sync_preserves_untracked_in_submodule_on_collision() {
     let scratch = b"operator scratch in submodule -- must not be lost\n";
     std::fs::write(main_sub.join("COLLIDE"), scratch).unwrap();
 
-    let out = session_cmd_cwd(&slot_path, &["sync"]).output().unwrap();
+    let out = session_cmd_cwd(&slot_path, &["land"]).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
     let preserved = std::fs::read(main_sub.join("COLLIDE"))
-        .expect("untracked submodule file deleted by sync");
+        .expect("untracked submodule file deleted by land");
     assert_eq!(preserved, scratch,
         "untracked submodule scratch was overwritten; \
          success={} stdout={stdout}\nstderr={stderr}", out.status.success());
 
     // Critical: parent main MUST NOT have advanced. If it did, re-running
-    // sync would see no `moved` gitlinks and skip the submodule loop —
+    // land would see no `moved` gitlinks and skip the submodule loop —
     // failed submodules would never get retried.
     let main_after = StdCommand::new("git")
         .args(["-C", &source.display().to_string(), "rev-parse", "main"])
@@ -1562,7 +1562,7 @@ fn session_sync_preserves_untracked_in_submodule_on_collision() {
         .args(["-C", &source.display().to_string(), "rev-parse", "main@{1}"])
         .output();
     // Read main's current SHA and compare against the slot's parent commit
-    // (which would be the post-sync target if the parent had advanced).
+    // (which would be the post-land target if the parent had advanced).
     let slot_head = StdCommand::new("git")
         .args(["-C", &slot_path.display().to_string(), "rev-parse", "HEAD"])
         .output().unwrap();
@@ -1573,9 +1573,9 @@ fn session_sync_preserves_untracked_in_submodule_on_collision() {
 }
 
 #[test]
-fn session_sync_recovers_after_submodule_collision_resolved() {
-    // After a collision-failed sync, removing the offending untracked file
-    // and re-running sync must complete cleanly: submodule advances + parent
+fn session_land_recovers_after_submodule_collision_resolved() {
+    // After a collision-failed land, removing the offending untracked file
+    // and re-running land must complete cleanly: submodule advances + parent
     // advances. Pins the order-reversal contract: submodule work happens
     // before parent ff-merge so partial failures stay recoverable.
     let key = pool_key();
@@ -1609,16 +1609,16 @@ fn session_sync_recovers_after_submodule_collision_resolved() {
     std::fs::write(main_sub.join("COLLIDE"), b"scratch\n").unwrap();
 
     // First run fails (collision).
-    let out = session_cmd_cwd(&slot_path, &["sync"]).output().unwrap();
-    assert!(!out.status.success(), "first sync should fail on collision");
+    let out = session_cmd_cwd(&slot_path, &["land"]).output().unwrap();
+    assert!(!out.status.success(), "first land should fail on collision");
 
     // Operator resolves: remove the untracked file.
     std::fs::remove_file(main_sub.join("COLLIDE")).unwrap();
 
     // Second run succeeds.
-    let out = session_cmd_cwd(&slot_path, &["sync"]).output().unwrap();
+    let out = session_cmd_cwd(&slot_path, &["land"]).output().unwrap();
     assert!(out.status.success(),
-        "second sync should succeed after collision cleared; \
+        "second land should succeed after collision cleared; \
          stdout={}\nstderr={}",
         String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
 
@@ -1640,7 +1640,7 @@ fn session_sync_recovers_after_submodule_collision_resolved() {
 }
 
 #[test]
-fn session_sync_attaches_detached_submodule_to_main() {
+fn session_land_attaches_detached_submodule_to_main() {
     // `git submodule update` leaves submodules detached; without an explicit
     // attach, ff-only would advance HEAD only and leave `main` ref lagging.
     // Verifies the detached → main attach path before the ff-merge.
@@ -1682,9 +1682,9 @@ fn session_sync_attaches_detached_submodule_to_main() {
         .args(["-C", &slot_sub.display().to_string(), "rev-parse", "HEAD"])
         .output().unwrap();
 
-    let out = session_cmd_cwd(&slot_path, &["sync"]).output().unwrap();
+    let out = session_cmd_cwd(&slot_path, &["land"]).output().unwrap();
     assert!(out.status.success(),
-        "sync: stdout={}\nstderr={}",
+        "land: stdout={}\nstderr={}",
         String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
 
     // HEAD must now be on refs/heads/main (re-attached).
@@ -1692,7 +1692,7 @@ fn session_sync_attaches_detached_submodule_to_main() {
         .args(["-C", &main_sub.display().to_string(), "symbolic-ref", "HEAD"])
         .output().unwrap();
     assert!(head_ref.status.success(),
-        "main_sub HEAD is still detached after sync");
+        "main_sub HEAD is still detached after land");
     assert_eq!(String::from_utf8_lossy(&head_ref.stdout).trim(), "refs/heads/main");
 
     // And main ref must equal slot's submodule HEAD.
@@ -1703,7 +1703,7 @@ fn session_sync_attaches_detached_submodule_to_main() {
 }
 
 #[test]
-fn session_sync_attaches_detached_submodule_to_gitmodules_branch() {
+fn session_land_attaches_detached_submodule_to_gitmodules_branch() {
     // `.gitmodules` branch hint takes priority over the `main` fallback. If
     // the submodule has `branch = release` declared, attach to release on
     // detached HEAD, not main.
@@ -1748,25 +1748,25 @@ fn session_sync_attaches_detached_submodule_to_gitmodules_branch() {
     run_git(&slot_path, &["add", "sub"]);
     run_git(&slot_path, &["commit", "--quiet", "-m", "bump sub"]);
 
-    let out = session_cmd_cwd(&slot_path, &["sync"]).output().unwrap();
+    let out = session_cmd_cwd(&slot_path, &["land"]).output().unwrap();
     assert!(out.status.success(),
-        "sync: stdout={}\nstderr={}",
+        "land: stdout={}\nstderr={}",
         String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
 
     let head_ref = StdCommand::new("git")
         .args(["-C", &main_sub.display().to_string(), "symbolic-ref", "HEAD"])
         .output().unwrap();
-    assert!(head_ref.status.success(), "main_sub HEAD detached after sync");
+    assert!(head_ref.status.success(), "main_sub HEAD detached after land");
     assert_eq!(String::from_utf8_lossy(&head_ref.stdout).trim(),
                "refs/heads/release",
                "expected attach to release per .gitmodules, not main");
 }
 
 #[test]
-fn session_sync_propagates_submodule_to_main() {
+fn session_land_propagates_submodule_to_main() {
     // Pin against `702d3ba`-era dead `[ -d $sub/.git ]` check: submodule
     // `.git` is a gitlink *file*, not a directory, so the loop body was
-    // skipped on every sync. Catches future regressions where propagation
+    // skipped on every land. Catches future regressions where propagation
     // silently no-ops while the parent advances.
     let key = pool_key();
     let _c = Cleanup(key.clone());
@@ -1798,9 +1798,9 @@ fn session_sync_propagates_submodule_to_main() {
         .args(["-C", &slot_sub.display().to_string(), "rev-parse", "HEAD"])
         .output().unwrap();
 
-    let out = session_cmd_cwd(&slot_path, &["sync"]).output().unwrap();
+    let out = session_cmd_cwd(&slot_path, &["land"]).output().unwrap();
     assert!(out.status.success(),
-        "sync: stdout={}\nstderr={}",
+        "land: stdout={}\nstderr={}",
         String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
 
     let main_sub = source.join("sub");
@@ -1814,8 +1814,8 @@ fn session_sync_propagates_submodule_to_main() {
 }
 
 #[test]
-fn session_sync_refuses_when_main_worktree_on_other_branch() {
-    // Operator detour: if main_path has a different branch checked out, sync
+fn session_land_refuses_when_main_worktree_on_other_branch() {
+    // Operator detour: if main_path has a different branch checked out, land
     // must refuse — `merge --ff-only` would otherwise advance the wrong branch.
     let key = pool_key();
     let _c = Cleanup(key.clone());
@@ -1842,16 +1842,16 @@ fn session_sync_refuses_when_main_worktree_on_other_branch() {
     run_git(&slot_path, &["commit", "--quiet", "-m", "x"]);
 
     // `find_main_path` parses `worktree list --porcelain` for `branch refs/heads/main`;
-    // after the operator's checkout, that line is gone, so sync errors with
+    // after the operator's checkout, that line is gone, so land errors with
     // "main is not checked out in any worktree". Either that or the symref
     // guard would catch it — load-bearing assertion is the operator branch
     // didn't move.
     let main_before = StdCommand::new("git")
         .args(["-C", &main_path.display().to_string(), "rev-parse", "operator-side"])
         .output().unwrap();
-    let out = session_cmd_cwd(&slot_path, &["sync"]).output().unwrap();
+    let out = session_cmd_cwd(&slot_path, &["land"]).output().unwrap();
     assert!(!out.status.success(),
-        "sync must refuse; stdout={}\nstderr={}",
+        "land must refuse; stdout={}\nstderr={}",
         String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     let main_after = StdCommand::new("git")
         .args(["-C", &main_path.display().to_string(), "rev-parse", "operator-side"])

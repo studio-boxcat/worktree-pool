@@ -1,10 +1,10 @@
 # Integration
 
-> **Related:** [[../CLAUDE.md]], [[wt.md]] (hooks, sync flow), [[cli.md]]
+> **Related:** [[../CLAUDE.md]], [[wt.md]] (hooks, land flow), [[cli.md]]
 
 ## Integration patterns
 
-The minimal-friction integration is **no integration at all** — auto-resolution + `.wt-hooks.sh` covers the common cases. From inside the source repo or any slot, `wt go feature-x`, `wt sync`, `wt ls`, `wt rm feature-x` work without consumer wrappers. Project-specific extras live in `<source>/.wt-hooks.sh`; see [[wt.md#hooks-sourcewt-hookssh]].
+The minimal-friction integration is **no integration at all** — auto-resolution + `.wt-hooks.sh` covers the common cases. From inside the source repo or any slot, `wt go feature-x`, `wt land`, `wt ls`, `wt rm feature-x` work without consumer wrappers. Project-specific extras live in `<source>/.wt-hooks.sh`; see [[wt.md#hooks-sourcewt-hookssh]].
 
 Consumers only need a `just` recipe (or shell alias) when the wrapper adds *operator-facing* surface — independent verbs like `wt-meta`, `wt-dev-start` — not for pre-filling the pool key. Avoid the old pattern of a recipe per verb just to inject the key:
 

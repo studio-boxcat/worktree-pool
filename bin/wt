@@ -11,7 +11,7 @@
 #   wt [--pool <key>] path    <name>     # exit 0 if exists, 1 if not, 2 on error
 #   wt [--pool <key>] ls      [--git-status]
 #   wt [--pool <key>] info    <name>
-#   wt sync   [message]                  # commit + merge-back-to-main
+#   wt land   [message]                  # commit dirty work + ff slot's commits onto local main (local-only; no push, no PR)
 #   wt whoami                            # cwd context: worktree|source|none + path
 #   wt orient                            # print current repo path + CLAUDE.md
 #
@@ -33,7 +33,7 @@
 #   wt_pre_rm       — runs after safety checks, before `release`
 #   wt_pre_cleanup  — runs before the cleanup classifier
 #   wt_post_cleanup — runs after classifier, only on the green/recycled path
-#   wt_post_sync    — runs after sync succeeds; sees $WT_MAIN_BEFORE/$WT_MAIN_AFTER
+#   wt_post_land    — runs after land succeeds; sees $WT_MAIN_BEFORE/$WT_MAIN_AFTER
 #
 # Hook scripts may also set:
 #   WT_LAUNCHER     — launcher invocation; default `ai`. Receives `-n <name>`
@@ -333,35 +333,37 @@ For save/restore around tests use commit + soft-reset instead: \
   fi
 }
 
-cmd_sync() {
+# Land slot's commits onto local main: auto-commit dirty work, ff main → slot HEAD.
+# Local-only — never fetches, never pushes, never opens a PR. See docs/wt.md §Land flow.
+cmd_land() {
   set -e
   local msg="${1:-}"
 
   local branch
   branch=$(git rev-parse --abbrev-ref HEAD)
   if [ "$branch" = "main" ] || [ "$branch" = "HEAD" ]; then
-    die "sync: must run from a non-main branch (current: $branch)"
+    die "land: must run from a non-main branch (current: $branch)"
   fi
 
   local marker
   marker=$(in_progress_marker .)
   if [ -n "$marker" ]; then
-    echo "sync: in-progress $marker — finish or abort first." >&2
-    echo "After finishing the merge commit, re-run sync." >&2
+    echo "land: in-progress $marker — finish or abort first." >&2
+    echo "After finishing the merge commit, re-run land." >&2
     exit 1
   fi
 
   local untracked
   untracked=$(git ls-files --others --exclude-standard)
   if [ -n "$untracked" ]; then
-    echo "sync: untracked files — add, ignore, or remove first:" >&2
+    echo "land: untracked files — add, ignore, or remove first:" >&2
     printf '%s\n' "$untracked" | sed 's/^/  /' >&2
     exit 1
   fi
 
   local main_path
   main_path=$(find_main_path)
-  [ -n "$main_path" ] || die "sync: main is not checked out in any worktree"
+  [ -n "$main_path" ] || die "land: main is not checked out in any worktree"
 
   # `merge --ff-only` refuses if untracked files would be overwritten, so
   # untracked content in main is preserved; ignore `??` here when checking
@@ -369,7 +371,7 @@ cmd_sync() {
   local main_dirty
   main_dirty=$(git -C "$main_path" status --porcelain | awk '!/^\?\?/')
   if [ -n "$main_dirty" ]; then
-    echo "sync: main worktree ($main_path) has uncommitted tracked changes:" >&2
+    echo "land: main worktree ($main_path) has uncommitted tracked changes:" >&2
     printf '%s\n' "$main_dirty" | sed 's/^/  /' >&2
     exit 1
   fi
@@ -377,39 +379,39 @@ cmd_sync() {
   # Auto-commit dirty tracked work. Refuse silent WIP commits.
   if ! git diff --quiet || ! git diff --cached --quiet; then
     if [ -z "$msg" ]; then
-      echo "sync: dirty tracked work needs a commit message:" >&2
+      echo "land: dirty tracked work needs a commit message:" >&2
       git status --short >&2
       echo >&2
-      echo "  wt sync \"feat: <what you did>\"" >&2
-      echo "  wt sync wip                        # shorthand → 'WIP via sync'" >&2
+      echo "  wt land \"feat: <what you did>\"" >&2
+      echo "  wt land wip                        # shorthand → 'WIP via land'" >&2
       exit 1
     fi
-    [ "$msg" = "wip" ] && msg="WIP via sync"
+    [ "$msg" = "wip" ] && msg="WIP via land"
     git add -u
     git commit -m "$msg"
   fi
 
-  # Capture pre-merge main for wt_post_sync hook.
+  # Capture pre-merge main for wt_post_land hook.
   local main_before
   main_before=$(git rev-parse main)
 
-  # Merge main. Common case (no parallel sync): main is ancestor of slot HEAD,
+  # Merge main. Common case (no parallel land): main is ancestor of slot HEAD,
   # so this is a no-op ("Already up to date.") — slot's commits will fast-forward
   # main below. Only when a parallel slot has advanced main do we get a real
   # 3-way merge (with potential conflicts; resume = re-run after manual commit).
-  if ! git merge -m "Sync main into $branch" main; then
+  if ! git merge -m "Merge main into $branch" main; then
     echo >&2
-    echo "sync: merge halted with conflicts. Resolve and either:" >&2
-    echo "  • finish: 'git add' the files, 'git commit', then re-run sync" >&2
+    echo "land: merge halted with conflicts. Resolve and either:" >&2
+    echo "  • finish: 'git add' the files, 'git commit', then re-run land" >&2
     echo "  • back out: 'git merge --abort'" >&2
     exit 1
   fi
 
-  # Refuse if a parallel slot's sync advanced main past our merge base during
+  # Refuse if a parallel slot's land advanced main past our merge base during
   # conflict resolution — `merge --ff-only` below would also catch this, but
   # this gives the operator a precise message.
   if ! git merge-base --is-ancestor main HEAD; then
-    echo "sync: main has moved past your merge base (parallel slot synced first)." >&2
+    echo "land: main has moved past your merge base (parallel slot landed first)." >&2
     echo "  Re-merge with 'git merge main', resolve, commit, then re-run." >&2
     exit 1
   fi
@@ -419,7 +421,7 @@ cmd_sync() {
   slot_path=$(git rev-parse --show-toplevel)
 
   # Order: submodule propagation BEFORE parent ff-merge. If propagation fails,
-  # parent stays at main_before and re-running sync retries cleanly (each
+  # parent stays at main_before and re-running land retries cleanly (each
   # submodule's fetch+attach+ff is idempotent — already-advanced submodules
   # no-op). The reverse order would strand the operator: parent advanced,
   # `moved` empty next time, failed submodules never retried.
@@ -430,7 +432,7 @@ cmd_sync() {
   # scratch in actively-edited submodule clones. `-e` not `-d`: a submodule's
   # `.git` is a gitlink *file*, never a directory. Parallel via background
   # subshells (Nx speedup at 7+ submodules; output interleaves). Top-level
-  # only; nested propagation deferred (see CLAUDE.md §Sync flow).
+  # only; nested propagation deferred (see docs/wt.md §Land flow).
   local moved
   moved=$(git diff --raw "$main_before" "$slot_head" | awk '$2=="160000" {print $6}')
   if [ -n "$moved" ]; then
@@ -440,7 +442,7 @@ cmd_sync() {
       # Slot's submodule absent (tag-excluded at acquire) — nothing to propagate.
       [ -e "$slot_path/$sub/.git" ] || continue
       [ -e "$main_path/$sub/.git" ] \
-        || die "sync: main worktree's submodule clone missing at $main_path/$sub"
+        || die "land: main worktree's submodule clone missing at $main_path/$sub"
       (
         new_sha=$(git -C "$slot_path/$sub" rev-parse HEAD)
         git -C "$main_path/$sub" fetch --quiet "$slot_path/$sub" "$branch"
@@ -460,18 +462,18 @@ cmd_sync() {
           fi
           if [ -n "$attach_target" ]; then
             git -C "$main_path/$sub" checkout --quiet "$attach_target" \
-              || die "sync: checkout $attach_target failed in $main_path/$sub (untracked collision?)"
+              || die "land: checkout $attach_target failed in $main_path/$sub (untracked collision?)"
           fi
         fi
         git -c core.hooksPath=/dev/null -C "$main_path/$sub" \
           merge --ff-only --quiet "$new_sha"
-        echo "sync: submodule $sub → ${new_sha:0:7}"
+        echo "land: submodule $sub → ${new_sha:0:7}"
       ) &
       pids+=($!)
     done <<< "$moved"
     for pid in "${pids[@]}"; do wait "$pid" || sub_failed=1; done
     [ "$sub_failed" = 0 ] \
-      || die "sync: submodule propagation failed (see above); main NOT advanced — fix and re-run sync"
+      || die "land: submodule propagation failed (see above); main NOT advanced — fix and re-run land"
   fi
 
   # Skip the no-op so re-runs are idempotent (e.g. after manual conflict resolution).
@@ -481,22 +483,22 @@ cmd_sync() {
     local main_ref
     main_ref=$(git -C "$main_path" symbolic-ref HEAD 2>/dev/null || true)
     [ "$main_ref" = "refs/heads/main" ] \
-      || die "sync: $main_path has $main_ref checked out, expected refs/heads/main"
+      || die "land: $main_path has $main_ref checked out, expected refs/heads/main"
     # core.hooksPath=/dev/null: don't fire user repos' post-merge —
-    # wt_post_sync is the documented hook surface.
+    # wt_post_land is the documented hook surface.
     git -c core.hooksPath=/dev/null -C "$main_path" merge --ff-only --quiet "$slot_head" \
-      || die "sync: fast-forward refused in $main_path — likely an untracked file at a path the slot adds; move/remove it and re-run"
+      || die "land: fast-forward refused in $main_path — likely an untracked file at a path the slot adds; move/remove it and re-run"
   fi
   local main_after
   main_after=$(git rev-parse main)
 
-  echo "sync: $branch merged; main at $(git rev-parse --short HEAD)"
+  echo "land: $branch merged; main at $(git rev-parse --short HEAD)"
 
-  # Post-sync hook (deps-changed advisory etc). Source hooks from main_path
-  # since sync runs without a pool key — main_path IS the source repo.
+  # Post-land hook (deps-changed advisory etc). Source hooks from main_path
+  # since land runs without a pool key — main_path IS the source repo.
   export WT_MAIN_BEFORE="$main_before" WT_MAIN_AFTER="$main_after"
   source_hooks "$main_path"
-  call_hook wt_post_sync || true
+  call_hook wt_post_land || true
 }
 
 cmd_cleanup() {
@@ -743,12 +745,12 @@ case "$verb" in
   init)    cmd_init    "$@" ;;
   path)    require_pool; cmd_path    "$@" ;;
   go)      require_pool; cmd_go      "$@" ;;
-  sync)    cmd_sync    "$@" ;;
+  land)    cmd_land    "$@" ;;
   cleanup) require_pool; cmd_cleanup "$@" ;;
   rm)      require_pool; cmd_rm      "$@" ;;
   orient)  cmd_orient  "$@" ;;
   whoami)  cmd_whoami  "$@" ;;
   ls)      require_pool; cmd_ls      "$@" ;;
   info)    require_pool; cmd_info    "$@" ;;
-  *)       die "usage: ${0##*/} [--pool <key>] {init|path|go|cleanup|rm|ls|info} ... | sync [message] | whoami | orient" ;;
+  *)       die "usage: ${0##*/} [--pool <key>] {init|path|go|cleanup|rm|ls|info} ... | land [message] | whoami | orient" ;;
 esac
