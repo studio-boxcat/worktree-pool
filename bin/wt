@@ -334,7 +334,9 @@ For save/restore around tests use commit + soft-reset instead: \
 }
 
 # Land slot's commits onto local main: auto-commit dirty work, ff main → slot HEAD.
-# Local-only — never fetches, never pushes, never opens a PR. See docs/wt.md §Land flow.
+# Bidirectional submodule sync: slot→main (gating; step 8) and main→slot working
+# tree (cosmetic; step 10). Local-only — never fetches origin, never pushes, never
+# opens a PR. See docs/wt.md §Land flow.
 cmd_land() {
   set -e
   local msg="${1:-}"
@@ -391,9 +393,13 @@ cmd_land() {
     git commit -m "$msg"
   fi
 
-  # Capture pre-merge main for wt_post_land hook.
-  local main_before
+  # Capture pre-merge main for wt_post_land hook, and pre-merge slot HEAD
+  # for the slot-direction submodule refresh below (the post-merge HEAD is
+  # the merge commit; we need the pre-merge tip to compute what the merge
+  # brought in from main's side).
+  local main_before slot_head_pre_merge
   main_before=$(git rev-parse main)
+  slot_head_pre_merge=$(git rev-parse HEAD)
 
   # Merge main. Common case (no parallel land): main is ancestor of slot HEAD,
   # so this is a no-op ("Already up to date.") — slot's commits will fast-forward
@@ -491,6 +497,79 @@ cmd_land() {
   fi
   local main_after
   main_after=$(git rev-parse main)
+
+  # Refresh slot's submodule working trees for gitlinks main brought in via
+  # the merge above. Without this, `git status` in the slot reports phantom
+  # rewinds for any submodule main advanced while the slot was branched off:
+  # the merge updates the slot's parent-tree gitlinks to main's, but the slot's
+  # submodule clone HEADs stay at the old SHAs. Mirror of the slot→main block
+  # above, inverted in direction.
+  #
+  # Cosmetic only — main is already advanced. Best-effort: each failure emits
+  # a WARN and continues; operator can finish manually with `git submodule
+  # update`. Local-only — fetch source is $main_path/$sub, never origin.
+  #
+  # Diffing slot_head_pre_merge → HEAD (the merge commit) directly yields the
+  # gitlinks 3-way merge picked from main's side — exactly the set where the
+  # slot's submodule clone needs refreshing. Slot's own moves cancel out in
+  # the diff (pre-merge HEAD already had them). `$2=="160000"` filters on dst
+  # mode → excludes deletions; additions in main are skipped below by the
+  # `.git` existence guard (slot has no clone for them yet).
+  local main_brought
+  main_brought=$(git diff --raw "$slot_head_pre_merge" HEAD | awk '$2=="160000" {print $6}')
+  if [ -n "$main_brought" ]; then
+    local sub_pids=()
+    while IFS= read -r sub; do
+      [ -n "$sub" ] || continue
+      # Slot's submodule absent (tag-excluded at acquire, or new in main) —
+      # nothing to refresh. Parent tree shows it as a missing/typechange in
+      # `git status`; that's a separate, pre-existing limitation.
+      [ -e "$slot_path/$sub/.git" ] || continue
+      [ -e "$main_path/$sub/.git" ] || {
+        echo "land: WARN: $sub: main worktree's submodule clone missing — slot working tree not refreshed" >&2
+        continue
+      }
+      (
+        local expected_sha sub_branch attach=""
+        expected_sha=$(git -C "$slot_path" ls-tree HEAD "$sub" | awk '{print $3}')
+        [ -n "$expected_sha" ] || { echo "land: WARN: $sub: gitlink missing in slot tree — skipped" >&2; exit 0; }
+        sub_branch=$(git -C "$slot_path" config -f .gitmodules \
+          --get "submodule.$sub.branch" 2>/dev/null || echo main)
+        # Failure here is non-fatal — the ff below will refuse if the SHA
+        # isn't reachable, and we warn there too.
+        git -C "$slot_path/$sub" fetch --quiet "$main_path/$sub" "$sub_branch" 2>/dev/null \
+          || echo "land: WARN: $sub: fetch from $main_path/$sub $sub_branch failed — slot may stay stale" >&2
+        # Attach detached HEAD before ff so the slot's branch ref tracks the
+        # gitlink (post-`submodule update` is detached → ff-only on detached
+        # only moves HEAD). Priority: slot-name branch (acquire convention)
+        # → .gitmodules branch → main.
+        if ! git -C "$slot_path/$sub" symbolic-ref -q HEAD >/dev/null; then
+          if git -C "$slot_path/$sub" show-ref --verify --quiet "refs/heads/$branch"; then
+            attach="$branch"
+          elif [ -n "$sub_branch" ] && git -C "$slot_path/$sub" show-ref --verify --quiet "refs/heads/$sub_branch"; then
+            attach="$sub_branch"
+          elif git -C "$slot_path/$sub" show-ref --verify --quiet refs/heads/main; then
+            attach="main"
+          fi
+          if [ -n "$attach" ]; then
+            git -C "$slot_path/$sub" checkout --quiet "$attach" \
+              || { echo "land: WARN: $sub: checkout $attach failed (untracked collision?) — slot not refreshed" >&2; exit 0; }
+          else
+            echo "land: WARN: $sub: no branch to attach to — slot not refreshed" >&2
+            exit 0
+          fi
+        fi
+        if git -c core.hooksPath=/dev/null -C "$slot_path/$sub" \
+           merge --ff-only --quiet "$expected_sha" 2>/dev/null; then
+          echo "land: slot submodule $sub → ${expected_sha:0:7}"
+        else
+          echo "land: WARN: $sub: ff-only to ${expected_sha:0:7} refused — slot may stay stale (manual: git -C $slot_path/$sub merge --ff-only $expected_sha)" >&2
+        fi
+      ) &
+      sub_pids+=($!)
+    done <<< "$main_brought"
+    for pid in "${sub_pids[@]}"; do wait "$pid" || true; done
+  fi
 
   echo "land: $branch merged; main at $(git rev-parse --short HEAD)"
 
