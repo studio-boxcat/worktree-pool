@@ -4,7 +4,7 @@
 # See https://github.com/studio-boxcat/worktree-pool
 #
 # Usage:
-#   wt [--pool <key>] init    --max-slots <n> [pool-init-flags...]
+#   wt [--pool <key>] init    [--max-slots <n>] [pool-init-flags...]   # default --max-slots 16
 #   wt [--pool <key>] go      <name> [--from <commit-ish>] [pool-acquire-flags...]
 #   wt [--pool <key>] rm      <name> [--force]
 #   wt [--pool <key>] cleanup <name>     # 🟢/🟡/🔴 exit-trap classifier
@@ -165,7 +165,7 @@ Run from inside a pool's source repo or a slot, or pass --pool <key>."
   fi
   POOL_ROOT=$(pool_root_path "$POOL_KEY")
   [ -d "$POOL_ROOT" ] || die "pool '$POOL_KEY' not initialized at $POOL_ROOT — \
-from inside the source repo, run: wt init --max-slots <n> [--groups ...]"
+from inside the source repo, run: wt init [--max-slots <n>] [--groups ...]"
 }
 
 # Lazily resolve `source:` from pool config. Cached in POOL_SOURCE on first call
@@ -702,7 +702,7 @@ cmd_ls() {
 
 # Initialize a pool, inferring --source from cwd's git toplevel and --pool from
 # its basename (override via `wt --pool <key> init`). All other flags pass
-# through to `worktree-pool init` — `--max-slots <n>` is required there.
+# through to `worktree-pool init`; `--max-slots` defaults to 16 if omitted.
 cmd_init() {
   set -e
 
@@ -717,6 +717,12 @@ cmd_init() {
   source=$(cd "$source" && pwd -P)
 
   local key="${POOL_KEY:-$(basename "$source")}"
+
+  local has_max_slots=0 a
+  for a in "$@"; do
+    case "$a" in --max-slots|--max-slots=*) has_max_slots=1; break ;; esac
+  done
+  (( has_max_slots )) || set -- --max-slots 16 "$@"
 
   exec worktree-pool --pool "$key" init --source "$source" "$@"
 }

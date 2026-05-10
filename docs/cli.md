@@ -5,8 +5,8 @@
 ## Quick start
 
 ```sh
-# Initialize a pool (or run `wt init --max-slots 16 --groups ios,android`
-# from inside the source repo — auto-infers --source and --pool).
+# Initialize a pool (or run `wt init --groups ios,android` from inside
+# the source repo — auto-infers --source and --pool; --max-slots defaults to 16).
 worktree-pool --pool myapp init \
   --source ~/Develop/myapp \
   --max-slots 16 \

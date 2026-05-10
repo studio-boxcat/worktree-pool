@@ -5,7 +5,7 @@
 Bash dispatcher in `bin/wt`. Subcommands wrapping the slot + git-flow lifecycle for interactive dev work:
 
 ```sh
-wt [--pool <key>] init    --max-slots <n> [pool-init-flags...]   # --source inferred from cwd
+wt [--pool <key>] init    [--max-slots <n>] [pool-init-flags...] # --source inferred from cwd; --max-slots defaults to 16
 wt [--pool <key>] path    <name>     # print slot path; exit 0 if exists, 1 if not, 2 on error
 wt [--pool <key>] go      <name> [--from <commit-ish>] [pool-acquire-flags...]
 wt [--pool <key>] rm      <name> [--force]   # safety-checked release; --force discards dirty/unmerged
@@ -24,7 +24,7 @@ wt orient                            # print current repo path + CLAUDE.md
 
 This means inside `~/Develop/myapp` (the source repo), or inside any slot of that pool, every verb works without a pool-key argument. Each repo is its own pool, so ambiguity is rare in practice.
 
-`init` is a thin pass-through to `worktree-pool init` that auto-infers `--source` from `git rev-parse --show-toplevel` and `--pool` from its basename. Run it from inside the source repo: `wt init --max-slots 16 --groups ios,android` (no need to type `--pool myapp --source ~/Develop/myapp`). Override the inferred key with `wt --pool <key> init ...`. All other init flags pass through unchanged. Refuses from inside an existing pool slot (toplevel would resolve to the slot, not the source).
+`init` is a thin pass-through to `worktree-pool init` that auto-infers `--source` from `git rev-parse --show-toplevel` and `--pool` from its basename. Run it from inside the source repo: `wt init --groups ios,android` (no need to type `--pool myapp --source ~/Develop/myapp`; `--max-slots` defaults to 16, override with `--max-slots <n>`). Override the inferred key with `wt --pool <key> init ...`. All other init flags pass through unchanged. Refuses from inside an existing pool slot (toplevel would resolve to the slot, not the source).
 
 `go` acquires/resumes a slot, prints a banner, `cd`s into the slot, runs `$WT_LAUNCHER -n <name>` (default `ai`) in `$SHELL`, and sets an EXIT trap that runs `wt cleanup`. The `-n <name>` is claude's session display name (visible in the prompt box, `/resume` picker, terminal title); assumes the configured launcher accepts it.
 
