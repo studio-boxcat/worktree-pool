@@ -1497,6 +1497,72 @@ fn session_land_is_idempotent_on_rerun() {
 }
 
 #[test]
+fn session_land_keeps_first_parent_on_mainline_after_parallel_land() {
+    // Two slots branched from the same main both land. The second land forces a
+    // real 3-way merge; the merge commit's parents must be (current_main, slot_tip)
+    // in that order — so `git log --first-parent main` stays on mainline instead
+    // of diving into the second slot's history.
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let main_path = tmp.path().join("main-wt");
+    run_git_root(&[
+        "-C", &bare.display().to_string(),
+        "worktree", "add", "--quiet",
+        &main_path.display().to_string(), "main",
+    ]);
+
+    let rev_parse = |cwd: &Path, rev: &str|
+        run_git_capture(cwd, &["rev-parse", rev]).trim().to_string();
+
+    let out_a = acquire_dev(&key, "slot-a");
+    assert!(out_a.status.success(), "{}", String::from_utf8_lossy(&out_a.stderr));
+    let slot_a = PathBuf::from(String::from_utf8_lossy(&out_a.stdout).trim().to_string());
+    let out_b = acquire_dev(&key, "slot-b");
+    assert!(out_b.status.success(), "{}", String::from_utf8_lossy(&out_b.stderr));
+    let slot_b = PathBuf::from(String::from_utf8_lossy(&out_b.stdout).trim().to_string());
+
+    for slot in [&slot_a, &slot_b] {
+        run_git(slot, &["config", "user.email", "t@t"]);
+        run_git(slot, &["config", "user.name", "t"]);
+    }
+    std::fs::write(slot_a.join("A"), b"a\n").unwrap();
+    run_git(&slot_a, &["add", "A"]);
+    run_git(&slot_a, &["commit", "--quiet", "-m", "A"]);
+    std::fs::write(slot_b.join("B"), b"b\n").unwrap();
+    run_git(&slot_b, &["add", "B"]);
+    run_git(&slot_b, &["commit", "--quiet", "-m", "B"]);
+    let slot_b_tip = rev_parse(&slot_b, "HEAD");
+
+    let out = session_cmd_cwd(&slot_a, &["land"]).output().unwrap();
+    assert!(out.status.success(),
+        "slot-a land: stderr={}", String::from_utf8_lossy(&out.stderr));
+    let main_after_a = rev_parse(&main_path, "HEAD");
+
+    let out = session_cmd_cwd(&slot_b, &["land"]).output().unwrap();
+    assert!(out.status.success(),
+        "slot-b land: stderr={}", String::from_utf8_lossy(&out.stderr));
+
+    let parent1 = rev_parse(&main_path, "HEAD^1");
+    let parent2 = rev_parse(&main_path, "HEAD^2");
+    assert_eq!(parent1, main_after_a,
+        "main^1 should be the prior main tip (slot-a's landed work)");
+    assert_eq!(parent2, slot_b_tip,
+        "main^2 should be slot-b's pre-merge tip");
+
+    let log_text = run_git_capture(&main_path, &["log", "--first-parent", "--format=%H"]);
+    assert!(!log_text.contains(&slot_b_tip),
+        "first-parent log should not dive into slot-b history:\n{log_text}");
+
+    let msg_text = run_git_capture(&main_path, &["log", "-1", "--format=%s"]);
+    assert!(msg_text.contains("Merge slot-b into main"),
+        "merge commit message wrong: {msg_text}");
+}
+
+#[test]
 fn session_land_preserves_untracked_in_submodule_on_collision() {
     // Same untracked-clobber bug as the parent-level fix, but at the submodule
     // propagation step (`reset --hard <new_sha>` in main's submodule clone).
