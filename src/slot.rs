@@ -111,28 +111,35 @@ pub fn acquirable_ns(
     Ok(out)
 }
 
-/// Count held slots whose lock's `group` matches `requested_group`. Renamed slots
-/// hide their home N, so this is the only way to budget-check parallel acquires
-/// against `max_slots` (without `slot_id` in the lock).
-pub fn count_held_in_group(
+/// Count slots occupying capacity in `requested_group`. A slot is "occupying"
+/// if its dir is `Renamed` (home N hidden, takes one slot of capacity). Held
+/// slots count toward their lock's group; zombies (Renamed, no/unparseable lock)
+/// have unknown group and count toward EVERY group — conservative but loud, so
+/// over-provisioning surfaces as a capacity error instead of silently growing
+/// the pool past `max_slots`. (`reclaim_stale` runs first under the same mutex
+/// and tries to clear zombies; only the unrecoverable ones reach this count.)
+pub fn count_occupying_in_group(
     pool_root: &Path,
     cfg: &PoolConfig,
     requested_group: Option<&str>,
 ) -> Result<usize> {
     let mut count = 0;
     for entry in enumerate(pool_root, cfg)? {
+        if !matches!(entry.kind, SlotEntryKind::Renamed) {
+            continue;
+        }
         let Ok(gitdir) = git::worktree_gitdir(&entry.path) else {
             continue;
         };
         let lock_path = fs_paths::slot_lock(&gitdir);
         if !lock_path.exists() {
+            count += 1;
             continue;
         }
-        let Ok(lock) = crate::lock::Lock::read(&lock_path) else {
-            continue;
-        };
-        if lock.group.as_deref() == requested_group {
-            count += 1;
+        match crate::lock::Lock::read(&lock_path) {
+            Ok(lock) if lock.group.as_deref() == requested_group => count += 1,
+            Err(_) => count += 1,
+            _ => {}
         }
     }
     Ok(count)

@@ -7,7 +7,7 @@
 1. Resolve `--commit` (default `default_commit` from config) against source repo → full SHA.
 2. Take pool-wide mutex.
 3. If `--unique-sha`, scan held locks for matching `full_sha`; refuse on hit.
-4. Check capacity (`count_held_in_group >= max_slots` → refuse with the slot table inline).
+4. Check capacity (`count_occupying_in_group >= max_slots` → refuse with the slot table inline). Counts every `Renamed` slot — held-with-lock against its lock's group, zombies (no/bad lock) against every group conservatively, so unrecoverable zombies surface as a loud capacity error rather than letting the pool grow past `max_slots`.
 5. Iterate acquirable Ns (fresh + recycled-idle, smallest first). Try per-slot init mutex on each (`O_EXCL`); first success wins. Heartbeat mtime every 30s during init.
 6. Materialize: fresh → `git worktree add --detach <pool>/{group}-N <full_sha>`; recycled → `git -C <slot> reset --hard <full_sha>`. **Never `git clean`** — untracked files are caller's warmth.
 7. Write lock at `<source>/.git/worktrees/<id>/worktree-pool/lock` (atomic; tempfile + rename) — held marker lands BEFORE the rename.

@@ -47,8 +47,8 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> 
 
     // Capacity gate. Renamed slots hide their home N (no `slot_id` in lock) so we
     // can't infer budget from canonical-dir presence alone — count held-in-group locks.
-    let held_in_group = slot::count_held_in_group(pool_root, cfg, group)?;
-    if held_in_group >= cfg.max_slots as usize {
+    let occupying = slot::count_occupying_in_group(pool_root, cfg, group)?;
+    if occupying >= cfg.max_slots as usize {
         let entries = slot::enumerate(pool_root, cfg)?;
         print_capacity_error(pool_root, cfg, group, &entries)?;
         bail!(

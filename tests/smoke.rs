@@ -2065,3 +2065,82 @@ fn release_replay_completes_with_submodules() {
     assert!(sub_branches_after.trim().is_empty(),
         "submodule's feat-sub branch should be cleaned: {sub_branches_after:?}");
 }
+
+/// **Capacity-leak bug** (residual after the lock-last release-recovery overhaul).
+///
+/// Pre-condition: the pool has reached an over-provisioned state — more `Renamed`
+/// dirs on disk than `max_slots`, with at least one zombie that `reclaim_stale`
+/// can't reclaim because every `0..max_slots` canonical-N is already occupied as
+/// an idle dir on disk. The user's pspec pool was in this state.
+///
+/// Bug: `count_held_in_group` only counts slots whose lock is present. An
+/// unrecoverable zombie has no lock, so it's invisible to the capacity check.
+/// Acquire then succeeds past `max_slots`, growing the pool further on every
+/// crash. The fix must count `Renamed` entries (with or without a lock) toward
+/// capacity so over-provisioning surfaces as a loud capacity error.
+#[test]
+fn capacity_check_counts_unrecoverable_zombies() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+
+    // Init with max_slots=2, no groups (matches pspec layout).
+    Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", &key, "init"])
+        .arg("--source").arg(&bare)
+        .args(["--max-slots", "2"])
+        .assert().success();
+
+    // Cycle two acquires + releases to materialize slot-0 and slot-1 as idle
+    // canonical dirs on disk.
+    for name in ["warm-1", "warm-2"] {
+        Command::cargo_bin("worktree-pool")
+            .unwrap()
+            .args(["--pool", &key, "acquire", "--name", name])
+            .output().unwrap();
+    }
+    Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", &key, "release", "--name", "warm-1"])
+        .assert().success();
+    Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", &key, "release", "--name", "warm-2"])
+        .assert().success();
+
+    let pool = pool_root(&key);
+    assert!(pool.join("slot-0").exists(), "slot-0 idle canonical present");
+    assert!(pool.join("slot-1").exists(), "slot-1 idle canonical present");
+
+    // Plant TWO unrecoverable zombies via direct `git worktree add`. With
+    // max_slots=2 and slot-0/slot-1 already on disk as idle canonicals,
+    // `reclaim_stale` can't relocate either zombie — every canonical-N in the
+    // 0..max_slots range is occupied. Pre-existing renamed count = 2 = max.
+    for name in ["z1", "z2"] {
+        StdCommand::new("git")
+            .args(["-C", &bare.display().to_string(),
+                   "worktree", "add", "--detach",
+                   &pool.join(name).display().to_string(), "main"])
+            .status().unwrap();
+    }
+    assert!(pool.join("z1").exists() && pool.join("z2").exists());
+
+    // The bug: pool already has 2 Renamed dirs (z1, z2 zombies). Any acquire
+    // MUST refuse — but pre-fix `count_held_in_group` returns 0 (no locks
+    // anywhere), capacity passes, acquire takes slot-0 and the pool grows to
+    // 3 Renamed dirs, past `max_slots=2`.
+    let out = Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", &key, "acquire", "--name", "fresh-1"])
+        .output().unwrap();
+    assert!(!out.status.success(),
+        "acquire must refuse: 2 unrecoverable zombies (z1, z2) already occupy max_slots=2. \
+         stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("are held") || stderr.contains("in use") || stderr.contains("capacity"),
+        "expected capacity-style error, got: {stderr}");
+}
