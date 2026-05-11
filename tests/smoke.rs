@@ -40,6 +40,29 @@ fn run_git_root(args: &[&str]) {
     StdCommand::new("git").args(args).status().unwrap();
 }
 
+fn assert_ok(out: &std::process::Output, ctx: &str) {
+    if out.status.success() { return; }
+    let sep = if ctx.is_empty() { "" } else { "\n" };
+    panic!("{ctx}{sep}stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr));
+}
+
+// Commits *all* pending changes (`add -A`) — fixtures and slot tests write a
+// single target file in an otherwise-clean tree; tests with stray uncommitted
+// state would silently capture it. Callers do NOT need to `git add` first.
+fn git_commit(cwd: &Path, msg: &str) {
+    let st = StdCommand::new("git").current_dir(cwd).args(["add", "-A"]).status().unwrap();
+    assert!(st.success(), "git add -A failed in {}", cwd.display());
+    let st = StdCommand::new("git")
+        .current_dir(cwd)
+        .args(["commit", "--quiet", "-m", msg])
+        .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+        .status().unwrap();
+    assert!(st.success(), "git commit -m {msg:?} failed in {}", cwd.display());
+}
+
 fn make_fixture(dir: &Path) -> PathBuf {
     let bare = dir.join("source.git");
     run_git_root(&["init", "--quiet", "--bare", &bare.display().to_string()]);
@@ -50,11 +73,8 @@ fn make_fixture(dir: &Path) -> PathBuf {
         &bare.display().to_string(),
         &staging.display().to_string(),
     ]);
-    run_git(&staging, &["config", "user.email", "t@t"]);
-    run_git(&staging, &["config", "user.name", "t"]);
     std::fs::write(staging.join("README"), b"hi").unwrap();
-    run_git(&staging, &["add", "README"]);
-    run_git(&staging, &["commit", "--quiet", "-m", "initial"]);
+    git_commit(&staging, "initial");
     run_git(&staging, &["push", "--quiet", "-u", "origin", "main"]);
     bare
 }
@@ -85,6 +105,15 @@ fn acquire_dev(key: &str, name: &str) -> std::process::Output {
         .unwrap()
 }
 
+fn acquire_dev_sub(key: &str, name: &str) -> std::process::Output {
+    Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", key, "acquire", "--name", name, "--group", "ios"])
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .output()
+        .unwrap()
+}
+
 fn release(key: &str, name: &str) {
     Command::cargo_bin("worktree-pool")
         .unwrap()
@@ -104,7 +133,7 @@ fn full_lifecycle() {
     init_pool(&key, &bare);
 
     let out = acquire_dev(&key, "feat-x");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "");
     let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
     assert!(path.ends_with("/feat-x"));
 
@@ -199,7 +228,7 @@ fn doctor_runs_without_pool() {
         .arg("doctor")
         .output()
         .unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("worktree-pool doctor"));
     assert!(stdout.contains("arch:"));
@@ -285,7 +314,7 @@ fn re_acquire_reuses_recycled_slot() {
 
     // Re-acquire under a different name. Should pick up ios-0 (recycled).
     let out = acquire_dev(&key, "feat-2");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "");
     let new_path = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let new_warm_marker = PathBuf::from(&new_path).join("WARMTH_MARKER");
     assert!(
@@ -455,7 +484,7 @@ fn stale_init_mutex_reclaimed_inline() {
         ])
         .output()
         .unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("reclaiming stale init mutex"),
@@ -654,11 +683,8 @@ fn make_fixture_with_submodule(dir: &Path) -> PathBuf {
         &sub_bare.display().to_string(),
         &sub_staging.display().to_string(),
     ]);
-    run_git(&sub_staging, &["config", "user.email", "t@t"]);
-    run_git(&sub_staging, &["config", "user.name", "t"]);
     std::fs::write(sub_staging.join("FILE"), b"sub-content").unwrap();
-    run_git(&sub_staging, &["add", "FILE"]);
-    run_git(&sub_staging, &["commit", "--quiet", "-m", "sub initial"]);
+    git_commit(&sub_staging, "sub initial");
     run_git(&sub_staging, &["push", "--quiet", "-u", "origin", "main"]);
 
     // Parent source.
@@ -671,8 +697,6 @@ fn make_fixture_with_submodule(dir: &Path) -> PathBuf {
         &bare.display().to_string(),
         &staging.display().to_string(),
     ]);
-    run_git(&staging, &["config", "user.email", "t@t"]);
-    run_git(&staging, &["config", "user.name", "t"]);
     std::fs::write(staging.join("README"), b"hi").unwrap();
     run_git(&staging, &["add", "README"]);
     // Allow `file://` submodule URLs (git 2.38+ disables by default).
@@ -688,7 +712,7 @@ fn make_fixture_with_submodule(dir: &Path) -> PathBuf {
             "sub",
         ],
     );
-    run_git(&staging, &["commit", "--quiet", "-m", "with submodule"]);
+    git_commit(&staging, "with submodule");
     run_git(&staging, &["push", "--quiet", "-u", "origin", "main"]);
     bare
 }
@@ -718,12 +742,7 @@ fn acquire_release_with_submodule_rewires_pointers() {
     init_pool(&key, &bare);
 
     // ---- acquire #1: fresh slot, submodules initialized after rename ----
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
-        .args(["--pool", &key, "acquire", "--name", "feat-1", "--group", "ios"])
-        .env("GIT_ALLOW_PROTOCOL", "file")
-        .output()
-        .unwrap();
+    let out = acquire_dev_sub(&key, "feat-1");
     assert!(
         out.status.success(),
         "acquire #1 failed: {}",
@@ -766,12 +785,7 @@ fn acquire_release_with_submodule_rewires_pointers() {
     );
 
     // ---- acquire #2: recycled slot, rename ios-0 → feat-2 with submodules already there ----
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
-        .args(["--pool", &key, "acquire", "--name", "feat-2", "--group", "ios"])
-        .env("GIT_ALLOW_PROTOCOL", "file")
-        .output()
-        .unwrap();
+    let out = acquire_dev_sub(&key, "feat-2");
     assert!(
         out.status.success(),
         "acquire #2 (recycled) failed: {}",
@@ -806,12 +820,7 @@ fn acquire_branches_submodule_release_cleans_up() {
     init_pool(&key, &bare);
 
     let slot_name = "feat-branch";
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
-        .args(["--pool", &key, "acquire", "--name", slot_name, "--group", "ios"])
-        .env("GIT_ALLOW_PROTOCOL", "file")
-        .output()
-        .unwrap();
+    let out = acquire_dev_sub(&key, slot_name);
     assert!(
         out.status.success(),
         "acquire failed: {}",
@@ -876,11 +885,8 @@ fn make_fixture_with_n_submodules(dir: &Path, n: usize) -> PathBuf {
             &sub_bare.display().to_string(),
             &sub_staging.display().to_string(),
         ]);
-        run_git(&sub_staging, &["config", "user.email", "t@t"]);
-        run_git(&sub_staging, &["config", "user.name", "t"]);
         std::fs::write(sub_staging.join("FILE"), format!("sub{i}-content").as_bytes()).unwrap();
-        run_git(&sub_staging, &["add", "FILE"]);
-        run_git(&sub_staging, &["commit", "--quiet", "-m", "init"]);
+        git_commit(&sub_staging, "init");
         run_git(&sub_staging, &["push", "--quiet", "-u", "origin", "main"]);
         sub_bares.push(sub_bare);
     }
@@ -895,8 +901,6 @@ fn make_fixture_with_n_submodules(dir: &Path, n: usize) -> PathBuf {
         &bare.display().to_string(),
         &staging.display().to_string(),
     ]);
-    run_git(&staging, &["config", "user.email", "t@t"]);
-    run_git(&staging, &["config", "user.name", "t"]);
     std::fs::write(staging.join("README"), b"hi").unwrap();
     run_git(&staging, &["add", "README"]);
     for (i, sub_bare) in sub_bares.iter().enumerate() {
@@ -913,7 +917,7 @@ fn make_fixture_with_n_submodules(dir: &Path, n: usize) -> PathBuf {
             ],
         );
     }
-    run_git(&staging, &["commit", "--quiet", "-m", "with submodules"]);
+    git_commit(&staging, "with submodules");
     run_git(&staging, &["push", "--quiet", "-u", "origin", "main"]);
     bare
 }
@@ -990,7 +994,7 @@ fn release_self_heals_stale_submodule_core_worktree() {
         .args(["--pool", &key, "acquire", "--name", "feat-1", "--group", "ios"])
         .output()
         .unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "");
     let slot = pool_root(&key).join("feat-1");
 
     // Find the submodule's admin config inside source's worktrees admin.
@@ -1107,7 +1111,7 @@ fn session_cmd(key: &str, args: &[&str]) -> StdCommand {
 /// `slot_repo_ok` falsely pass (e.g. dotfiles repo at $HOME).
 fn acquire_then_break(key: &str, name: &str, gitlink_only: bool) -> PathBuf {
     let out = acquire_dev(key, name);
-    assert!(out.status.success(), "acquire failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "acquire failed");
     let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
     assert!(path.exists());
     let gitlink = std::fs::read_to_string(path.join(".git")).expect("read gitlink");
@@ -1244,7 +1248,7 @@ fn session_rm_refuses_broken_slot() {
 /// Returns the slot path.
 fn acquire_then_dirty(key: &str, name: &str) -> PathBuf {
     let out = acquire_dev(key, name);
-    assert!(out.status.success(), "acquire failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "acquire failed");
     let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
     std::fs::write(path.join("README"), b"dirty tracked\n").unwrap();
     std::fs::write(path.join("untracked.txt"), b"new\n").unwrap();
@@ -1281,9 +1285,7 @@ fn session_rm_force_discards_dirty() {
     let path = acquire_then_dirty(&key, "messy");
 
     let out = session_cmd(&key, &["rm", "messy", "--force"]).output().unwrap();
-    assert!(out.status.success(),
-        "rm --force should succeed on dirty slot.\nstdout={}\nstderr={}",
-        String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "rm --force should succeed on dirty slot");
     // The slot is un-renamed back to canonical id (ios-N) — operator namespace cleared.
     assert!(!path.exists(), "operator-named slot dir should be gone after rm --force");
 }
@@ -1301,11 +1303,8 @@ fn session_rm_force_discards_unmerged_branch() {
     let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
 
     // Create a commit on the slot's branch — not in main.
-    run_git(&path, &["config", "user.email", "t@t"]);
-    run_git(&path, &["config", "user.name", "t"]);
     std::fs::write(path.join("CHANGE"), b"new\n").unwrap();
-    run_git(&path, &["add", "CHANGE"]);
-    run_git(&path, &["commit", "--quiet", "-m", "ahead of main"]);
+    git_commit(&path, "ahead of main");
 
     // Without --force: refuse.
     let out = session_cmd(&key, &["rm", "ahead"]).output().unwrap();
@@ -1315,9 +1314,7 @@ fn session_rm_force_discards_unmerged_branch() {
 
     // With --force: succeed.
     let out = session_cmd(&key, &["rm", "ahead", "--force"]).output().unwrap();
-    assert!(out.status.success(),
-        "rm --force should discard unmerged commits.\nstdout={}\nstderr={}",
-        String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "rm --force should discard unmerged commits");
     assert!(!path.exists());
 }
 
@@ -1333,9 +1330,7 @@ fn session_rm_force_accepted_before_positionals() {
 
     let path = acquire_then_dirty(&key, "messy");
     let out = session_cmd(&key, &["rm", "--force", "messy"]).output().unwrap();
-    assert!(out.status.success(),
-        "rm --force <name> should succeed.\nstdout={}\nstderr={}",
-        String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "rm --force <name> should succeed");
     assert!(!path.exists());
 }
 
@@ -1397,15 +1392,12 @@ fn session_land_preserves_untracked_in_main_on_collision() {
     ]);
 
     let out = acquire_dev(&key, "feat");
-    assert!(out.status.success(), "acquire: {}", String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "acquire");
     let slot_path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
 
     // Slot adds tracked COLLIDE.
-    run_git(&slot_path, &["config", "user.email", "t@t"]);
-    run_git(&slot_path, &["config", "user.name", "t"]);
     std::fs::write(slot_path.join("COLLIDE"), b"slot version\n").unwrap();
-    run_git(&slot_path, &["add", "COLLIDE"]);
-    run_git(&slot_path, &["commit", "--quiet", "-m", "add collide"]);
+    git_commit(&slot_path, "add collide");
 
     // Operator scratches at the same path in main worktree (untracked).
     let scratch = b"operator scratch -- must not be lost\n";
@@ -1447,16 +1439,11 @@ fn session_land_advances_main_on_clean_path() {
     assert!(out.status.success());
     let slot_path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
 
-    run_git(&slot_path, &["config", "user.email", "t@t"]);
-    run_git(&slot_path, &["config", "user.name", "t"]);
     std::fs::write(slot_path.join("NEW"), b"slot-added\n").unwrap();
-    run_git(&slot_path, &["add", "NEW"]);
-    run_git(&slot_path, &["commit", "--quiet", "-m", "add new"]);
+    git_commit(&slot_path, "add new");
 
     let out = session_cmd_cwd(&slot_path, &["land"]).output().unwrap();
-    assert!(out.status.success(),
-        "land should succeed; stdout={}\nstderr={}",
-        String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "land should succeed");
 
     // Tree-landed in main implies ref advanced (ff-only is atomic).
     let landed = std::fs::read(main_path.join("NEW")).expect("NEW missing in main");
@@ -1483,17 +1470,12 @@ fn session_land_is_idempotent_on_rerun() {
     let out = acquire_dev(&key, "feat");
     assert!(out.status.success());
     let slot_path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
-    run_git(&slot_path, &["config", "user.email", "t@t"]);
-    run_git(&slot_path, &["config", "user.name", "t"]);
     std::fs::write(slot_path.join("F"), b"f\n").unwrap();
-    run_git(&slot_path, &["add", "F"]);
-    run_git(&slot_path, &["commit", "--quiet", "-m", "f"]);
+    git_commit(&slot_path, "f");
 
     assert!(session_cmd_cwd(&slot_path, &["land"]).output().unwrap().status.success());
     let out = session_cmd_cwd(&slot_path, &["land"]).output().unwrap();
-    assert!(out.status.success(),
-        "second land should no-op cleanly; stdout={}\nstderr={}",
-        String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "second land should no-op cleanly");
 }
 
 #[test]
@@ -1519,32 +1501,24 @@ fn session_land_keeps_first_parent_on_mainline_after_parallel_land() {
         run_git_capture(cwd, &["rev-parse", rev]).trim().to_string();
 
     let out_a = acquire_dev(&key, "slot-a");
-    assert!(out_a.status.success(), "{}", String::from_utf8_lossy(&out_a.stderr));
+    assert_ok(&out_a, "acquire slot-a");
     let slot_a = PathBuf::from(String::from_utf8_lossy(&out_a.stdout).trim().to_string());
     let out_b = acquire_dev(&key, "slot-b");
-    assert!(out_b.status.success(), "{}", String::from_utf8_lossy(&out_b.stderr));
+    assert_ok(&out_b, "acquire slot-b");
     let slot_b = PathBuf::from(String::from_utf8_lossy(&out_b.stdout).trim().to_string());
 
-    for slot in [&slot_a, &slot_b] {
-        run_git(slot, &["config", "user.email", "t@t"]);
-        run_git(slot, &["config", "user.name", "t"]);
-    }
     std::fs::write(slot_a.join("A"), b"a\n").unwrap();
-    run_git(&slot_a, &["add", "A"]);
-    run_git(&slot_a, &["commit", "--quiet", "-m", "A"]);
+    git_commit(&slot_a, "A");
     std::fs::write(slot_b.join("B"), b"b\n").unwrap();
-    run_git(&slot_b, &["add", "B"]);
-    run_git(&slot_b, &["commit", "--quiet", "-m", "B"]);
+    git_commit(&slot_b, "B");
     let slot_b_tip = rev_parse(&slot_b, "HEAD");
 
     let out = session_cmd_cwd(&slot_a, &["land"]).output().unwrap();
-    assert!(out.status.success(),
-        "slot-a land: stderr={}", String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "slot-a land");
     let main_after_a = rev_parse(&main_path, "HEAD");
 
     let out = session_cmd_cwd(&slot_b, &["land"]).output().unwrap();
-    assert!(out.status.success(),
-        "slot-b land: stderr={}", String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "slot-b land");
 
     let parent1 = rev_parse(&main_path, "HEAD^1");
     let parent2 = rev_parse(&main_path, "HEAD^2");
@@ -1583,25 +1557,15 @@ fn session_land_preserves_untracked_in_submodule_on_collision() {
     run_git(&source, &["config", "submodule.sub.ignore", "untracked"]);
     init_pool(&key, &source);
 
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
-        .args(["--pool", &key, "acquire", "--name", "feat", "--group", "ios"])
-        .env("GIT_ALLOW_PROTOCOL", "file")
-        .output().unwrap();
-    assert!(out.status.success(), "acquire: {}", String::from_utf8_lossy(&out.stderr));
+    let out = acquire_dev_sub(&key, "feat");
+    assert_ok(&out, "acquire");
     let slot_path = pool_root(&key).join("feat");
     let slot_sub = slot_path.join("sub");
 
     // Slot adds tracked COLLIDE in submodule, commits, advances parent gitlink.
-    run_git(&slot_sub, &["config", "user.email", "t@t"]);
-    run_git(&slot_sub, &["config", "user.name", "t"]);
     std::fs::write(slot_sub.join("COLLIDE"), b"slot version\n").unwrap();
-    run_git(&slot_sub, &["add", "COLLIDE"]);
-    run_git(&slot_sub, &["commit", "--quiet", "-m", "add collide in sub"]);
-    run_git(&slot_path, &["config", "user.email", "t@t"]);
-    run_git(&slot_path, &["config", "user.name", "t"]);
-    run_git(&slot_path, &["add", "sub"]);
-    run_git(&slot_path, &["commit", "--quiet", "-m", "bump sub"]);
+    git_commit(&slot_sub, "add collide in sub");
+    git_commit(&slot_path, "bump sub");
 
     // Operator scratches at COLLIDE in main's submodule clone (untracked).
     let main_sub = source.join("sub");
@@ -1652,24 +1616,14 @@ fn session_land_recovers_after_submodule_collision_resolved() {
     run_git(&source, &["config", "submodule.sub.ignore", "untracked"]);
     init_pool(&key, &source);
 
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
-        .args(["--pool", &key, "acquire", "--name", "feat", "--group", "ios"])
-        .env("GIT_ALLOW_PROTOCOL", "file")
-        .output().unwrap();
+    let out = acquire_dev_sub(&key, "feat");
     assert!(out.status.success());
     let slot_path = pool_root(&key).join("feat");
     let slot_sub = slot_path.join("sub");
 
-    run_git(&slot_sub, &["config", "user.email", "t@t"]);
-    run_git(&slot_sub, &["config", "user.name", "t"]);
     std::fs::write(slot_sub.join("COLLIDE"), b"slot version\n").unwrap();
-    run_git(&slot_sub, &["add", "COLLIDE"]);
-    run_git(&slot_sub, &["commit", "--quiet", "-m", "add collide"]);
-    run_git(&slot_path, &["config", "user.email", "t@t"]);
-    run_git(&slot_path, &["config", "user.name", "t"]);
-    run_git(&slot_path, &["add", "sub"]);
-    run_git(&slot_path, &["commit", "--quiet", "-m", "bump sub"]);
+    git_commit(&slot_sub, "add collide");
+    git_commit(&slot_path, "bump sub");
 
     let main_sub = source.join("sub");
     std::fs::write(main_sub.join("COLLIDE"), b"scratch\n").unwrap();
@@ -1683,10 +1637,7 @@ fn session_land_recovers_after_submodule_collision_resolved() {
 
     // Second run succeeds.
     let out = session_cmd_cwd(&slot_path, &["land"]).output().unwrap();
-    assert!(out.status.success(),
-        "second land should succeed after collision cleared; \
-         stdout={}\nstderr={}",
-        String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "second land should succeed after collision cleared;");
 
     // Sub + parent both advanced.
     let slot_sub_head = StdCommand::new("git")
@@ -1725,33 +1676,21 @@ fn session_land_attaches_detached_submodule_to_main() {
     let sha = String::from_utf8_lossy(&head_sha.stdout).trim().to_string();
     run_git(&main_sub, &["checkout", "--quiet", "--detach", &sha]);
 
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
-        .args(["--pool", &key, "acquire", "--name", "feat", "--group", "ios"])
-        .env("GIT_ALLOW_PROTOCOL", "file")
-        .output().unwrap();
+    let out = acquire_dev_sub(&key, "feat");
     assert!(out.status.success());
     let slot_path = pool_root(&key).join("feat");
     let slot_sub = slot_path.join("sub");
 
-    run_git(&slot_sub, &["config", "user.email", "t@t"]);
-    run_git(&slot_sub, &["config", "user.name", "t"]);
     std::fs::write(slot_sub.join("NEW"), b"x\n").unwrap();
-    run_git(&slot_sub, &["add", "NEW"]);
-    run_git(&slot_sub, &["commit", "--quiet", "-m", "x"]);
-    run_git(&slot_path, &["config", "user.email", "t@t"]);
-    run_git(&slot_path, &["config", "user.name", "t"]);
-    run_git(&slot_path, &["add", "sub"]);
-    run_git(&slot_path, &["commit", "--quiet", "-m", "bump sub"]);
+    git_commit(&slot_sub, "x");
+    git_commit(&slot_path, "bump sub");
 
     let slot_sub_head = StdCommand::new("git")
         .args(["-C", &slot_sub.display().to_string(), "rev-parse", "HEAD"])
         .output().unwrap();
 
     let out = session_cmd_cwd(&slot_path, &["land"]).output().unwrap();
-    assert!(out.status.success(),
-        "land: stdout={}\nstderr={}",
-        String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "land");
 
     // HEAD must now be on refs/heads/main (re-attached).
     let head_ref = StdCommand::new("git")
@@ -1786,38 +1725,23 @@ fn session_land_attaches_detached_submodule_to_gitmodules_branch() {
     let sha = String::from_utf8_lossy(&head_sha.stdout).trim().to_string();
     run_git(&main_sub, &["branch", "release", &sha]);
     run_git(&source, &["config", "-f", ".gitmodules", "submodule.sub.branch", "release"]);
-    run_git(&source, &["config", "user.email", "t@t"]);
-    run_git(&source, &["config", "user.name", "t"]);
-    run_git(&source, &["add", ".gitmodules"]);
-    run_git(&source, &["commit", "--quiet", "-m", "track release branch for sub"]);
+    git_commit(&source, "track release branch for sub");
     run_git(&source, &["push", "--quiet", "origin", "main"]);
     run_git(&main_sub, &["checkout", "--quiet", "--detach", &sha]);
 
     init_pool(&key, &source);
 
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
-        .args(["--pool", &key, "acquire", "--name", "feat", "--group", "ios"])
-        .env("GIT_ALLOW_PROTOCOL", "file")
-        .output().unwrap();
-    assert!(out.status.success(), "acquire: {}", String::from_utf8_lossy(&out.stderr));
+    let out = acquire_dev_sub(&key, "feat");
+    assert_ok(&out, "acquire");
     let slot_path = pool_root(&key).join("feat");
     let slot_sub = slot_path.join("sub");
 
-    run_git(&slot_sub, &["config", "user.email", "t@t"]);
-    run_git(&slot_sub, &["config", "user.name", "t"]);
     std::fs::write(slot_sub.join("X"), b"x\n").unwrap();
-    run_git(&slot_sub, &["add", "X"]);
-    run_git(&slot_sub, &["commit", "--quiet", "-m", "x"]);
-    run_git(&slot_path, &["config", "user.email", "t@t"]);
-    run_git(&slot_path, &["config", "user.name", "t"]);
-    run_git(&slot_path, &["add", "sub"]);
-    run_git(&slot_path, &["commit", "--quiet", "-m", "bump sub"]);
+    git_commit(&slot_sub, "x");
+    git_commit(&slot_path, "bump sub");
 
     let out = session_cmd_cwd(&slot_path, &["land"]).output().unwrap();
-    assert!(out.status.success(),
-        "land: stdout={}\nstderr={}",
-        String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "land");
 
     let head_ref = StdCommand::new("git")
         .args(["-C", &main_sub.display().to_string(), "symbolic-ref", "HEAD"])
@@ -1841,33 +1765,21 @@ fn session_land_propagates_submodule_to_main() {
     let source = tmp.path().join("staging");
     init_pool(&key, &source);
 
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
-        .args(["--pool", &key, "acquire", "--name", "feat", "--group", "ios"])
-        .env("GIT_ALLOW_PROTOCOL", "file")
-        .output().unwrap();
-    assert!(out.status.success(), "acquire: {}", String::from_utf8_lossy(&out.stderr));
+    let out = acquire_dev_sub(&key, "feat");
+    assert_ok(&out, "acquire");
     let slot_path = pool_root(&key).join("feat");
     let slot_sub = slot_path.join("sub");
 
-    run_git(&slot_sub, &["config", "user.email", "t@t"]);
-    run_git(&slot_sub, &["config", "user.name", "t"]);
     std::fs::write(slot_sub.join("NEW"), b"x\n").unwrap();
-    run_git(&slot_sub, &["add", "NEW"]);
-    run_git(&slot_sub, &["commit", "--quiet", "-m", "x"]);
-    run_git(&slot_path, &["config", "user.email", "t@t"]);
-    run_git(&slot_path, &["config", "user.name", "t"]);
-    run_git(&slot_path, &["add", "sub"]);
-    run_git(&slot_path, &["commit", "--quiet", "-m", "bump sub"]);
+    git_commit(&slot_sub, "x");
+    git_commit(&slot_path, "bump sub");
 
     let slot_sub_head = StdCommand::new("git")
         .args(["-C", &slot_sub.display().to_string(), "rev-parse", "HEAD"])
         .output().unwrap();
 
     let out = session_cmd_cwd(&slot_path, &["land"]).output().unwrap();
-    assert!(out.status.success(),
-        "land: stdout={}\nstderr={}",
-        String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "land");
 
     let main_sub = source.join("sub");
     let main_sub_head = StdCommand::new("git")
@@ -1901,11 +1813,8 @@ fn session_land_refuses_when_main_worktree_on_other_branch() {
     let out = acquire_dev(&key, "feat");
     assert!(out.status.success());
     let slot_path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
-    run_git(&slot_path, &["config", "user.email", "t@t"]);
-    run_git(&slot_path, &["config", "user.name", "t"]);
     std::fs::write(slot_path.join("X"), b"x\n").unwrap();
-    run_git(&slot_path, &["add", "X"]);
-    run_git(&slot_path, &["commit", "--quiet", "-m", "x"]);
+    git_commit(&slot_path, "x");
 
     // `find_main_path` parses `worktree list --porcelain` for `branch refs/heads/main`;
     // after the operator's checkout, that line is gone, so land errors with
@@ -1954,7 +1863,7 @@ fn reclaim_legacy_zombie_at_acquire() {
     init_pool(&key, &bare);
 
     let out = acquire_dev(&key, "feat-zombie");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "");
     let slot = pool_root(&key).join("feat-zombie");
     let gitdir = slot_gitdir_path(&slot);
     std::fs::remove_file(gitdir.join("worktree-pool/lock")).unwrap();
@@ -1964,9 +1873,7 @@ fn reclaim_legacy_zombie_at_acquire() {
     assert!(!gitdir.join("worktree-pool/lock").exists());
 
     let out = acquire_dev(&key, "feat-fresh");
-    assert!(out.status.success(),
-        "acquire must succeed (zombie reclaimed first); stderr={}",
-        String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "acquire must succeed (zombie reclaimed first)");
     assert!(!slot.exists(), "zombie should have been un-renamed away from feat-zombie");
 }
 
@@ -1979,7 +1886,7 @@ fn release_replay_completes_after_slow_ops_crash() {
     init_pool(&key, &bare);
 
     let out = acquire_dev(&key, "feat-half");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "");
     let slot = pool_root(&key).join("feat-half");
     run_git(&slot, &["checkout", "--quiet", "--detach"]);
     run_git(&slot, &["branch", "-D", "feat-half"]);
@@ -1990,7 +1897,7 @@ fn release_replay_completes_after_slow_ops_crash() {
 
     assert!(!slot.exists(), "feat-half dir should be un-renamed by replay");
     let out = acquire_dev(&key, "feat-after");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "");
 }
 
 #[test]
@@ -2002,7 +1909,7 @@ fn reclaim_orphan_lock_after_post_rename_crash() {
     init_pool(&key, &bare);
 
     let out = acquire_dev(&key, "feat-postrename");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "");
     let slot = pool_root(&key).join("feat-postrename");
     let gitdir = slot_gitdir_path(&slot);
 
@@ -2029,9 +1936,7 @@ fn reclaim_orphan_lock_after_post_rename_crash() {
     // And the canonical ios-0 slot is now correctly classified as idle and
     // available — fresh acquire reuses it (recycled-warm path).
     let out = acquire_dev(&key, "feat-after-orphan");
-    assert!(out.status.success(),
-        "acquire after reclaim must succeed; stderr={}",
-        String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "acquire after reclaim must succeed");
     let acquired_path = String::from_utf8_lossy(&out.stdout).trim().to_string();
     assert!(acquired_path.ends_with("/feat-after-orphan"));
 }
@@ -2045,13 +1950,13 @@ fn reclaim_does_not_disturb_live_held_slot() {
     init_pool(&key, &bare);
 
     let out = acquire_dev(&key, "live-1");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "");
     let live_slot = pool_root(&key).join("live-1");
     let live_gitdir = slot_gitdir_path(&live_slot);
     let live_lock_before = std::fs::read(live_gitdir.join("worktree-pool/lock")).unwrap();
 
     let out = acquire_dev(&key, "live-2");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "");
 
     assert!(live_slot.exists(), "live held slot must remain at user-name");
     let live_lock_after = std::fs::read(live_gitdir.join("worktree-pool/lock")).unwrap();
@@ -2073,7 +1978,7 @@ fn reclaim_multiple_legacy_zombies_in_one_sweep() {
 
     for name in ["z1", "z2", "z3"] {
         let out = acquire_dev(&key, name);
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_ok(&out, "");
         let slot = pool_root(&key).join(name);
         let gitdir = slot_gitdir_path(&slot);
         std::fs::remove_file(gitdir.join("worktree-pool/lock")).unwrap();
@@ -2083,9 +1988,7 @@ fn reclaim_multiple_legacy_zombies_in_one_sweep() {
 
     // One sweep (triggered by acquire) must reclaim all three.
     let out = acquire_dev(&key, "fresh");
-    assert!(out.status.success(),
-        "acquire must succeed with three zombies present; stderr={}",
-        String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "acquire must succeed with three zombies present");
 
     for name in ["z1", "z2", "z3"] {
         assert!(!pool_root(&key).join(name).exists(),
@@ -2106,7 +2009,7 @@ fn release_replay_completes_with_submodules() {
     init_pool(&key, &bare);
 
     let out = acquire_dev(&key, "feat-sub");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "");
     let slot = pool_root(&key).join("feat-sub");
 
     // Submodule is initialized; acquire created a `feat-sub` branch in it.
@@ -2194,11 +2097,7 @@ fn over_provisioned_pool_self_heals_via_reclaim() {
         .unwrap()
         .args(["--pool", &key, "acquire", "--name", "fresh-1"])
         .output().unwrap();
-    assert!(out.status.success(),
-        "acquire must succeed after reclaim relocates zombies to surplus N's. \
-         stdout={} stderr={}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "acquire must succeed after reclaim relocates zombies to surplus N's");
     assert!(pool.join("fresh-1").exists());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("released 'z1'") && stderr.contains("released 'z2'"),
@@ -2230,10 +2129,7 @@ fn over_provisioned_pool_self_heals_grouped() {
     let out = Command::cargo_bin("worktree-pool").unwrap()
         .args(["--pool", &key, "acquire", "--name", "fresh-ios", "--group", "ios"])
         .output().unwrap();
-    assert!(out.status.success(),
-        "acquire --group ios must succeed; zombie is recoverable. stdout={} stderr={}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "acquire --group ios must succeed; zombie is recoverable");
     assert!(pool.join("fresh-ios").exists());
 }
 
@@ -2295,10 +2191,7 @@ fn release_unblocks_when_all_canonicals_idle() {
         .unwrap()
         .args(["--pool", &key, "release", "--name", "feat"])
         .output().unwrap();
-    assert!(out.status.success(),
-        "release must succeed in over-provisioned pool. stdout={} stderr={}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr));
+    assert_ok(&out, "release must succeed in over-provisioned pool");
     assert!(!pool.join("feat").exists(), "feat dir should be gone after release");
     assert!(pool.join("slot-2").exists(),
         "released slot should land at slot-2 (smallest free N past the surplus)");
