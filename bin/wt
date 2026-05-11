@@ -635,8 +635,11 @@ cmd_land() {
       git -C "$main_path/$sub" fetch --quiet "$slot_path/$sub" "$branch" 2>/dev/null || true
       main_sub_tip=$(git -C "$main_path/$sub" rev-parse HEAD 2>/dev/null) || continue
       if ! git -C "$main_path/$sub" merge-base --is-ancestor "$main_sub_tip" "$slot_sub_tip" 2>/dev/null; then
-        echo "land: submodule '$sub' diverged — slot tip ${slot_sub_tip:0:7} not reachable from main's clone HEAD ${main_sub_tip:0:7}" >&2
-        echo "  resolve in main: cd $main_path/$sub && git rebase $slot_sub_tip   # or merge if you prefer non-linear history" >&2
+        echo "land: submodule '$sub' diverged — main's clone HEAD ${main_sub_tip:0:7} is not an ancestor of slot tip ${slot_sub_tip:0:7}" >&2
+        echo "  step 12 will need to ff $main_path/$sub to ${slot_sub_tip:0:7}, but main's clone has commits not in that history." >&2
+        echo "  recovery (pick one): " >&2
+        echo "    discard main-side: git -C $main_path/$sub reset --hard ${slot_sub_tip:0:7}   # loses ${main_sub_tip:0:7}" >&2
+        echo "    merge main-side:   git -C $main_path/$sub merge ${slot_sub_tip:0:7}   # then 'git -C $main_path add $sub && git commit' to bump source's gitlink" >&2
         preflight_failed=1
       fi
     done <<< "$moved_preflight"
