@@ -84,6 +84,25 @@ in_progress_marker() {
   done
 }
 
+# If $1 has an in-progress git operation, print a recovery hint to stderr and
+# return 1 (dirty). Returns 0 when clean. Callers OR multiple paths together:
+# `report_in_progress p1 || failed=1; report_in_progress p2 || failed=1`.
+report_in_progress() {
+  local path=$1 marker
+  marker=$(in_progress_marker "$path")
+  [ -z "$marker" ] && return 0
+  local hint
+  case "$marker" in
+    MERGE_HEAD)                hint="git -C $path merge --abort" ;;
+    rebase-merge|rebase-apply) hint="git -C $path rebase --abort" ;;
+    CHERRY_PICK_HEAD)          hint="git -C $path cherry-pick --abort" ;;
+    REVERT_HEAD)               hint="git -C $path revert --abort" ;;
+    *)                         hint="finish or abort the in-progress operation in $path" ;;
+  esac
+  echo "land: in-progress $marker in $path — $hint" >&2
+  return 1
+}
+
 # Echo count of commits in <branch> not in main. '?' on rev-list failure.
 # Returns 1 if the branch ref doesn't exist.
 ahead_count() {
@@ -107,6 +126,85 @@ inside_dir() {
   cwd_real=$(pwd -P)
   root_real=$(cd "$1" && pwd -P)
   [[ "$cwd_real" == "$root_real"/* ]]
+}
+
+# Land lock: per-source mutex serializing `wt land` invocations against the
+# same source repo. Two parallel slots both landing race on `<main>/<sub>` ref
+# updates + main's parent-merge — git's per-ref lockfile catches the worst,
+# but TOCTOU between ancestry-probe and ff is not atomic. One source = one
+# in-flight land; different sources parallelize.
+#
+# Lock file path: `<source>/.git/worktree-pool/land.lock`. Body = bash PID of
+# the holder (operator's shell, not a subcommand). Acquire spins with PID
+# liveness + mtime fallback for crashed holders. Released explicitly on:
+#   - normal completion, and
+#   - conflict-exit at step 6 — operator's pause is potentially long, so we
+#     drop the lock and re-acquire on resume.
+# Both paths use the EXIT trap below so signals + early `exit 1` always clear.
+#
+# Stale threshold = 5 min. Legitimate hold spans seconds (lock → pre-flight →
+# `git merge main`). Anything older is a wedged holder; PID-liveness catches
+# the common case (SIGHUP / SIGKILL / panic) immediately.
+LAND_LOCK_STALE_SECS=300
+LAND_LOCK_MAX_WAIT_S=60
+
+_land_lock_path() {
+  # `--git-common-dir` returns a path relative to the worktree root on non-bare
+  # clones; anchor on $1 so two lands from different cwds resolve to the same
+  # lockfile.
+  local common
+  common=$(git -C "$1" rev-parse --git-common-dir 2>/dev/null) || common=".git"
+  case "$common" in
+    /*) ;;
+    *)  common="$1/$common" ;;
+  esac
+  printf '%s/worktree-pool/land.lock' "$common"
+}
+
+_land_lock_age_secs() {
+  stat -f %m "$1" 2>/dev/null \
+    | awk -v now="$(date +%s)" '{print now - $1}' 2>/dev/null
+}
+
+land_lock_acquire() {
+  local source_path=$1 lockfile waited=0 holder_pid age
+  lockfile=$(_land_lock_path "$source_path")
+  mkdir -p "$(dirname "$lockfile")"
+  while true; do
+    if ( set -o noclobber; printf '%s\n' "$$" > "$lockfile" ) 2>/dev/null; then
+      LAND_LOCK_HELD=$lockfile
+      return 0
+    fi
+    holder_pid=$(awk 'NR==1{print; exit}' "$lockfile" 2>/dev/null)
+    if [ -n "$holder_pid" ] && ! kill -0 "$holder_pid" 2>/dev/null; then
+      echo "land: reclaiming land.lock (holder pid $holder_pid no longer running)" >&2
+      rm -f "$lockfile"
+      continue
+    fi
+    age=$(_land_lock_age_secs "$lockfile")
+    if [ -n "$age" ] && [ "$age" -ge "$LAND_LOCK_STALE_SECS" ]; then
+      echo "land: reclaiming stale land.lock (age ${age}s ≥ ${LAND_LOCK_STALE_SECS}s)" >&2
+      rm -f "$lockfile"
+      continue
+    fi
+    if [ "$waited" -ge "$LAND_LOCK_MAX_WAIT_S" ]; then
+      die "land: land.lock held by pid ${holder_pid:-?} at $lockfile for >${LAND_LOCK_MAX_WAIT_S}s — another land in progress"
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+}
+
+# Refuses to delete if the holder PID isn't ours — guards against stomping a
+# successor that reclaimed our lock mid-run after a PID-liveness false positive.
+land_lock_release() {
+  [ -n "${LAND_LOCK_HELD:-}" ] || return 0
+  local holder
+  holder=$(awk 'NR==1{print; exit}' "$LAND_LOCK_HELD" 2>/dev/null)
+  if [ "$holder" = "$$" ]; then
+    rm -f "$LAND_LOCK_HELD"
+  fi
+  LAND_LOCK_HELD=""
 }
 
 # Find the absolute path of the worktree that has refs/heads/main checked out.
@@ -355,6 +453,20 @@ cmd_land() {
     exit 1
   fi
 
+  # No-op early exit: slot already landed (HEAD ≡ main) and tree is clean. Skip
+  # the lock acquisition, marker scans, and submodule preflight entirely —
+  # operators verifying "did I land?" shouldn't trip refusals from unrelated
+  # in-progress state in main_path or its submodules.
+  if [ -z "$msg" ] && git diff --quiet && git diff --cached --quiet \
+      && [ -z "$(git ls-files --others --exclude-standard)" ]; then
+    local main_sha
+    main_sha=$(git rev-parse main 2>/dev/null || true)
+    if [ -n "$main_sha" ] && [ "$main_sha" = "$(git rev-parse HEAD)" ]; then
+      echo "land: $branch already landed; main at $(git rev-parse --short HEAD)"
+      exit 0
+    fi
+  fi
+
   local untracked
   untracked=$(git ls-files --others --exclude-standard)
   if [ -n "$untracked" ]; then
@@ -366,6 +478,33 @@ cmd_land() {
   local main_path
   main_path=$(find_main_path)
   [ -n "$main_path" ] || die "land: main is not checked out in any worktree"
+
+  # Acquire per-source land.lock before any check that reads main_path's state
+  # — without serialization, two parallel lands race on submodule preflights,
+  # ff targets, and main's ref. EXIT trap releases on every exit path (normal,
+  # die, conflict-exit, SIGHUP/SIGKILL is handled by the next acquirer's
+  # PID-liveness reclaim).
+  land_lock_acquire "$main_path"
+  trap 'land_lock_release' EXIT
+
+  # In-progress check on main worktree + its top-level submodules. Step-8 (slot
+  # → main submodule propagation) and step-9 (parent ff) write to these clones;
+  # an unfinished rebase/merge there would surface as a confusing mid-flow
+  # failure with no precise hint. Refuse early with a per-path recovery hint.
+  # Skip nested (step 8 is top-level only) and skip slot's submodules (step 10
+  # is cosmetic best-effort).
+  local main_marker_failed=0
+  report_in_progress "$main_path" || main_marker_failed=1
+  # Enumerate top-level submodule paths from .gitmodules directly — `git
+  # submodule foreach` recurses into nested by default, and the `--recursive`
+  # flag is value-less (not `--recursive=false`). Reading .gitmodules avoids
+  # the subprocess-per-submodule cost and matches step 8's top-level-only scope.
+  while IFS= read -r sub_path; do
+    [ -n "$sub_path" ] || continue
+    [ -e "$main_path/$sub_path/.git" ] || continue
+    report_in_progress "$main_path/$sub_path" || main_marker_failed=1
+  done < <(git -C "$main_path" config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null | awk '{print $2}')
+  [ "$main_marker_failed" = 0 ] || exit 1
 
   # `merge --ff-only` refuses if untracked files would be overwritten, so
   # untracked content in main is preserved; ignore `??` here when checking
@@ -423,29 +562,89 @@ cmd_land() {
   fi
 
   # Reorder parents on the auto-generated merge so main's first-parent history
-  # stays on mainline (`git merge main` from the slot puts slot tip as first
-  # parent — inverted vs. the conventional "merge feature into main" topology).
-  # Gate: HEAD moved (skip no-op merges) AND first parent == pre-merge slot tip
-  # (skip operator-authored resume commits whose custom message must survive).
-  # Cheap string compare first short-circuits the rev-parse fork on no-ops.
+  # stays on mainline (slot-side `git merge main` puts slot tip as first parent
+  # — inverted vs. "merge feature into main" convention). Applies to operator-
+  # authored resume commits too (same inversion). Tree-identical rewrite — we
+  # preserve message + author + committer identity since no content changed,
+  # only the parent-pointer order. Skip no-ops and octopus merges (commit-tree
+  # -p main -p slot would silently drop parents 3+).
   local post_merge_head
   post_merge_head=$(git rev-parse HEAD)
-  if [ "$post_merge_head" != "$slot_head_pre_merge" ] \
-      && [ "$(git rev-parse HEAD^1)" = "$slot_head_pre_merge" ]; then
-    local main_now new_merge
-    main_now=$(git rev-parse HEAD^2)
-    new_merge=$(git commit-tree "$(git rev-parse HEAD^{tree})" \
-      -p "$main_now" -p "$slot_head_pre_merge" \
-      -m "Merge $branch into main") \
-      || die "land: commit-tree failed while reordering merge parents"
-    git update-ref -m "wt land: reorder merge parents" \
-      "refs/heads/$branch" "$new_merge" "$post_merge_head" \
-      || die "land: update-ref failed while reordering merge parents (raced?)"
+  if [ "$post_merge_head" != "$slot_head_pre_merge" ]; then
+    local parent_count
+    parent_count=$(git rev-list --parents -n1 HEAD | awk '{print NF-1}')
+    if [ "$parent_count" = "2" ]; then
+      local main_now orig_msg orig_author_name orig_author_email orig_author_date
+      local orig_committer_name orig_committer_email orig_committer_date new_merge
+      main_now=$(git rev-parse HEAD^2)
+      orig_msg=$(git log -1 --format=%B HEAD)
+      # Replace the topology-inverted auto-generated message; preserve operator-
+      # authored resume messages verbatim.
+      if [ "$(printf '%s' "$orig_msg" | head -1)" = "Merge main into $branch" ]; then
+        orig_msg="Merge $branch into main"
+      fi
+      orig_author_name=$(git log -1 --format=%an HEAD)
+      orig_author_email=$(git log -1 --format=%ae HEAD)
+      orig_author_date=$(git log -1 --format=%aI HEAD)
+      orig_committer_name=$(git log -1 --format=%cn HEAD)
+      orig_committer_email=$(git log -1 --format=%ce HEAD)
+      orig_committer_date=$(git log -1 --format=%cI HEAD)
+      new_merge=$(GIT_AUTHOR_NAME="$orig_author_name" \
+                  GIT_AUTHOR_EMAIL="$orig_author_email" \
+                  GIT_AUTHOR_DATE="$orig_author_date" \
+                  GIT_COMMITTER_NAME="$orig_committer_name" \
+                  GIT_COMMITTER_EMAIL="$orig_committer_email" \
+                  GIT_COMMITTER_DATE="$orig_committer_date" \
+                  git commit-tree "$(git rev-parse HEAD^{tree})" \
+                    -p "$main_now" -p "$slot_head_pre_merge" -m "$orig_msg") \
+        || die "land: commit-tree failed while reordering merge parents"
+      git update-ref -m "wt land: reorder merge parents" \
+        "refs/heads/$branch" "$new_merge" "$post_merge_head" \
+        || die "land: update-ref failed while reordering merge parents (raced?)"
+      echo "land: normalized merge parents (main first-parent stays on mainline)"
+    fi
   fi
 
   local slot_head slot_path
   slot_head=$(git rev-parse HEAD)
   slot_path=$(git rev-parse --show-toplevel)
+
+  # Submodule ancestry pre-flight. For each top-level submodule whose gitlink
+  # the parent merge moved, fetch the slot's branch into main's clone and
+  # verify the slot's tip is reachable from main's clone HEAD (i.e. the ff
+  # step 8 will do is feasible). Without this, divergent submodule histories
+  # surface mid-propagation at step 8 with parent already at slot_head and a
+  # `merge --ff-only` refusal — recoverable but the error message is generic.
+  # Aggregate all submodules and report once. Fetches are local-only.
+  #
+  # Oracle = clone-tip ancestry (not gitlink ancestry). Gitlinks can move
+  # forwards-and-backwards between main and slot trees independently of the
+  # clone-tip history that ff actually targets.
+  local moved_preflight preflight_failed=0
+  moved_preflight=$(git diff --raw "$main_before" "$slot_head" | awk '$2=="160000" {print $6}')
+  if [ -n "$moved_preflight" ]; then
+    while IFS= read -r sub; do
+      [ -n "$sub" ] || continue
+      [ -e "$slot_path/$sub/.git" ] || continue
+      [ -e "$main_path/$sub/.git" ] || continue
+      local slot_sub_tip main_sub_tip
+      slot_sub_tip=$(git -C "$slot_path/$sub" rev-parse HEAD 2>/dev/null) || continue
+      # Fetch first so main's clone has the slot's tip reachable for the
+      # ancestry probe (and step 8's `merge --ff-only` will reuse the fetched
+      # objects — no double work).
+      git -C "$main_path/$sub" fetch --quiet "$slot_path/$sub" "$branch" 2>/dev/null || true
+      main_sub_tip=$(git -C "$main_path/$sub" rev-parse HEAD 2>/dev/null) || continue
+      if ! git -C "$main_path/$sub" merge-base --is-ancestor "$main_sub_tip" "$slot_sub_tip" 2>/dev/null; then
+        echo "land: submodule '$sub' diverged — slot tip ${slot_sub_tip:0:7} not reachable from main's clone HEAD ${main_sub_tip:0:7}" >&2
+        echo "  resolve in main: cd $main_path/$sub && git rebase $slot_sub_tip   # or merge if you prefer non-linear history" >&2
+        preflight_failed=1
+      fi
+    done <<< "$moved_preflight"
+    if [ "$preflight_failed" != 0 ]; then
+      echo "land: submodule preflight failed — main NOT advanced. Resolve and re-run." >&2
+      exit 1
+    fi
+  fi
 
   # Order: submodule propagation BEFORE parent ff-merge. If propagation fails,
   # parent stays at main_before and re-running land retries cleanly (each
@@ -592,7 +791,7 @@ cmd_land() {
     for pid in "${sub_pids[@]}"; do wait "$pid" || true; done
   fi
 
-  echo "land: $branch merged; main at $(git rev-parse --short HEAD)"
+  echo "land: $branch landed; main at $(git rev-parse --short HEAD)"
 
   # Post-land hook (deps-changed advisory etc). Source hooks from main_path
   # since land runs without a pool key — main_path IS the source repo.

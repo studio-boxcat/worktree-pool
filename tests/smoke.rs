@@ -1537,6 +1537,236 @@ fn session_land_keeps_first_parent_on_mainline_after_parallel_land() {
 }
 
 #[test]
+fn session_land_noop_when_already_landed() {
+    // HEAD == main && clean tree && no untracked + no message → exit 0 silently
+    // without acquiring land.lock or running marker / dirty / preflight scans.
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+    let main_path = tmp.path().join("main-wt");
+    run_git_root(&[
+        "-C", &bare.display().to_string(),
+        "worktree", "add", "--quiet",
+        &main_path.display().to_string(), "main",
+    ]);
+
+    let out = acquire_dev(&key, "feat");
+    assert_ok(&out, "acquire");
+    let slot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+
+    // Slot is at main with clean tree. Land should no-op.
+    let out = session_cmd_cwd(&slot, &["land"]).output().unwrap();
+    assert_ok(&out, "no-op land");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("already landed"),
+        "expected 'already landed' early-exit message, got: {stdout}");
+}
+
+#[test]
+fn session_land_refuses_when_main_submodule_has_in_progress_merge() {
+    // Marker scan must walk top-level submodules, not just main_path. A MERGE_HEAD
+    // inside <main>/<sub> blocks step-8's ff; the scan should refuse with a
+    // recovery hint *before* any state change.
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    make_fixture_with_submodule(tmp.path());
+    let source = tmp.path().join("staging");
+    run_git(&source, &["config", "submodule.sub.ignore", "untracked"]);
+    init_pool(&key, &source);
+    let main_sub = source.join("sub");
+
+    // Induce MERGE_HEAD in <main>/<sub>.
+    std::fs::write(main_sub.join("X"), b"v1\n").unwrap();
+    git_commit(&main_sub, "x v1");
+    run_git(&main_sub, &["checkout", "-b", "side"]);
+    std::fs::write(main_sub.join("X"), b"side\n").unwrap();
+    git_commit(&main_sub, "x side");
+    run_git(&main_sub, &["checkout", "main"]);
+    std::fs::write(main_sub.join("X"), b"main\n").unwrap();
+    git_commit(&main_sub, "x main");
+    let _ = StdCommand::new("git").current_dir(&main_sub)
+        .args(["merge", "--no-edit", "side"]).output().unwrap();
+
+    let out = acquire_dev_sub(&key, "feat");
+    assert_ok(&out, "acquire");
+    let slot = pool_root(&key).join("feat");
+    std::fs::write(slot.join("Y"), b"y\n").unwrap();
+    git_commit(&slot, "y");
+
+    let out = session_cmd_cwd(&slot, &["land"]).output().unwrap();
+    assert!(!out.status.success(), "land should refuse with MERGE_HEAD in <main>/<sub>");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("in-progress MERGE_HEAD") && stderr.contains("/sub")
+            && stderr.contains("merge --abort"),
+        "stderr should name the submodule path + recovery hint, got: {stderr}");
+}
+
+#[test]
+fn session_land_refuses_when_main_has_in_progress_merge() {
+    // Marker scan: an unfinished merge in main_path must be detected pre-flight
+    // with a precise recovery hint (NOT a generic mid-flow failure).
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+    let main_path = tmp.path().join("main-wt");
+    run_git_root(&[
+        "-C", &bare.display().to_string(),
+        "worktree", "add", "--quiet",
+        &main_path.display().to_string(), "main",
+    ]);
+
+    // Create conflicting branches in main_path → induce a merge with MERGE_HEAD
+    // left behind.
+    std::fs::write(main_path.join("X"), b"v1\n").unwrap();
+    git_commit(&main_path, "x v1");
+    run_git(&main_path, &["checkout", "-b", "side"]);
+    std::fs::write(main_path.join("X"), b"side\n").unwrap();
+    git_commit(&main_path, "x side");
+    run_git(&main_path, &["checkout", "main"]);
+    std::fs::write(main_path.join("X"), b"main\n").unwrap();
+    git_commit(&main_path, "x main");
+    // This merge will conflict, leaving MERGE_HEAD.
+    let _ = StdCommand::new("git").current_dir(&main_path)
+        .args(["merge", "--no-edit", "side"]).output().unwrap();
+    assert!(main_path.join(".git/MERGE_HEAD").exists()
+        || run_git_capture(&main_path, &["rev-parse", "--git-path", "MERGE_HEAD"])
+              .lines().next().map_or(false, |p| std::path::Path::new(p).exists()),
+        "fixture failed to leave MERGE_HEAD");
+
+    let out = acquire_dev(&key, "feat");
+    assert_ok(&out, "acquire");
+    let slot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+
+    std::fs::write(slot.join("Y"), b"y\n").unwrap();
+    git_commit(&slot, "y");
+
+    let out = session_cmd_cwd(&slot, &["land"]).output().unwrap();
+    assert!(!out.status.success(), "land should refuse with MERGE_HEAD in main");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("in-progress MERGE_HEAD") && stderr.contains("merge --abort"),
+        "stderr should name the marker + recovery hint, got: {stderr}");
+}
+
+#[test]
+fn session_land_serializes_parallel_lands_on_same_source() {
+    // Two parallel `wt land` invocations on the same source must serialize via
+    // land.lock: both succeed (one waits, then runs), final main contains both
+    // landings. Race without the lock would surface as a noisy mid-flow failure.
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+    let main_path = tmp.path().join("main-wt");
+    run_git_root(&[
+        "-C", &bare.display().to_string(),
+        "worktree", "add", "--quiet",
+        &main_path.display().to_string(), "main",
+    ]);
+
+    let out = acquire_dev(&key, "slot-a");
+    assert_ok(&out, "acquire a");
+    let slot_a = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    let out = acquire_dev(&key, "slot-b");
+    assert_ok(&out, "acquire b");
+    let slot_b = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+
+    std::fs::write(slot_a.join("A"), b"a\n").unwrap();
+    git_commit(&slot_a, "A");
+    std::fs::write(slot_b.join("B"), b"b\n").unwrap();
+    git_commit(&slot_b, "B");
+
+    let barrier = Arc::new(Barrier::new(2));
+    let handles: Vec<_> = [slot_a.clone(), slot_b.clone()]
+        .into_iter()
+        .map(|slot| {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                session_cmd_cwd(&slot, &["land"]).output().unwrap()
+            })
+        })
+        .collect();
+    let outs: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let successes = outs.iter().filter(|o| o.status.success()).count();
+    assert_eq!(successes, 2,
+        "both parallel lands should succeed; failures:\n{}",
+        outs.iter().filter(|o| !o.status.success())
+            .map(|o| format!("stdout={}\nstderr={}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)))
+            .collect::<Vec<_>>().join("\n---\n"));
+
+    // Both landings should be reachable from main.
+    let log = run_git_capture(&main_path, &["log", "--format=%s"]);
+    assert!(log.contains("A") && log.contains("B"),
+        "main should contain both landings; got log:\n{log}");
+}
+
+#[test]
+fn session_land_refreshes_slot_submodule_when_main_brought_advance() {
+    // Step 10 (slot-direction refresh): slot A bumps the submodule + lands,
+    // slot B (branched before A landed) does unrelated parent-side work + lands.
+    // B's parent merge brings in main's new gitlink; B's submodule clone must
+    // be ff'd to match (no phantom rewinds in `git status`), attached to a
+    // branch (not left detached), and the ff must be journaled in reflog.
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    make_fixture_with_submodule(tmp.path());
+    let source = tmp.path().join("staging");
+    run_git(&source, &["config", "submodule.sub.ignore", "untracked"]);
+    init_pool(&key, &source);
+
+    let out = acquire_dev_sub(&key, "slot-a");
+    assert_ok(&out, "acquire slot-a");
+    let slot_a = pool_root(&key).join("slot-a");
+    let out = acquire_dev_sub(&key, "slot-b");
+    assert_ok(&out, "acquire slot-b");
+    let slot_b = pool_root(&key).join("slot-b");
+
+    // Slot A bumps the submodule.
+    std::fs::write(slot_a.join("sub").join("ABUMP"), b"a\n").unwrap();
+    git_commit(&slot_a.join("sub"), "a bumps sub");
+    git_commit(&slot_a, "slot-a parent bumps sub");
+
+    // Slot B does parent-only work (no submodule changes).
+    std::fs::write(slot_b.join("BFILE"), b"b\n").unwrap();
+    git_commit(&slot_b, "slot-b parent only");
+
+    let out = session_cmd_cwd(&slot_a, &["land"]).output().unwrap();
+    assert_ok(&out, "slot-a land");
+    let a_sub_tip = run_git_capture(&slot_a.join("sub"), &["rev-parse", "HEAD"])
+        .trim().to_string();
+
+    let out = session_cmd_cwd(&slot_b, &["land"]).output().unwrap();
+    assert_ok(&out, "slot-b land");
+
+    let slot_b_sub = slot_b.join("sub");
+    let b_sub_head = run_git_capture(&slot_b_sub, &["rev-parse", "HEAD"]).trim().to_string();
+    assert_eq!(b_sub_head, a_sub_tip,
+        "slot-b's submodule HEAD should refresh to slot-a's sub tip");
+
+    let symref = run_git_capture(&slot_b_sub, &["symbolic-ref", "HEAD"]);
+    assert!(symref.starts_with("refs/heads/"),
+        "slot-b's submodule HEAD should be attached (symref), got: {symref:?}");
+
+    let status = run_git_capture(&slot_b, &["status", "--porcelain"]);
+    assert!(!status.lines().any(|l| l.contains(" sub")),
+        "slot-b superproject should not show phantom submodule rewind: {status:?}");
+
+    let reflog = run_git_capture(&slot_b_sub, &["reflog"]);
+    assert!(reflog.contains(&a_sub_tip[..7]),
+        "slot-b's submodule reflog should journal the ff to {} — got: {reflog}",
+        &a_sub_tip[..7]);
+}
+
+#[test]
 fn session_land_preserves_untracked_in_submodule_on_collision() {
     // Same untracked-clobber bug as the parent-level fix, but at the submodule
     // propagation step (`reset --hard <new_sha>` in main's submodule clone).
