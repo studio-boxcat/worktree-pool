@@ -103,6 +103,14 @@ report_in_progress() {
   return 1
 }
 
+# Echo top-level submodule paths from `<repo>/.gitmodules`, one per line. Empty
+# when the repo has no `.gitmodules`. Top-level only — `git submodule foreach`
+# would recurse into nested.
+submodule_paths() {
+  git -C "$1" config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null \
+    | awk '{print $2}'
+}
+
 # Echo count of commits in <branch> not in main. '?' on rev-list failure.
 # Returns 1 if the branch ref doesn't exist.
 ahead_count() {
@@ -475,9 +483,10 @@ cmd_land() {
     exit 1
   fi
 
-  local main_path
+  local main_path slot_path
   main_path=$(find_main_path)
   [ -n "$main_path" ] || die "land: main is not checked out in any worktree"
+  slot_path=$(git rev-parse --show-toplevel)
 
   # Acquire per-source land.lock before any check that reads main_path's state
   # — without serialization, two parallel lands race on submodule preflights,
@@ -495,15 +504,11 @@ cmd_land() {
   # is cosmetic best-effort).
   local main_marker_failed=0
   report_in_progress "$main_path" || main_marker_failed=1
-  # Enumerate top-level submodule paths from .gitmodules directly — `git
-  # submodule foreach` recurses into nested by default, and the `--recursive`
-  # flag is value-less (not `--recursive=false`). Reading .gitmodules avoids
-  # the subprocess-per-submodule cost and matches step 8's top-level-only scope.
   while IFS= read -r sub_path; do
     [ -n "$sub_path" ] || continue
     [ -e "$main_path/$sub_path/.git" ] || continue
     report_in_progress "$main_path/$sub_path" || main_marker_failed=1
-  done < <(git -C "$main_path" config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null | awk '{print $2}')
+  done < <(submodule_paths "$main_path")
   [ "$main_marker_failed" = 0 ] || exit 1
 
   # `merge --ff-only` refuses if untracked files would be overwritten, so
@@ -519,17 +524,73 @@ cmd_land() {
 
   # Auto-commit dirty tracked work. Refuse silent WIP commits.
   if ! git diff --quiet || ! git diff --cached --quiet; then
-    if [ -z "$msg" ]; then
-      echo "land: dirty tracked work needs a commit message:" >&2
-      git status --short >&2
-      echo >&2
-      echo "  wt land \"feat: <what you did>\"" >&2
-      echo "  wt land wip                        # shorthand → 'WIP via land'" >&2
-      exit 1
+    # Pre-stage submodule sync. Stock `git merge` (without --recurse-submodules,
+    # the IDE/`git pull` default) advances the recorded gitlink but leaves the
+    # submodule working dir at the pre-merge SHA. `git add -u` below would then
+    # stage that stale HEAD as the new gitlink — silently regressing the merge.
+    # Per submodule, classify index gitlink vs working HEAD by ancestry:
+    #   working == index → in sync, skip.
+    #   working < index  → post-merge stale; `git submodule update` brings the
+    #                      working dir forward (idempotent; checkout refuses on
+    #                      untracked collision rather than clobbering).
+    #   working > index  → operator's pending forward bump; leave for auto-commit.
+    #   diverged         → refuse; operator resolves.
+    # `protocol.file.allow=always` is required because pool slots' submodule
+    # clones use `file://` origins pointing at the source clone's `.git/modules/...`.
+    local sub_sync_failed=0
+    if [ -f "$slot_path/.gitmodules" ]; then
+      local sub_path sub_index_sha sub_head_sha sub_full
+      while IFS= read -r sub_path; do
+        [ -n "$sub_path" ] || continue
+        sub_full="$slot_path/$sub_path"
+        [ -e "$sub_full/.git" ] || continue
+        sub_index_sha=$(git -C "$slot_path" ls-files -s -- "$sub_path" 2>/dev/null \
+          | awk '$1=="160000" && $3=="0" {print $2; exit}')
+        [ -n "$sub_index_sha" ] || continue
+        sub_head_sha=$(git -C "$sub_full" rev-parse HEAD 2>/dev/null) || continue
+        [ "$sub_index_sha" = "$sub_head_sha" ] && continue
+        # Ensure index SHA is reachable for the ancestry probe. Stock `git merge`
+        # updates the parent's gitlink but doesn't fetch into the submodule clone
+        # — the new SHA may live only in main's submodule clone.
+        if ! git -C "$sub_full" cat-file -e "${sub_index_sha}^{commit}" 2>/dev/null \
+            && [ -e "$main_path/$sub_path/.git" ]; then
+          git -C "$sub_full" fetch --quiet "$main_path/$sub_path" 2>/dev/null || true
+        fi
+        # Forward bump: leave for auto-commit. Behind: sync forward. Else: diverged.
+        if git -C "$sub_full" merge-base --is-ancestor "$sub_index_sha" "$sub_head_sha" 2>/dev/null; then
+          continue
+        fi
+        if git -C "$sub_full" merge-base --is-ancestor "$sub_head_sha" "$sub_index_sha" 2>/dev/null; then
+          echo "land: submodule '$sub_path' working dir ${sub_head_sha:0:7} is behind recorded gitlink ${sub_index_sha:0:7} (post-merge without --recurse-submodules) — running submodule update" >&2
+          if ! git -C "$slot_path" -c protocol.file.allow=always \
+               submodule update --quiet -- "$sub_path"; then
+            echo "land: submodule update failed for '$sub_path' — fix manually and retry:" >&2
+            echo "  git -c protocol.file.allow=always submodule update -- $sub_path" >&2
+            sub_sync_failed=1
+          fi
+          continue
+        fi
+        echo "land: submodule '$sub_path' diverged from recorded gitlink (working ${sub_head_sha:0:7} vs index ${sub_index_sha:0:7} share no ancestor) — refusing to auto-commit a regression." >&2
+        echo "  Resolve manually (e.g. git -c protocol.file.allow=always submodule update -- $sub_path), then re-run land." >&2
+        sub_sync_failed=1
+      done < <(submodule_paths "$slot_path")
     fi
-    [ "$msg" = "wip" ] && msg="WIP via land"
-    git add -u
-    git commit -m "$msg"
+    [ "$sub_sync_failed" = 0 ] || exit 1
+
+    # Re-check dirty state — submodule sync above may have made the tree clean.
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+      if [ -z "$msg" ]; then
+        echo "land: dirty tracked work needs a commit message:" >&2
+        git status --short >&2
+        echo >&2
+        echo "  wt land \"feat: <what you did>\"" >&2
+        echo "  wt land wip                        # shorthand → 'WIP via land'" >&2
+        exit 1
+      fi
+      [ "$msg" = "wip" ] && msg="WIP via land"
+      git add -u
+      git commit -m "$msg"
+    fi
   fi
 
   # Capture pre-merge main for wt_post_land hook, and pre-merge slot HEAD
@@ -605,9 +666,8 @@ cmd_land() {
     fi
   fi
 
-  local slot_head slot_path
+  local slot_head
   slot_head=$(git rev-parse HEAD)
-  slot_path=$(git rev-parse --show-toplevel)
 
   # Submodule ancestry pre-flight. For each top-level submodule whose gitlink
   # the parent merge moved, fetch the slot's branch into main's clone and

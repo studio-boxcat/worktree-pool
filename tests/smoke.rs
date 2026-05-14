@@ -1767,6 +1767,88 @@ fn session_land_refreshes_slot_submodule_when_main_brought_advance() {
 }
 
 #[test]
+fn session_land_syncs_stale_submodule_after_plain_merge() {
+    // Regression: stock `git merge main` (no --recurse-submodules, the default
+    // in every IDE and `git pull`) advances the recorded submodule gitlink but
+    // leaves the slot's submodule working dir at the pre-merge SHA. `wt land`'s
+    // auto-commit step previously ran `git add -u` blind, which staged the
+    // stale working HEAD as the new gitlink — silently regressing the merge.
+    // Step 11's preflight then caught its own corruption and aborted, leaving
+    // a spurious commit and unadvanced main.
+    //
+    // Fix: detect the working-behind-index case before auto-commit and run
+    // `git submodule update` to bring the working dir forward. Then auto-commit
+    // sees a clean tree (or only legit changes) and skips the spurious commit.
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    make_fixture_with_submodule(tmp.path());
+    let source = tmp.path().join("staging");
+    run_git(&source, &["config", "submodule.sub.ignore", "untracked"]);
+    init_pool(&key, &source);
+
+    let out = acquire_dev_sub(&key, "feat");
+    assert_ok(&out, "acquire");
+    let slot_path = pool_root(&key).join("feat");
+
+    // Advance main's submodule gitlink: commit in main's submodule clone,
+    // then commit the gitlink advance in main's parent.
+    let main_sub = source.join("sub");
+    std::fs::write(main_sub.join("MAIN_BUMP"), b"main-bump\n").unwrap();
+    git_commit(&main_sub, "main bumps sub");
+    git_commit(&source, "main parent bumps sub");
+    let main_new_gitlink = run_git_capture(&main_sub, &["rev-parse", "HEAD"])
+        .trim().to_string();
+
+    // Slot does parent-only work (no submodule changes) so the upcoming merge
+    // creates a real merge commit rather than fast-forwarding.
+    std::fs::write(slot_path.join("SLOT_FILE"), b"slot\n").unwrap();
+    git_commit(&slot_path, "slot work");
+
+    // Stock `git merge` — does NOT update the submodule working dir. The
+    // recorded gitlink advances to main's new SHA; the slot's submodule clone
+    // HEAD stays at the original.
+    let st = StdCommand::new("git")
+        .args(["merge", "--no-edit", "main"])
+        .current_dir(&slot_path)
+        .status().unwrap();
+    assert!(st.success(), "git merge main in slot");
+
+    // Pre-condition: stale working HEAD, advanced index.
+    let slot_sub = slot_path.join("sub");
+    let stale_head = run_git_capture(&slot_sub, &["rev-parse", "HEAD"]).trim().to_string();
+    assert_ne!(stale_head, main_new_gitlink,
+        "pre-condition: slot's sub working HEAD should still be at the pre-merge SHA");
+    let recorded_after_merge = run_git_capture(&slot_path, &["ls-tree", "HEAD", "sub"])
+        .split_whitespace().nth(2).unwrap_or("").to_string();
+    assert_eq!(recorded_after_merge, main_new_gitlink,
+        "pre-condition: slot's recorded gitlink should equal main's new gitlink");
+
+    // wt land with NO message — without the fix this would refuse with
+    // "dirty tracked work needs a commit message" (the stale-sub mismatch
+    // shows up as dirty). With the fix, the sub sync clears the dirt and
+    // land proceeds without an auto-commit.
+    let out = session_cmd_cwd(&slot_path, &["land"]).output().unwrap();
+    assert_ok(&out, "land on stale-submodule state");
+
+    // Main's recorded gitlink must equal main_new_gitlink (no regression).
+    let main_recorded_after_land = run_git_capture(&source, &["ls-tree", "HEAD", "sub"])
+        .split_whitespace().nth(2).unwrap_or("").to_string();
+    assert_eq!(main_recorded_after_land, main_new_gitlink,
+        "main's recorded gitlink must not regress after land");
+
+    // No spurious "WIP via land" or similar regression auto-commit.
+    let log = run_git_capture(&source, &["log", "--format=%s", "-n", "10"]);
+    assert!(!log.contains("WIP via land"),
+        "land must not produce a regression auto-commit; log:\n{log}");
+
+    // Slot's sub working HEAD now matches the recorded gitlink (sub-sync ran).
+    let synced_head = run_git_capture(&slot_sub, &["rev-parse", "HEAD"]).trim().to_string();
+    assert_eq!(synced_head, main_new_gitlink,
+        "slot's sub working HEAD should have been ff'd forward by the pre-stage sync");
+}
+
+#[test]
 fn session_land_preserves_untracked_in_submodule_on_collision() {
     // Same untracked-clobber bug as the parent-level fix, but at the submodule
     // propagation step (`reset --hard <new_sha>` in main's submodule clone).
