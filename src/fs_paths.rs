@@ -30,6 +30,15 @@ pub fn slot_lock(worktree_gitdir: &Path) -> PathBuf {
     worktree_gitdir.join("worktree-pool/lock")
 }
 
+/// Sticky pool-ownership marker, sibling to `slot_lock`. Written once at
+/// `acquire` time, never deleted by `release`/`reclaim_stale`/cleanup. Its
+/// presence is the positive signal that the slot dir was ever pool-acquired
+/// — without it, `reclaim_stale` would silently absorb manually-`git worktree
+/// add`-ed dirs and destructively un-rename them. See `release::reclaim_stale`.
+pub fn slot_created_marker(worktree_gitdir: &Path) -> PathBuf {
+    worktree_gitdir.join("worktree-pool/created")
+}
+
 /// `$WORKTREE_ROOT`. Panics with a clear message if the var is unset — every
 /// pool path is anchored here, so silent fallback would mis-locate state.
 pub fn worktree_root() -> PathBuf {

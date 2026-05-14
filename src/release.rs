@@ -138,8 +138,36 @@ fn release_tail(
 /// Runs under the pool mutex at the start of every acquire/release so it never
 /// races live mutators. Best-effort: failures log and continue.
 /// See [[lifecycle.md#crash-recovery]] for the state table this implements.
+///
+/// **Provenance gate.** A `(Renamed, no lock)` slot is only treated as a legacy
+/// zombie when the sticky `created` marker is present (proves it was once
+/// pool-acquired). Without the marker — manual `git worktree add`, scratch dir,
+/// or hand-deleted lock+marker — we leave it alone with a single warn. The
+/// marker is co-written at acquire and never removed by release/reclaim/cleanup.
+///
+/// **Migration.** Pre-fix pools have lock files but no marker. Before classifying,
+/// auto-stamp the marker on any slot whose lock is present (lock presence proves
+/// pool ownership — only `acquire` writes locks). Pre-fix `(Renamed, no lock)`
+/// zombies have lost provenance and must be cleared via `wt rm --force`.
 pub fn reclaim_stale(pool_root: &Path, cfg: &PoolConfig) -> Result<()> {
     let entries = slot::enumerate(pool_root, cfg)?;
+
+    // Migration pass: stamp marker on any locked-but-unmarked slot. Idempotent.
+    for entry in &entries {
+        let Ok(gitdir) = git::worktree_gitdir(&entry.path) else { continue };
+        let lock_path = fs_paths::slot_lock(&gitdir);
+        let marker_path = fs_paths::slot_created_marker(&gitdir);
+        if lock_path.exists() && !marker_path.exists() {
+            eprintln!("reclaim_stale: stamping legacy pool marker on '{}'", entry.name);
+            if let Err(e) = std::fs::write(
+                &marker_path,
+                "# worktree-pool slot provenance marker — do not delete\n",
+            ) {
+                eprintln!("warn: stamping marker {}: {e:#}", marker_path.display());
+            }
+        }
+    }
+
     for entry in entries {
         let gitdir = match git::worktree_gitdir(&entry.path) {
             Ok(g) => g,
@@ -149,11 +177,20 @@ pub fn reclaim_stale(pool_root: &Path, cfg: &PoolConfig) -> Result<()> {
             }
         };
         let lock_path = fs_paths::slot_lock(&gitdir);
+        let marker_path = fs_paths::slot_created_marker(&gitdir);
         let lock_present = lock_path.exists();
         match (&entry.kind, lock_present) {
             (slot::SlotEntryKind::Renamed, false) => {
+                if !marker_path.exists() {
+                    eprintln!(
+                        "reclaim_stale: '{}' (renamed dir, no lock, no pool marker) \
+                         — not pool-owned; leaving untouched. Recover with `wt rm --force {}` if intended.",
+                        entry.name, entry.name
+                    );
+                    continue;
+                }
                 eprintln!(
-                    "reclaim_stale: legacy zombie '{}' (renamed dir, no lock) — completing release",
+                    "reclaim_stale: legacy zombie '{}' (renamed dir, no lock, marker present) — completing release",
                     entry.name
                 );
                 if let Err(e) = release_tail(pool_root, cfg, &entry.path, &entry.name) {

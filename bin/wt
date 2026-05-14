@@ -369,6 +369,20 @@ cmd_go() {
 
   inside_dir "$POOL_ROOT" && die "refusing to nest — already inside a pool slot."
 
+  # Non-TTY guard. The launcher (`ai` / `claude`) needs an interactive terminal;
+  # without one it exits in <1s, the EXIT trap fires, and a fresh+clean slot
+  # silently 🟢-recycles — operator sees nothing useful happen. Refuse early
+  # with a clear message. Override via `WT_GO_ALLOW_NOTTY=1` for CI/scripts
+  # that drive `wt go` non-interactively (rare; usually `worktree-pool acquire`
+  # is the right primitive).
+  if [ -z "${WT_GO_ALLOW_NOTTY:-}" ] && { [ ! -t 0 ] || [ ! -t 1 ]; }; then
+    die "go: no TTY on stdin/stdout — launcher would misfire and the EXIT trap \
+would silently recycle the slot.
+  Common cause: running \`wt go\` from inside an existing AI session.
+  For non-interactive automation use \`worktree-pool acquire\` directly, or set \
+WT_GO_ALLOW_NOTTY=1."
+  fi
+
   # If a slot with this name already exists, resume it instead of acquiring.
   # Warn loudly — `--from` and other acquire flags are ignored on resume
   # (slot stays at its existing commit). A dir whose `.git` gitlink is missing
@@ -393,11 +407,16 @@ Recover with: rm -rf $(printf '%q' "$path"), then re-run."
     fi
   fi
 
-  # EXIT trap. Always invokes `wt cleanup`; project-specific extras are layered
-  # via wt_pre_cleanup / wt_post_cleanup hooks instead of replacing the trap.
-  # $WT_* expands at trap-fire time so the trap sees the right slot.
-  export WT_KEY="$POOL_KEY" WT_NAME="$name"
-  trap "'$0' --pool \"\$WT_KEY\" cleanup \"\$WT_NAME\"" EXIT
+  # EXIT trap → `wt _exit_handler`. Handler decides between (a) the misfire-
+  # preserve 🟡 path (fresh + clean + launcher exited <LAUNCH_MISFIRE_SECS),
+  # which leaves the slot personalized for inspection, and (b) the normal
+  # `wt cleanup` path. Without (a), launcher misfires (no TTY, missing PATH,
+  # crashed pre-launch hook) silently 🟢-recycle a slot that never ran a
+  # session — destroying the diagnostic surface.
+  # `WT_LAUNCH_START` is filled in just before the launcher exec; absence
+  # means we never reached the launcher, so the handler treats it as misfire.
+  export WT_KEY="$POOL_KEY" WT_NAME="$name" WT_FRESH="" WT_LAUNCH_START=""
+  trap "'$0' --pool \"\$WT_KEY\" _exit_handler \"\$WT_NAME\"" EXIT
 
   printf '\n──── session: %s/%s @ %s ────\n\n' "$POOL_KEY" "$name" "$path"
 
@@ -424,19 +443,65 @@ For save/restore around tests use commit + soft-reset instead: \
 
   # `set +e` for the subshell so a non-zero exit doesn't trip cmd_go's `set -e`
   # before we can print the misfire warning below.
-  local launch_start launch_dur
-  launch_start=${EPOCHSECONDS:-$(date +%s)}
+  # WT_LAUNCH_START exported into the EXIT trap env: its presence proves we
+  # reached the launcher; the handler reads it to compute launch_dur.
+  export WT_FRESH="$fresh"
+  export WT_LAUNCH_START=${EPOCHSECONDS:-$(date +%s)}
   set +e
   (cd "$path" && exec "${SHELL:-zsh}" -ic "$cmd")
   set -e
-  launch_dur=$(( ${EPOCHSECONDS:-$(date +%s)} - launch_start ))
+  local launch_dur=$(( ${EPOCHSECONDS:-$(date +%s)} - WT_LAUNCH_START ))
 
   if [ "$launch_dur" -lt "$LAUNCH_MISFIRE_SECS" ] && [ "$existing" = 0 ]; then
     local Y='' X=''
     [ -t 2 ] && { Y=$'\e[33m'; X=$'\e[0m'; }
-    printf '%s⚠ launcher (%s) exited after %ss — likely misfired (auth, env, missing TTY, or %s not on PATH).\n  Slot will be auto-recycled by the EXIT trap. Re-run after fixing, or use `%s rm --force %s` if you need a clean retry.%s\n' \
-      "$Y" "$launcher" "$launch_dur" "$launcher" "${0##*/}" "$name" "$X" >&2
+    printf '%s⚠ launcher (%s) exited after %ss — likely misfired (auth, env, missing TTY, or %s not on PATH).%s\n' \
+      "$Y" "$launcher" "$launch_dur" "$launcher" "$X" >&2
   fi
+}
+
+# EXIT-trap target installed by `cmd_go`. Decides whether to preserve the slot
+# (🟡 misfire path) or delegate to `cmd_cleanup` (normal path).
+#
+# Misfire preserve fires when ALL of:
+#   - WT_FRESH=1 (this acquire created the slot; resumes never recycle silently)
+#   - launcher exited fast (< LAUNCH_MISFIRE_SECS) OR never started (WT_LAUNCH_START empty)
+#   - working tree is clean (no porcelain output)
+#   - no commits ahead of main
+# In that case we print a 🟡 line and return without recycling. Otherwise we
+# tail-call cmd_cleanup. Always exits 0.
+cmd__exit_handler() {
+  local name="${1:-}"
+  [ -n "$name" ] || exit 0
+
+  local path="$POOL_ROOT/$name"
+  if [ ! -d "$path" ] || ! slot_repo_ok "$path"; then
+    # Dir gone or broken — defer to cleanup, which has the existing recovery messaging.
+    exec "$0" --pool "$POOL_KEY" cleanup "$name"
+  fi
+
+  if [ "${WT_FRESH:-}" = "1" ]; then
+    local now dur=999
+    now=${EPOCHSECONDS:-$(date +%s)}
+    [ -n "${WT_LAUNCH_START:-}" ] && dur=$(( now - WT_LAUNCH_START ))
+
+    local porcelain ahead
+    porcelain=$(git -C "$path" status --porcelain 2>/dev/null || true)
+    ahead=0
+    if a=$(ahead_count "$path" "$name"); then ahead="$a"; fi
+
+    if [ "$dur" -lt "$LAUNCH_MISFIRE_SECS" ] \
+       && [ -z "$porcelain" ] && [ "$ahead" = "0" ]; then
+      local Y='' X=''
+      [ -t 2 ] && { Y=$'\e[33m'; X=$'\e[0m'; }
+      printf '%s🟡 launcher misfire: slot %s/%s left in place (ran %ss < %ss, fresh acquire, tree clean).\n   Inspect: %s go %s   |   Discard: %s rm --force %s%s\n' \
+        "$Y" "$POOL_KEY" "$name" "$dur" "$LAUNCH_MISFIRE_SECS" \
+        "${0##*/}" "$name" "${0##*/}" "$name" "$X" >&2
+      exit 0
+    fi
+  fi
+
+  exec "$0" --pool "$POOL_KEY" cleanup "$name"
 }
 
 # Land slot's commits onto local main: auto-commit dirty work, ff main → slot HEAD.
@@ -931,16 +996,75 @@ cmd_cleanup() {
   fi
 }
 
+# Run `cleanup` on every held slot in the pool. Operator-driven; not invoked
+# automatically. Catches orphans whose EXIT trap never fired (killed shell,
+# detached-HEAD slots whose branch was hand-deleted, manual worktree adds).
+# Always exits 0 — same trap-friendly contract as cleanup itself.
+#
+# **Concurrency.** Not serialized against parallel `wt go`s. Safe because
+# (a) cleanup→rm→`worktree-pool release` takes the pool mutex per-slot, and
+# (b) new acquires draw from the idle canonical namespace (`slot-N` /
+# `{group}-N`), never from user-renamed names sweep is iterating. A racing
+# operator-driven `wt rm` of a slot sweep is about to clean up just makes
+# cleanup's "already recycled" path fire — harmless.
+cmd_sweep() {
+  [ $# -eq 0 ] || die "sweep takes no arguments"
+
+  # Held slot names are column 3 of `worktree-pool ls` rows where col 2 == "held".
+  local out names
+  out=$(worktree-pool --pool "$POOL_KEY" ls)
+  names=$(printf '%s\n' "$out" | awk 'NR>2 && $2=="held" {print $3}')
+  if [ -z "$names" ]; then
+    echo "(no held slots to sweep)"
+    return 0
+  fi
+
+  local total=0 recycled=0 left=0 vanished=0 name before
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    total=$((total + 1))
+    # Detect recycle by dir disappearance — cleanup itself always exits 0,
+    # so we can't read its exit code, and parsing its colored output is brittle.
+    before=1
+    [ -d "$POOL_ROOT/$name" ] || before=0
+    "$0" --pool "$POOL_KEY" cleanup "$name"
+    if [ "$before" = 0 ]; then
+      vanished=$((vanished + 1))
+    elif [ ! -d "$POOL_ROOT/$name" ]; then
+      recycled=$((recycled + 1))
+    else
+      left=$((left + 1))
+    fi
+  done <<< "$names"
+
+  if [ "$vanished" = 0 ]; then
+    printf -- '── sweep: %d slot(s), %d recycled, %d left in place ──\n' \
+      "$total" "$recycled" "$left"
+  else
+    printf -- '── sweep: %d slot(s), %d recycled, %d left in place, %d vanished mid-sweep ──\n' \
+      "$total" "$recycled" "$left" "$vanished"
+  fi
+}
+
 cmd_rm() {
   set -e
   # Pre-parse `--force` / `-f` so it can appear before or after positionals.
   # `--force` skips the work-preservation safety (dirty + unmerged); the
   # ghost-dir guard remains because release physically can't run without git
   # state — broken slots need explicit `rm -rf`, not --force.
-  local force=0 args=() arg
+  # Reject other `--*` flags so a typo (`--name foo`) doesn't get silently
+  # treated as a slot named `--name`. `--` is end-of-options for slot names
+  # that begin with `-` (rare but valid via `worktree-pool acquire --name`).
+  local force=0 args=() arg seen_endopts=0
   for arg in "$@"; do
+    if [ "$seen_endopts" = 1 ]; then
+      args+=("$arg")
+      continue
+    fi
     case "$arg" in
+      --)         seen_endopts=1 ;;
       --force|-f) force=1 ;;
+      --*|-*)     die "rm: unknown flag '$arg' — usage: wt rm <name> [--force|-f]" ;;
       *)          args+=("$arg") ;;
     esac
   done
@@ -1047,8 +1171,24 @@ cmd_ls() {
   # across held rows. STATE is constant after the held-only filter, NAME == ID
   # for held slots (renamed at acquire), and GROUP is interesting only when
   # multiple groups have held slots. Use `worktree-pool ls` for the full table.
+  #
+  # Defaults `--git-status` on (BRANCH/DIRTY/UNTRK/AHEAD): the dev-session
+  # wrapper is almost always asked "what state are my slots in?", and one
+  # `git status --porcelain` per held slot is cheap. `--bare` opts out for
+  # cold caches or very large slot dirs.
+  local bare=0 forward=()
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --bare)        bare=1 ;;
+      --git-status)  ;;  # already on by default; accept for back-compat
+      *)             forward+=("$arg") ;;
+    esac
+  done
+  [ "$bare" = 0 ] && forward=(--git-status ${forward[@]+"${forward[@]}"})
+
   local out held
-  out=$(worktree-pool --pool "$POOL_KEY" ls "$@")
+  out=$(worktree-pool --pool "$POOL_KEY" ls ${forward[@]+"${forward[@]}"})
   held=$(printf '%s\n' "$out" | awk 'NR>2 && $2=="held"')
   if [ -z "$held" ]; then
     echo "(no held slots)"
@@ -1095,6 +1235,155 @@ cmd_info() {
   exec worktree-pool --pool "$POOL_KEY" inspect --name "$name" "$@"
 }
 
+# ---------- help ----------
+
+# Per-verb usage. `wt help [verb]` and `wt <verb> --help` route here. Each
+# block mirrors the contract in docs/wt.md so the CLI is self-documenting
+# without requiring the operator to grep markdown.
+print_help() {
+  local verb="${1:-}"
+  case "$verb" in
+    init)
+      cat <<'EOF'
+wt [--pool <key>] init [--max-slots <n>] [pool-init-flags...]
+
+Initialize a pool. --source inferred from `git rev-parse --show-toplevel`,
+--pool from its basename. --max-slots defaults to 16. All other flags pass
+through to `worktree-pool init` (e.g. --groups ios,android).
+Refuses from inside an existing pool slot.
+EOF
+      ;;
+    path)
+      cat <<'EOF'
+wt [--pool <key>] path <name>
+
+Print the absolute slot path. Exit 0 if slot exists, 1 if not, 2 on error.
+Lets scripts branch on resume vs. fresh acquire.
+EOF
+      ;;
+    go)
+      cat <<'EOF'
+wt [--pool <key>] go <name> [--from <commit-ish>] [pool-acquire-flags...]
+
+Acquire (or resume) a slot, cd into it, launch $WT_LAUNCHER (default `ai`)
+with `-n <name>`, and set an EXIT trap that runs `wt cleanup`. On resume,
+acquire flags are ignored — slot stays at its existing commit; the launcher
+is invoked with --continue.
+
+  --from <ref>   fork from <commit-ish> (passed as --commit to acquire)
+EOF
+      ;;
+    rm)
+      cat <<'EOF'
+wt [--pool <key>] rm <name> [--force|-f]
+
+Manual safety-checked release. Refuses on dirty working tree or commits not
+in main; refuses 🔴 BROKEN slots (recover via `rm -rf`).
+  --force / -f   discard dirty tracked changes and unmerged commits
+EOF
+      ;;
+    cleanup)
+      cat <<'EOF'
+wt [--pool <key>] cleanup <name>
+
+EXIT-trap classifier (always exits 0). Markers:
+  🟢 clean + 0 ahead local main → un-rename + delete branch + release
+  🟡 dirty / untracked          → leave personalized; resume with `wt go`
+  🔴 UNMERGED                    → operator resolves before recycling
+  🔴 BROKEN                      → slot dir has no valid .git; rm -rf to recover
+EOF
+      ;;
+    sweep)
+      cat <<'EOF'
+wt [--pool <key>] sweep
+
+Run `cleanup` over every held slot in the pool. Catches orphans whose
+EXIT trap never fired (detached HEAD with deleted branch, killed shell,
+manual `git worktree add`-then-abandon, etc.). Prints a per-slot marker
+and a final tally. Always exits 0.
+EOF
+      ;;
+    ls)
+      cat <<'EOF'
+wt [--pool <key>] ls [--bare]
+
+Show held slots only (use `worktree-pool ls` for full table including idle).
+By default includes git status columns: BRANCH, DIRTY, UNTRK, AHEAD —
+`(detached)` or a non-name branch in BRANCH flags slots that won't recycle
+on cleanup, AHEAD>0 flags unmerged.
+  --bare        skip the per-slot git status calls (faster)
+EOF
+      ;;
+    info)
+      cat <<'EOF'
+wt [--pool <key>] info <name>
+
+Pass-through to `worktree-pool inspect --name <n>` with the inferred pool
+key prefilled. Prints lock state + git status -sb + recent log.
+EOF
+      ;;
+    land)
+      cat <<'EOF'
+wt land [message]
+
+Local-only fast-forward of slot's commits onto local `main`. Auto-commits
+dirty tracked work using <message> (refuses if dirty without one; `wip`
+shorthand → `WIP via land`). Bidirectional submodule sync. Never fetches,
+pushes, or opens a PR. Operates on cwd's slot; no pool key needed.
+See docs/wt.md §Land flow for the full step list.
+EOF
+      ;;
+    whoami)
+      cat <<'EOF'
+wt whoami
+
+Print cwd context for AI-agent bootstrap: `worktree <path>`,
+`source <path>`, or `none`. Path uses `~` for $HOME. Always exits 0.
+EOF
+      ;;
+    orient)
+      cat <<'EOF'
+wt orient
+
+Print current repo's toplevel path followed by its CLAUDE.md. Refuses if
+not inside a git repo. Intended for AI-agent session bootstrap.
+EOF
+      ;;
+    ""|help|-h|--help)
+      cat <<'EOF'
+wt — dev-session wrapper around `worktree-pool`.
+
+Pool lifecycle:
+  init     initialize a pool (run from inside the source repo)
+  go       acquire/resume a slot and launch a session
+  rm       safety-checked release of a slot
+  cleanup  classifier invoked by `go`'s EXIT trap (🟢/🟡/🔴)
+  sweep    run cleanup over every held slot
+
+Inspection:
+  path     print absolute slot path; exit code = exists predicate
+  ls       held slots + git status (BRANCH/DIRTY/UNTRK/AHEAD)
+  info     full slot inspection (lock + status + log)
+
+Workflow:
+  land     ff slot's commits onto local main (no push, no PR)
+
+Bootstrap:
+  whoami   cwd context (worktree|source|none)
+  orient   print current repo + its CLAUDE.md
+
+Pool-key auto-resolution: --pool inferred from cwd (slot or source repo).
+Override with --pool <key> / -p <key> before the verb.
+
+Per-verb help:  wt help <verb>   (or wt <verb> --help)
+EOF
+      ;;
+    *)
+      die "no help for unknown verb '$verb'"
+      ;;
+  esac
+}
+
 # ---------- dispatch ----------
 
 POOL_KEY=""
@@ -1109,16 +1398,34 @@ while [ $# -gt 0 ]; do
 done
 
 verb="${1:-}"; shift || true
+
+# Top-level help: `wt`, `wt --help`, `wt -h`, `wt help [verb]`.
+case "$verb" in
+  ""|--help|-h) print_help ""; exit 0 ;;
+  help)         print_help "${1:-}"; exit 0 ;;
+esac
+
+# Per-verb help: `wt <verb> --help` / `-h` anywhere in args. Routes before the
+# subcommand sees the args, so `--help` can't get treated as a positional
+# (e.g. `wt cleanup --help` was previously parsed as a slot named `--help`).
+for arg in "$@"; do
+  case "$arg" in
+    --help|-h) print_help "$verb"; exit 0 ;;
+  esac
+done
+
 case "$verb" in
   init)    cmd_init    "$@" ;;
   path)    require_pool; cmd_path    "$@" ;;
   go)      require_pool; cmd_go      "$@" ;;
   land)    cmd_land    "$@" ;;
   cleanup) require_pool; cmd_cleanup "$@" ;;
+  _exit_handler) require_pool; cmd__exit_handler "$@" ;;
+  sweep)   require_pool; cmd_sweep   "$@" ;;
   rm)      require_pool; cmd_rm      "$@" ;;
   orient)  cmd_orient  "$@" ;;
   whoami)  cmd_whoami  "$@" ;;
   ls)      require_pool; cmd_ls      "$@" ;;
   info)    require_pool; cmd_info    "$@" ;;
-  *)       die "usage: ${0##*/} [--pool <key>] {init|path|go|cleanup|rm|ls|info} ... | land [message] | whoami | orient" ;;
+  *)       die "unknown verb '$verb'. Run \`${0##*/} help\` for the full list." ;;
 esac

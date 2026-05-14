@@ -119,6 +119,7 @@ struct Row {
     group: String,
     age: String,
     full_sha: String,
+    branch: String,
     dirty: String,
     untracked: String,
     ahead: String,
@@ -134,6 +135,7 @@ impl Row {
             group: group.unwrap_or_else(|| "-".into()),
             age: "-".into(),
             full_sha: "-".into(),
+            branch: "-".into(),
             dirty: "-".into(),
             untracked: "-".into(),
             ahead: "-".into(),
@@ -190,6 +192,7 @@ fn build_row(entry: &slot::SlotEntry) -> Result<Row> {
         group,
         age,
         full_sha,
+        branch: "-".into(),
         dirty: "-".into(),
         untracked: "-".into(),
         ahead: "-".into(),
@@ -201,6 +204,16 @@ fn augment_with_git(row: &mut Row) -> Result<()> {
     if row.path.as_os_str().is_empty() {
         return Err(anyhow!("no path"));
     }
+    // Branch name (or `(detached)` when HEAD isn't on a branch — e.g. operator
+    // ran `git checkout <sha>` or hand-deleted the slot's branch). Detached
+    // slots still recycle on cleanup but flag them so operators can spot the
+    // anomaly without running `wt info` per slot.
+    let (ok, branch, _) = git::run_lenient(&row.path, &["symbolic-ref", "-q", "--short", "HEAD"])?;
+    row.branch = if ok && !branch.trim().is_empty() {
+        branch.trim().to_string()
+    } else {
+        "(detached)".into()
+    };
     let (ok, porcelain, _) = git::run_lenient(&row.path, &["status", "--porcelain"])?;
     if ok {
         let mut dirty = 0u32;
@@ -249,7 +262,7 @@ fn state_order(s: &State) -> u8 {
 fn print_table(rows: &[Row], with_git: bool) {
     let mut headers = vec!["ID", "STATE", "NAME", "GROUP", "AGE", "SHA"];
     if with_git {
-        headers.extend(["DIRTY", "UNTRK", "AHEAD"]);
+        headers.extend(["BRANCH", "DIRTY", "UNTRK", "AHEAD"]);
     }
     let cells: Vec<Vec<String>> = rows
         .iter()
@@ -263,7 +276,12 @@ fn print_table(rows: &[Row], with_git: bool) {
                 r.full_sha.clone(),
             ];
             if with_git {
-                row.extend([r.dirty.clone(), r.untracked.clone(), r.ahead.clone()]);
+                row.extend([
+                    r.branch.clone(),
+                    r.dirty.clone(),
+                    r.untracked.clone(),
+                    r.ahead.clone(),
+                ]);
             }
             row
         })

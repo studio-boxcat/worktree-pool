@@ -24,7 +24,7 @@ worktree-pool --pool myapp release --name abc12345
 
 # Inspect
 worktree-pool --pool myapp ls
-worktree-pool --pool myapp ls --git-status     # adds dirty/untracked/ahead columns
+worktree-pool --pool myapp ls --git-status     # adds branch/dirty/untracked/ahead columns
 worktree-pool --pool myapp inspect --name abc12345
 ```
 

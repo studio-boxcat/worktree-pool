@@ -1101,6 +1101,9 @@ fn session_cmd(key: &str, args: &[&str]) -> StdCommand {
         .args(args)
         .env("PATH", new_path);
     cmd.env("SHELL", "/usr/bin/true");
+    // Tests run without a TTY; bypass cmd_go's TTY guard so we exercise the
+    // launcher-misfire and ghost-slot paths it protects.
+    cmd.env("WT_GO_ALLOW_NOTTY", "1");
     cmd
 }
 
@@ -2367,8 +2370,10 @@ fn materialize_idle_canonicals(key: &str, group: Option<&str>, names: &[&str]) {
 }
 
 /// Plant an unrecoverable-zombie shape at `<pool>/<name>` via direct
-/// `git worktree add --detach` — produces a Renamed dir with no lock at its
-/// gitdir and detached HEAD, exactly the shape `reclaim_stale` would handle.
+/// `git worktree add --detach` plus a pool-ownership marker — simulates a
+/// crashed acquire/release (lock removed but the slot was once pool-owned).
+/// Without the marker, `reclaim_stale` correctly refuses to absorb the dir
+/// (it'd be indistinguishable from a manual `git worktree add`).
 fn plant_zombie(bare: &Path, pool: &Path, name: &str) {
     let st = StdCommand::new("git")
         .args(["-C", &bare.display().to_string(),
@@ -2376,6 +2381,15 @@ fn plant_zombie(bare: &Path, pool: &Path, name: &str) {
                &pool.join(name).display().to_string(), "main"])
         .status().unwrap();
     assert!(st.success(), "plant_zombie: `git worktree add` failed for {name}");
+
+    // Resolve the gitdir via the gitlink the worktree just created.
+    let gitlink = std::fs::read_to_string(pool.join(name).join(".git")).unwrap();
+    let gitdir = std::path::PathBuf::from(
+        gitlink.trim().trim_start_matches("gitdir:").trim()
+    );
+    let marker = gitdir.join("worktree-pool/created");
+    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    std::fs::write(&marker, "# planted by test\n").unwrap();
 }
 
 /// Over-provisioned state — every `0..max_slots` canonical-N is occupied as
@@ -2524,4 +2538,103 @@ fn release_unblocks_when_all_canonicals_idle() {
         .count();
     assert!(pool_dir_count <= 3,
         "pool should not grow past pre-acquire size (3 dirs); got {pool_dir_count}");
+}
+
+// ---------- pool-ownership marker tests (provenance gate) ----------
+
+/// Resolve `<gitdir>/worktree-pool/created` for a slot at `<pool>/<name>`.
+fn marker_for(pool: &Path, name: &str) -> PathBuf {
+    let gitlink = std::fs::read_to_string(pool.join(name).join(".git")).unwrap();
+    let gitdir = PathBuf::from(gitlink.trim().trim_start_matches("gitdir:").trim());
+    gitdir.join("worktree-pool/created")
+}
+
+/// `acquire` writes both lock and marker. `release` removes the lock but
+/// preserves the marker — provenance is sticky once stamped.
+#[test]
+fn acquire_writes_marker_and_release_preserves_it() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let out = acquire_dev(&key, "feat-x");
+    assert_ok(&out, "acquire feat-x");
+
+    let pool = pool_root(&key);
+    let marker = marker_for(&pool, "feat-x");
+    assert!(marker.exists(), "acquire should stamp marker at {}", marker.display());
+
+    release(&key, "feat-x");
+
+    // Post-release the slot is back at canonical ios-0; marker must follow the gitdir.
+    let canonical_marker = marker_for(&pool, "ios-0");
+    assert!(canonical_marker.exists(),
+        "marker must persist past release at {}", canonical_marker.display());
+}
+
+/// Manual `git worktree add` under the pool root must NOT be silently
+/// absorbed by reclaim_stale. Pre-fix, this destroyed the operator's branch
+/// and un-renamed the dir on the next acquire from any session.
+#[test]
+fn reclaim_stale_skips_unmanaged_renamed_dir() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let pool = pool_root(&key);
+    // Plant a manual worktree (no marker — operator bypassed `acquire`).
+    let st = StdCommand::new("git")
+        .args(["-C", &bare.display().to_string(),
+               "worktree", "add",
+               &pool.join("manual-feat").display().to_string()])
+        .status().unwrap();
+    assert!(st.success(), "manual git worktree add failed");
+
+    // Trigger reclaim_stale via an unrelated acquire.
+    let out = acquire_dev(&key, "real-feat");
+    assert_ok(&out, "acquire of real-feat must succeed alongside unmanaged dir");
+
+    assert!(pool.join("manual-feat").exists(),
+        "unmanaged dir must NOT be absorbed by reclaim_stale");
+    assert!(pool.join("real-feat").exists(), "real acquire succeeded");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not pool-owned") && stderr.contains("manual-feat"),
+        "reclaim_stale should warn about the unmanaged dir; stderr={stderr}");
+}
+
+/// Migration path: pre-fix pools have lock files but no marker. The
+/// auto-stamp pass at the start of reclaim_stale should write the marker
+/// for any slot whose lock proves pool ownership.
+#[test]
+fn reclaim_stale_auto_stamps_marker_on_legacy_locked_slot() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let out = acquire_dev(&key, "legacy");
+    assert_ok(&out, "acquire legacy");
+
+    let pool = pool_root(&key);
+    let marker = marker_for(&pool, "legacy");
+    assert!(marker.exists(), "precondition: marker present after acquire");
+
+    // Simulate a pre-fix pool: hand-delete the marker, leaving the lock.
+    std::fs::remove_file(&marker).unwrap();
+    assert!(!marker.exists(), "marker removed");
+
+    // Trigger reclaim_stale via an unrelated acquire.
+    let out = acquire_dev(&key, "fresh");
+    assert_ok(&out, "acquire fresh must trigger reclaim_stale migration");
+
+    assert!(marker.exists(), "reclaim_stale should auto-stamp the marker on the legacy locked slot");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("stamping legacy pool marker") && stderr.contains("legacy"),
+        "auto-stamp should be logged; stderr={stderr}");
 }

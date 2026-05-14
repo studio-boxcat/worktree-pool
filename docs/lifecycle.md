@@ -38,21 +38,27 @@ The on-disk encoding is built so any crash leaves a state that the next `acquire
 - **acquire** writes the lock BEFORE the rename. A crash before the rename leaves the slot at canonical `{group}-N` with lock + detached HEAD; a crash after the rename but before `checkout_force_branch` leaves it at user-name with lock + detached HEAD. Both are reachable by reclaim (canonical case via the HEAD-detached disambiguator; user-name case via re-running `release --name <user-name>`).
 - **release** removes the lock AFTER the un-rename. A crash before the rename leaves the slot at user-name with lock present (every step replayable); a crash between rename and lock removal leaves an orphan lock at canonical (reclaim disambiguates by HEAD state and removes it).
 
+**Pool-ownership marker.** A sticky file at `<source>/.git/worktrees/<id>/worktree-pool/created` is co-written with the lock at `acquire` time and **never removed** (release/reclaim/cleanup all leave it). Its presence is the positive signal "this gitdir was once pool-acquired." Without it, `reclaim_stale` would silently absorb any `(Renamed dir, no lock)` it sees — including manual `git worktree add`s and operator-scratch dirs that happen to share a name. The marker turns that case into a loud refusal. See `fs_paths::slot_created_marker` and `release::reclaim_stale`.
+
 **`reclaim_stale` rules.**
 
-| dir name | lock | HEAD | meaning | action |
-|---|---|---|---|---|
-| renamed | present | any | held (or release crashed mid-slow-ops) | leave; replay if user re-runs `release` |
-| renamed | absent | any | **legacy zombie** (pre-fix release crash) | replay release tail directly: detach, delete branch, `worktree_rename` to canonical |
-| canonical | present | on branch | live held (or acquire crashed late) | leave |
-| canonical | present | detached | **post-rename orphan lock** (release crashed late) | remove lock |
-| canonical | absent | any | idle | leave |
+| dir name | lock | marker | HEAD | meaning | action |
+|---|---|---|---|---|---|
+| renamed | present | any | any | held (or release crashed mid-slow-ops) | leave; replay if user re-runs `release` |
+| renamed | absent | **present** | any | **legacy zombie** (pre-fix release crash) | replay release tail: detach, delete branch, `worktree_rename` to canonical |
+| renamed | absent | **absent** | any | **unmanaged dir** (manual `git worktree add`, hand-deleted lock+marker) | leave untouched, log warn — operator clears via `wt rm --force` |
+| canonical | present | any | on branch | live held (or acquire crashed late) | leave |
+| canonical | present | any | detached | **post-rename orphan lock** (release crashed late) | remove lock |
+| canonical | absent | any | any | idle | leave |
 
-The HEAD-detached check is the disambiguator: a live held slot is on its branch (`acquire::checkout_force_branch`); a canonical-named dir with detached HEAD never reached that step (or reached it then was undone by release). See `slot::is_post_release_orphan`.
+The HEAD-detached check is the disambiguator for the canonical-with-lock row: a live held slot is on its branch (`acquire::checkout_force_branch`); a canonical-named dir with detached HEAD never reached that step (or reached it then was undone by release). See `slot::is_post_release_orphan`.
 
-**One residual mode still needs operator action:**
+**Migration from pre-marker pools.** Pools created before the provenance marker have lock files but no marker. At the start of every `reclaim_stale`, an idempotent auto-stamp pass writes the marker on any slot whose lock is present — lock presence proves pool ownership (only `acquire` writes locks). Pre-fix `(Renamed, no lock)` zombies have already lost provenance and fall into the **unmanaged dir** row above; clear them with `wt rm --force <name>` once.
+
+**Residual modes still needing operator action:**
 
 - **Ghost dir** (`.git` gitlink missing or dangling — typically from a half-completed `worktree remove` whose working-tree rm couldn't finish, e.g. an IDE holding a file open): no git state to reach the slot through. `wt go/cleanup/rm` all detect this and refuse with `🔴 BROKEN` (see [[wt.md#cleanup-classifier]]). Recover with `rm -rf <slot-path>`.
+- **Unmanaged dir** (the row above): pool refuses to touch it, but the dir continues to occupy a name slot. `wt rm --force <name>` releases through the normal path; alternatively `git worktree remove <slot>` then `rm -rf <slot>` for non-pool worktrees.
 
 ## Mutex liveness
 

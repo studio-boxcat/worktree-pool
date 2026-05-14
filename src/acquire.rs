@@ -119,6 +119,21 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> 
     lock.write(&lock_path)
         .with_context(|| format!("writing lock {}", lock_path.display()))?;
 
+    // Sticky pool-ownership marker. Written once, never removed by release/
+    // reclaim_stale/cleanup. Its presence is the positive signal that this
+    // gitdir was ever pool-acquired — without it `reclaim_stale` would absorb
+    // any (Renamed dir, no lock) it sees, including manually-`git worktree
+    // add`-ed dirs and operator-scratch dirs that happen to share a name.
+    let marker_path = fs_paths::slot_created_marker(&gitdir);
+    if !marker_path.exists()
+        && let Err(e) = std::fs::write(
+            &marker_path,
+            "# worktree-pool slot provenance marker — do not delete\n",
+        )
+    {
+        eprintln!("warn: writing pool marker {}: {e:#}", marker_path.display());
+    }
+
     // Rename `{group}-N → <name>` and create the branch.
     let target_path = pool_root.join(&args.name);
     git::worktree_rename(&cfg.source, &canonical_path, &target_path)

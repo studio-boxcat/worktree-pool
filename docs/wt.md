@@ -10,11 +10,13 @@ wt [--pool <key>] path    <name>     # print slot path; exit 0 if exists, 1 if n
 wt [--pool <key>] go      <name> [--from <commit-ish>] [pool-acquire-flags...]
 wt [--pool <key>] rm      <name> [--force]   # safety-checked release; --force discards dirty/unmerged
 wt [--pool <key>] cleanup <name>     # 🟢/🟡/🔴 exit-trap classifier
-wt [--pool <key>] ls      [--git-status]
+wt [--pool <key>] sweep              # run cleanup over every held slot in the pool
+wt [--pool <key>] ls      [--bare]   # held slots + git status (BRANCH/DIRTY/UNTRK/AHEAD); --bare skips git calls
 wt [--pool <key>] info    <name>
 wt land   [message]                  # ff slot's commits onto local main (local-only; no push, no PR)
 wt whoami                            # cwd context: worktree|source|none + path
 wt orient                            # print current repo path + CLAUDE.md
+wt help   [verb]                     # per-verb usage; also `wt <verb> --help`
 ```
 
 **Pool-key auto-resolution.** `--pool` is optional; `wt` infers the key from cwd:
@@ -26,7 +28,9 @@ This means inside `~/Develop/myapp` (the source repo), or inside any slot of tha
 
 `init` is a thin pass-through to `worktree-pool init` that auto-infers `--source` from `git rev-parse --show-toplevel` and `--pool` from its basename. Run it from inside the source repo: `wt init --groups ios,android` (no need to type `--pool myapp --source ~/Develop/myapp`; `--max-slots` defaults to 16, override with `--max-slots <n>`). Override the inferred key with `wt --pool <key> init ...`. All other init flags pass through unchanged. Refuses from inside an existing pool slot (toplevel would resolve to the slot, not the source).
 
-`go` acquires/resumes a slot, prints a banner, `cd`s into the slot, runs `$WT_LAUNCHER -n <name>` (default `ai`) in `$SHELL`, and sets an EXIT trap that runs `wt cleanup`. The `-n <name>` is claude's session display name (visible in the prompt box, `/resume` picker, terminal title); assumes the configured launcher accepts it.
+`go` acquires/resumes a slot, prints a banner, `cd`s into the slot, runs `$WT_LAUNCHER -n <name>` (default `ai`) in `$SHELL`, and sets an EXIT trap that runs an internal handler (which delegates to `wt cleanup` in the normal case, or preserves the slot on launcher misfire — see [§Cleanup classifier](#cleanup-classifier)). The `-n <name>` is claude's session display name (visible in the prompt box, `/resume` picker, terminal title); assumes the configured launcher accepts it.
+
+**TTY guard.** `go` refuses early if stdin or stdout isn't a TTY. The launcher (`ai` / `claude`) needs an interactive terminal; without one it exits in <1s and the EXIT trap would silently 🟢-recycle a fresh slot — destroying the diagnostic surface. Common cause: running `wt go` from inside an existing AI session. For non-interactive automation use `worktree-pool acquire` directly, or set `WT_GO_ALLOW_NOTTY=1` to bypass the guard.
 
 `--from <commit-ish>` (optional) forks the new branch from the given ref; translated to `acquire --commit <X>`. Omit to use the pool's `default_commit`. If a slot with `<name>` already exists, `go` resumes it with a loud warning (acquire flags are ignored on resume — slot stays at its existing commit); the underlying `ai` is invoked with `--continue`. Use `rm` first if you want to recreate from scratch.
 
@@ -34,7 +38,9 @@ This means inside `~/Develop/myapp` (the source repo), or inside any slot of tha
 
 `path` is the predicate query — prints `$WORKTREE_ROOT/<key>/<name>` on stdout (always, when key + pool are valid) and exits 0 if the slot exists, 1 if it doesn't, 2 on usage / pool-not-initialized. Lets consumer scripts branch on resume vs. fresh acquire (`if wt path … >/dev/null; then …`) without re-stitching the pool-root path themselves. Pattern matches `git rev-parse --git-dir`, `brew --prefix`, `pyenv prefix`.
 
-`ls` filters `worktree-pool ls` to held slots only — operators almost always want "what's active right now," not idle capacity. `--git-status` is forwarded. Use `worktree-pool ls` directly for the full table including idle rows. `info` is a pass-through to `worktree-pool inspect --name <n>` with the inferred pool key prefilled.
+`ls` filters `worktree-pool ls` to held slots only — operators almost always want "what's active right now," not idle capacity. `--git-status` is **on by default** (BRANCH/DIRTY/UNTRK/AHEAD columns) — the dev-session wrapper is almost always asked "what state are my slots in?", and one `git status --porcelain` per held slot is cheap. `--bare` opts out for cold caches or very large slot dirs. The `BRANCH` column reads `(detached)` when HEAD isn't on a branch (operator ran `git checkout <sha>` or hand-deleted the slot's branch); detached slots still recycle on cleanup but the column flags the anomaly without `wt info`. Use `worktree-pool ls` directly for the full table including idle rows. `info` is a pass-through to `worktree-pool inspect --name <n>` with the inferred pool key prefilled.
+
+`sweep` runs `cleanup` over every held slot in the pool — same classifier semantics, applied in a loop, with a final tally. Operator-driven (not automatic). Catches orphans whose EXIT trap never fired: a killed shell, a slot whose branch was hand-deleted (now detached HEAD with 0 ahead → 🟢 recycle), or a manual `git worktree add` that bypassed `wt go`. Always exits 0 — same trap-friendly contract as `cleanup` itself.
 
 `land` takes no pool key — it operates on the current worktree's repo and finds the main worktree via `git worktree list`. See [§Land flow](#land-flow) below.
 
@@ -83,10 +89,11 @@ Always exits 0 — it's an exit-trap target, so `wt go`'s exit trap doesn't mudd
 |---|---|---|
 | 🟢 | clean working tree AND 0 commits ahead local `main` | un-rename + delete branch + release (recycle) |
 | 🟡 | dirty / untracked files | leave personalized — resume with `wt go` later |
+| 🟡 misfire | fresh acquire AND launcher exited in <`LAUNCH_MISFIRE_SECS` (default 3) AND tree clean AND 0 ahead | leave in place; suggests `wt go <name>` to retry, `wt rm --force <name>` to discard. Fired by the EXIT-trap handler before delegating to cleanup; preserves the slot when no real session ran. |
 | 🔴 UNMERGED | non-zero commits ahead local `main` (unmerged) | loud refuse — operator resolves before recycling |
 | 🔴 BROKEN | slot dir exists but `<slot>/.git` is missing or dangling (ghost dir from partial cleanup debris) | loud refuse — operator recovers via `rm -rf` (the dir is unrecoverable as a worktree; nothing of value lives in `.git`-less debris) |
 
-Re-running `wt go <name>` resumes any 🟡 / 🔴 UNMERGED slot. 🔴 BROKEN slots can't be resumed — `go` and `rm` both refuse them.
+Re-running `wt go <name>` resumes any 🟡 / 🟡 misfire / 🔴 UNMERGED slot. 🔴 BROKEN slots can't be resumed — `go` and `rm` both refuse them.
 
 ## Land flow
 
