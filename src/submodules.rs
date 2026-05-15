@@ -227,55 +227,25 @@ fn update_recursive(
         // tree, so they don't fight for the same lockfile. The follow-on
         // `checkout_force_branch` writes only to the submodule's own gitdir
         // (refs/heads/<n> + HEAD) — no contention with sibling threads.
-        std::thread::scope(|scope| -> Result<()> {
-            let handles: Vec<_> = included
-                .iter()
-                .map(|e| {
-                    scope.spawn(move || -> Result<()> {
-                        git::run_with_config(
-                            dir,
-                            &[("protocol.file.allow", "always")],
-                            &["submodule", "update", &e.path],
-                        )
-                        .map(drop)
-                        .with_context(|| {
-                            format!("submodule update {} in {}", e.path, dir.display())
-                        })?;
-                        let sub_path = dir.join(&e.path);
-                        git::checkout_force_branch(&sub_path, branch_name).with_context(
-                            || {
-                                format!(
-                                    "creating branch '{}' in submodule {}",
-                                    branch_name,
-                                    sub_path.display()
-                                )
-                            },
-                        )
-                    })
-                })
-                .collect();
-            let mut first_err: Option<anyhow::Error> = None;
-            for h in handles {
-                match h.join() {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        if first_err.is_none() {
-                            first_err = Some(e);
-                        } else {
-                            eprintln!("(also) {e:#}");
-                        }
-                    }
-                    Err(_) => {
-                        if first_err.is_none() {
-                            first_err = Some(anyhow::anyhow!("submodule update thread panicked"));
-                        }
-                    }
-                }
-            }
-            if let Some(e) = first_err {
-                return Err(e);
-            }
-            Ok(())
+        // Inline-fallback on OS thread-create failure: see `parallel` module.
+        crate::parallel::try_for_each(&included, |e| {
+            git::run_with_config(
+                dir,
+                &[("protocol.file.allow", "always")],
+                &["submodule", "update", &e.path],
+            )
+            .map(drop)
+            .with_context(|| {
+                format!("submodule update {} in {}", e.path, dir.display())
+            })?;
+            let sub_path = dir.join(&e.path);
+            git::checkout_force_branch(&sub_path, branch_name).with_context(|| {
+                format!(
+                    "creating branch '{}' in submodule {}",
+                    branch_name,
+                    sub_path.display()
+                )
+            })
         })?;
     }
 
@@ -323,14 +293,11 @@ pub fn delete_branch_recursive(dir: &Path, branch_name: &str) {
         return;
     }
 
-    std::thread::scope(|scope| {
-        for e in &entries {
-            let sub_path = dir.join(&e.path);
-            scope.spawn(move || {
-                let _ = git::checkout_detach(&sub_path);
-                let _ = git::branch_delete(&sub_path, branch_name);
-            });
-        }
+    // Inline-fallback on OS thread-create failure: see `parallel` module.
+    crate::parallel::for_each(&entries, |e| {
+        let sub_path = dir.join(&e.path);
+        let _ = git::checkout_detach(&sub_path);
+        let _ = git::branch_delete(&sub_path, branch_name);
     });
 
     for e in &entries {

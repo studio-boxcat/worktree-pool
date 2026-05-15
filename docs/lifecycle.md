@@ -14,7 +14,7 @@
 8. Rename via `fs::rename` + `git worktree repair` (`git worktree move` refuses on slots with submodules — see `git.rs::worktree_rename`). Also rewrites every submodule admin's `core.worktree` (anchored on the pool-key segment, idempotent self-heal).
 9. Force-create branch: `git -C <pool>/<name> update-ref refs/heads/<name> HEAD && symbolic-ref HEAD refs/heads/<name>`. (Avoids `git checkout -B`'s 600ms of per-file filter-process pings on a tree that's already at the right state.)
 10. Drop pool-wide mutex (slot is now visibly held under user-name; submodule init below is per-slot work guarded by the still-held init mutex).
-11. Submodule update, two-phase to dodge `<source>/.git/config` lockfile contention: (a) sequential `git config submodule.<name>.url` writes per submodule, applying URL overrides per pool config; (b) parallel per-submodule `git submodule update <path>` via `std::thread::scope`, then in the same thread `update-ref refs/heads/<name> HEAD && symbolic-ref HEAD refs/heads/<name>` to attach the submodule to a branch matching the parent slot's name (gives commits a push-ready label and a stable ref for `wt land` to fetch by — see [[wt.md#land-flow]]). Recursive into nested submodules with the same branch name. Tag exclusion via `--exclude-submodule-tags` against `worktreePoolTag` in `.gitmodules`.
+11. Submodule update, two-phase to dodge `<source>/.git/config` lockfile contention: (a) sequential `git config submodule.<name>.url` writes per submodule, applying URL overrides per pool config; (b) parallel per-submodule `git submodule update <path>` via `parallel::try_for_each` (inline-fallback on OS thread-create failure — see `parallel.rs`), then in the same thread `update-ref refs/heads/<name> HEAD && symbolic-ref HEAD refs/heads/<name>` to attach the submodule to a branch matching the parent slot's name (gives commits a push-ready label and a stable ref for `wt land` to fetch by — see [[wt.md#land-flow]]). Recursive into nested submodules with the same branch name. Tag exclusion via `--exclude-submodule-tags` against `worktreePoolTag` in `.gitmodules`.
 12. Release init mutex; print path on stdout (last line).
 
 ## `release`
@@ -23,7 +23,7 @@
 2. Run `slot::reclaim_stale` to fix any leftover state from a prior crash (see [[#crash-recovery]]).
 3. Short-circuit: if the slot dir doesn't exist (already released, or just reclaimed), exit 0.
 4. Read lock to recover `group`.
-5. Detach HEAD; `branch -D <name>` (local); `push --delete origin <name>` (best-effort, no-op if `origin` is a bare mirror). Recursively mirror this in every submodule (`detach + branch -D <name>` per submodule, parallel via `std::thread::scope`) to clean up the per-slot branch step 11 of acquire created.
+5. Detach HEAD; `branch -D <name>` (local); `push --delete origin <name>` (best-effort, no-op if `origin` is a bare mirror). Recursively mirror this in every submodule (`detach + branch -D <name>` per submodule, parallel via `parallel::for_each`) to clean up the per-slot branch step 11 of acquire created.
 6. Find smallest free `{group}-N` (unbounded search — see [[#over-provisioned-pools]]; release lands at surplus N >= `max_slots` if every N in `0..max_slots` is occupied).
 7. Un-rename via `fs::rename` + `git worktree repair` + submodule `core.worktree` self-heal (same primitives as acquire's rename).
 8. **Delete lock LAST.** This is the only step that transitions the slot from held → idle on disk; all earlier steps preserve the lock as the authoritative "still owned" signal so a crash mid-flight is recoverable by replay.

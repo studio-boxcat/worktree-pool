@@ -10,6 +10,7 @@ mod fs_paths;
 mod git;
 mod lock;
 mod mutex;
+mod parallel;
 mod release;
 mod slot;
 mod submodules;

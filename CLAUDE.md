@@ -75,7 +75,7 @@ Per-host `init` runs once per pool key. Source path differs by host (build serve
 
 ## Build / development
 
-- Code lives in `src/`; one module per concern (`acquire`, `release`, `slot`, `lock`, `mutex`, `submodules`, `dashboard`, `admin`, `doctor`).
+- Code lives in `src/`; one module per concern (`acquire`, `release`, `slot`, `lock`, `mutex`, `submodules`, `parallel`, `dashboard`, `admin`, `doctor`). `parallel` wraps `std::thread::scope` with inline-fallback on OS thread-create failure — `Scope::spawn` panics under thread starvation, and `panic = "abort"` would otherwise kill the process mid-release.
 - Hand-rolled YAML in `yaml.rs` — line-oriented scalars only. `serde_yaml` is unmaintained; ~30 LOC suffices.
 - `git` operations shell out via `git.rs`. We bypass `git worktree move` entirely (refuses on slots with submodules — see [[docs/lifecycle.md#why-not-git-worktree-move]]); `worktree_rename` does `fs::rename` + `git worktree repair` + submodule admin `core.worktree` self-heal instead.
 - Atomic writes via `tempfile::NamedTempFile::persist` (handles EXDEV across volumes).
