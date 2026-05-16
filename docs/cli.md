@@ -44,6 +44,8 @@ worktree-pool --pool <key> validate-gitmodules
 worktree-pool doctor
 ```
 
+`doctor` is host-level (no `--pool`) and read-only. Checks: arch, `git --version`, `$WORKTREE_ROOT` + pool count, binary quarantine xattr, and stale `index.lock` files across every initialized pool. Stale-lock signature + reclamation path live in [[lifecycle.md#crash-recovery]].
+
 ## Distribution
 
 arm64 macOS only. Two artifacts ship from `bin/`:

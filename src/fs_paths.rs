@@ -39,6 +39,28 @@ pub fn slot_created_marker(worktree_gitdir: &Path) -> PathBuf {
     worktree_gitdir.join("worktree-pool/created")
 }
 
+/// Git's per-worktree index lock at `<worktree_gitdir>/index.lock`. Foreign to
+/// worktree-pool — git owns the lifecycle — but the file can leak when a git
+/// process dies between `open(O_CREAT|O_EXCL)` and a write (signal, panic,
+/// untracked-cache writeback aborted mid-flight). `reclaim_stale` sweeps the
+/// 0-byte + aged-out case; see `release::sweep_stale_index_lock`.
+pub fn worktree_index_lock(worktree_gitdir: &Path) -> PathBuf {
+    worktree_gitdir.join("index.lock")
+}
+
+/// Iterate every initialized pool dir under `$WORKTREE_ROOT` (entries that
+/// contain a `.meta/config.yaml`). Silent on missing root or `read_dir`
+/// failures — callers treat "no pools" as the empty case.
+pub fn for_each_pool_dir(mut f: impl FnMut(PathBuf)) {
+    let Ok(rd) = std::fs::read_dir(worktree_root()) else { return };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if pool_config(&path).exists() {
+            f(path);
+        }
+    }
+}
+
 /// `$WORKTREE_ROOT`. Panics with a clear message if the var is unset — every
 /// pool path is anchored here, so silent fallback would mis-locate state.
 pub fn worktree_root() -> PathBuf {

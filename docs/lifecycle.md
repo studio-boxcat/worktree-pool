@@ -53,6 +53,8 @@ The on-disk encoding is built so any crash leaves a state that the next `acquire
 
 The HEAD-detached check is the disambiguator for the canonical-with-lock row: a live held slot is on its branch (`acquire::checkout_force_branch`); a canonical-named dir with detached HEAD never reached that step (or reached it then was undone by release). See `slot::is_post_release_orphan`.
 
+**Stale `git index.lock` sweep.** Orthogonal to the table above and run once per enumerated slot: `<source>/.git/worktrees/<id>/index.lock` is removed iff **0 bytes AND mtime older than 60s**. The lock is git's, not ours — it leaks when a git process dies between `open(O_CREAT|O_EXCL)` and the first write (SIGKILL from harness timeouts, panic, untracked-cache writeback aborting under concurrent-git contention). The 0-byte + age guard protects live `git status` / `git commit` from inside a held slot (they hold a non-empty, young lock for milliseconds). Non-zero locks are left alone — they may be partial writes the operator wants to inspect. See `release::sweep_stale_index_lock`.
+
 **Migration from pre-marker pools.** Pools created before the provenance marker have lock files but no marker. At the start of every `reclaim_stale`, an idempotent auto-stamp pass writes the marker on any slot whose lock is present — lock presence proves pool ownership (only `acquire` writes locks). Pre-fix `(Renamed, no lock)` zombies have already lost provenance and fall into the **unmanaged dir** row above; clear them with `wt rm --force <name>` once.
 
 **Residual modes still needing operator action:**

@@ -10,10 +10,16 @@
 //! every acquire/release startup) detects and removes it.
 use anyhow::{Context, Result};
 use std::path::Path;
+use std::time::Duration;
 
 use crate::cli::ReleaseArgs;
 use crate::config::PoolConfig;
 use crate::{fs_paths, git, lock::Lock, mutex, slot, submodules};
+
+/// Minimum age before a 0-byte `index.lock` is treated as a crashed-git leftover.
+/// A live `git status` / `git commit` from inside a held slot momentarily owns
+/// this file; 60s is well past any realistic git completion time.
+const STALE_INDEX_LOCK_AFTER: Duration = Duration::from_secs(60);
 
 pub fn run(pool_root: &Path, cfg: &PoolConfig, args: ReleaseArgs) -> Result<()> {
     // Pool-wide mutex serializes the find-smallest-free-N + rename window.
@@ -176,6 +182,10 @@ pub fn reclaim_stale(pool_root: &Path, cfg: &PoolConfig) -> Result<()> {
                 continue;
             }
         };
+        // Foreign-artifact sweep (git's index.lock); orthogonal to the table below.
+        if clear_stale_index_lock(&gitdir) {
+            eprintln!("reclaim_stale: cleared stale index.lock in '{}'", entry.name);
+        }
         let lock_path = fs_paths::slot_lock(&gitdir);
         let marker_path = fs_paths::slot_created_marker(&gitdir);
         let lock_present = lock_path.exists();
@@ -214,6 +224,42 @@ pub fn reclaim_stale(pool_root: &Path, cfg: &PoolConfig) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// True iff `<gitdir>/index.lock` matches the crashed-git-leftover signature
+/// (0-byte file, mtime older than `STALE_INDEX_LOCK_AFTER`, not a symlink/dir).
+/// See [[lifecycle.md#crash-recovery]] for the leak class + rationale.
+///
+/// Best-effort: I/O errors / future mtimes / non-file entries return `false`.
+pub(crate) fn is_stale_index_lock(gitdir: &Path) -> bool {
+    let Ok(md) = std::fs::symlink_metadata(fs_paths::worktree_index_lock(gitdir)) else {
+        return false;
+    };
+    if !md.is_file() || md.len() != 0 {
+        return false;
+    }
+    let Ok(mtime) = md.modified() else { return false };
+    // Future mtime (clock skew / NTP jump) → treat as not stale yet.
+    let Ok(age) = mtime.elapsed() else { return false };
+    age >= STALE_INDEX_LOCK_AFTER
+}
+
+/// Remove a stale `index.lock` if present. Best-effort. Returns `true` iff
+/// the file was actually unlinked (false if not stale, not present, or
+/// removal raced/failed — failure logs).
+fn clear_stale_index_lock(gitdir: &Path) -> bool {
+    if !is_stale_index_lock(gitdir) {
+        return false;
+    }
+    let lock_path = fs_paths::worktree_index_lock(gitdir);
+    match std::fs::remove_file(&lock_path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            eprintln!("warn: removing stale {}: {e:#}", lock_path.display());
+            false
+        }
+    }
 }
 
 /// True iff the slot's HEAD is not attached to a branch (detached, missing, or

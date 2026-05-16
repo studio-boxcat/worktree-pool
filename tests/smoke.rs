@@ -2638,3 +2638,193 @@ fn reclaim_stale_auto_stamps_marker_on_legacy_locked_slot() {
     assert!(stderr.contains("stamping legacy pool marker") && stderr.contains("legacy"),
         "auto-stamp should be logged; stderr={stderr}");
 }
+
+// ---------- stale `index.lock` reclamation ----------
+//
+// Plant a per-worktree `index.lock` matching the crashed-git signature
+// (0-byte + aged-out mtime), trigger reclaim_stale via an unrelated release,
+// and verify removal. Guards: live (young) and non-empty locks must survive.
+
+/// Plant `<gitdir>/index.lock` at `bytes.len()` bytes, with mtime backdated
+/// by `age`. Returns the lock path.
+fn plant_index_lock(gitdir: &Path, bytes: &[u8], age: std::time::Duration) -> PathBuf {
+    let lock = gitdir.join("index.lock");
+    std::fs::write(&lock, bytes).unwrap();
+    let when = std::time::SystemTime::now() - age;
+    std::fs::File::open(&lock).unwrap().set_modified(when).unwrap();
+    lock
+}
+
+/// Trigger `reclaim_stale` without writing any new locks to held slots by
+/// releasing a name that doesn't exist (release short-circuits after the
+/// reclaim pass — see release.rs).
+fn trigger_reclaim(key: &str) {
+    Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", key, "release", "--name", "no-such-slot"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn reclaim_clears_stale_index_lock() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let out = acquire_dev(&key, "feat-stale");
+    assert_ok(&out, "");
+    let slot = pool_root(&key).join("feat-stale");
+    let gitdir = slot_gitdir_path(&slot);
+
+    let lock = plant_index_lock(&gitdir, b"", std::time::Duration::from_secs(120));
+    assert!(lock.exists(), "precondition: planted lock present");
+
+    trigger_reclaim(&key);
+
+    assert!(!lock.exists(),
+        "reclaim_stale must remove the stale index.lock at {}", lock.display());
+}
+
+#[test]
+fn reclaim_preserves_young_index_lock() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let out = acquire_dev(&key, "feat-young");
+    assert_ok(&out, "");
+    let slot = pool_root(&key).join("feat-young");
+    let gitdir = slot_gitdir_path(&slot);
+
+    // 0-byte but fresh — could be a live `git status` mid-stride. Must survive.
+    let lock = plant_index_lock(&gitdir, b"", std::time::Duration::from_secs(2));
+
+    trigger_reclaim(&key);
+
+    assert!(lock.exists(),
+        "young 0-byte lock must NOT be removed (live git protection)");
+
+    // Cleanup so the held slot can be released by `Cleanup`.
+    std::fs::remove_file(&lock).unwrap();
+}
+
+#[test]
+fn reclaim_preserves_nonempty_index_lock() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let out = acquire_dev(&key, "feat-partial");
+    assert_ok(&out, "");
+    let slot = pool_root(&key).join("feat-partial");
+    let gitdir = slot_gitdir_path(&slot);
+
+    // Aged but non-empty — could be a partial write the operator wants to see.
+    let lock = plant_index_lock(&gitdir, b"pid 12345\n", std::time::Duration::from_secs(120));
+
+    trigger_reclaim(&key);
+
+    assert!(lock.exists(),
+        "non-zero lock must NOT be removed (operator-visible partial write)");
+    std::fs::remove_file(&lock).unwrap();
+}
+
+#[test]
+fn doctor_reports_stale_index_lock() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let out = acquire_dev(&key, "feat-doc");
+    assert_ok(&out, "");
+    let slot = pool_root(&key).join("feat-doc");
+    let gitdir = slot_gitdir_path(&slot);
+
+    let lock = plant_index_lock(&gitdir, b"", std::time::Duration::from_secs(120));
+
+    let out = Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .arg("doctor")
+        .output()
+        .unwrap();
+    assert_ok(&out, "doctor must exit ok even when warnings are present");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("! stale index.lock"),
+        "doctor must emit the WARN marker for stale locks; stdout={stdout}");
+    assert!(stdout.contains(&lock.display().to_string()),
+        "doctor should report the offending path; stdout={stdout}");
+    assert!(lock.exists(),
+        "doctor must be read-only — stale lock should persist until acquire/release clears it");
+
+    std::fs::remove_file(&lock).unwrap();
+}
+
+#[test]
+fn reclaim_preserves_symlink_at_index_lock() {
+    // `symlink_metadata` + `is_file()` guard: a symlink at `index.lock` (any
+    // size) is never git's work — leave alone, regardless of age/target.
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let out = acquire_dev(&key, "feat-symlink");
+    assert_ok(&out, "");
+    let slot = pool_root(&key).join("feat-symlink");
+    let gitdir = slot_gitdir_path(&slot);
+    let lock = gitdir.join("index.lock");
+
+    // Target file is 0 bytes & old — would qualify if it were the lock itself.
+    let target = tmp.path().join("zero");
+    std::fs::write(&target, b"").unwrap();
+    std::fs::File::open(&target).unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(120))
+        .unwrap();
+    std::os::unix::fs::symlink(&target, &lock).unwrap();
+
+    trigger_reclaim(&key);
+
+    assert!(std::fs::symlink_metadata(&lock).is_ok(),
+        "symlink at index.lock must NOT be removed");
+    std::fs::remove_file(&lock).unwrap();
+}
+
+#[test]
+fn doctor_reports_no_locks_for_clean_pool() {
+    // Tests share `$WORKTREE_ROOT` with the host's other pools, so we can't
+    // assert "none" globally — assert that doctor doesn't surface a stale
+    // lock attributable to our pool's gitdirs.
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let out = acquire_dev(&key, "feat-clean");
+    assert_ok(&out, "");
+    let slot = pool_root(&key).join("feat-clean");
+    let our_gitdir = slot_gitdir_path(&slot);
+
+    let out = Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .arg("doctor")
+        .output()
+        .unwrap();
+    assert_ok(&out, "");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("stale index.lock:"),
+        "doctor output missing stale-lock check line: {stdout}");
+    let our_prefix = our_gitdir.display().to_string();
+    assert!(!stdout.contains(&our_prefix),
+        "doctor falsely flagged our clean pool's gitdir ({our_prefix}); stdout={stdout}");
+}
