@@ -46,7 +46,7 @@ The on-disk encoding is built so any crash leaves a state that the next `acquire
 |---|---|---|---|---|---|
 | renamed | present | any | any | held (or release crashed mid-slow-ops) | leave; replay if user re-runs `release` |
 | renamed | absent | **present** | any | **legacy zombie** (pre-fix release crash) | replay release tail: detach, delete branch, `worktree_rename` to canonical |
-| renamed | absent | **absent** | any | **unmanaged dir** (manual `git worktree add`, hand-deleted lock+marker) | leave untouched, log warn — operator clears via `wt rm --force` |
+| renamed | absent | **absent** | any | **unmanaged dir** (manual `git worktree add`, hand-deleted lock+marker) | leave untouched, log warn — operator clears via `wt release --force` |
 | canonical | present | any | on branch | live held (or acquire crashed late) | leave |
 | canonical | present | any | detached | **post-rename orphan lock** (release crashed late) | remove lock |
 | canonical | absent | any | any | idle | leave |
@@ -55,12 +55,12 @@ The HEAD-detached check is the disambiguator for the canonical-with-lock row: a 
 
 **Stale `git index.lock` sweep.** Orthogonal to the table above and run once per enumerated slot: `<source>/.git/worktrees/<id>/index.lock` is removed iff **0 bytes AND mtime older than 60s**. The lock is git's, not ours — it leaks when a git process dies between `open(O_CREAT|O_EXCL)` and the first write (SIGKILL from harness timeouts, panic, untracked-cache writeback aborting under concurrent-git contention). The 0-byte + age guard protects live `git status` / `git commit` from inside a held slot (they hold a non-empty, young lock for milliseconds). Non-zero locks are left alone — they may be partial writes the operator wants to inspect. See `release::sweep_stale_index_lock`.
 
-**Migration from pre-marker pools.** Pools created before the provenance marker have lock files but no marker. At the start of every `reclaim_stale`, an idempotent auto-stamp pass writes the marker on any slot whose lock is present — lock presence proves pool ownership (only `acquire` writes locks). Pre-fix `(Renamed, no lock)` zombies have already lost provenance and fall into the **unmanaged dir** row above; clear them with `wt rm --force <name>` once.
+**Migration from pre-marker pools.** Pools created before the provenance marker have lock files but no marker. At the start of every `reclaim_stale`, an idempotent auto-stamp pass writes the marker on any slot whose lock is present — lock presence proves pool ownership (only `acquire` writes locks). Pre-fix `(Renamed, no lock)` zombies have already lost provenance and fall into the **unmanaged dir** row above; clear them with `wt release --force <name>` once.
 
 **Residual modes still needing operator action:**
 
-- **Ghost dir** (`.git` gitlink missing or dangling — typically from a half-completed `worktree remove` whose working-tree rm couldn't finish, e.g. an IDE holding a file open): no git state to reach the slot through. `wt go/cleanup/rm` all detect this and refuse with `🔴 BROKEN` (see [[wt.md#cleanup-classifier]]). Recover with `rm -rf <slot-path>`.
-- **Unmanaged dir** (the row above): pool refuses to touch it, but the dir continues to occupy a name slot. `wt rm --force <name>` releases through the normal path; alternatively `git worktree remove <slot>` then `rm -rf <slot>` for non-pool worktrees.
+- **Ghost dir** (`.git` gitlink missing or dangling — typically from a half-completed `worktree remove` whose working-tree rm couldn't finish, e.g. an IDE holding a file open): no git state to reach the slot through. `wt go/cleanup/release` all detect this and refuse with `🔴 BROKEN` (see [[wt.md#cleanup-classifier]]). Recover with `rm -rf <slot-path>`.
+- **Unmanaged dir** (the row above): pool refuses to touch it, but the dir continues to occupy a name slot. `wt release --force <name>` releases through the normal path; alternatively `git worktree remove <slot>` then `rm -rf <slot>` for non-pool worktrees.
 
 ## Mutex liveness
 

@@ -1228,7 +1228,7 @@ fn session_cleanup_detects_fully_orphaned_slot() {
 }
 
 #[test]
-fn session_rm_refuses_broken_slot() {
+fn session_release_refuses_broken_slot() {
     let key = pool_key();
     let _c = Cleanup(key.clone());
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1237,9 +1237,9 @@ fn session_rm_refuses_broken_slot() {
 
     let path = acquire_then_break(&key, "ghost", true);
 
-    let out = session_cmd(&key, &["rm", "ghost"]).output().unwrap();
+    let out = session_cmd(&key, &["release", "ghost"]).output().unwrap();
     assert!(!out.status.success(),
-        "rm should refuse broken slot rather than dive into release.\nstdout={}\nstderr={}",
+        "release should refuse broken slot rather than dive into worktree-pool release.\nstdout={}\nstderr={}",
         String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("is broken (no valid .git"),
@@ -1259,7 +1259,7 @@ fn acquire_then_dirty(key: &str, name: &str) -> PathBuf {
 }
 
 #[test]
-fn session_rm_refuses_dirty_without_force() {
+fn session_release_refuses_dirty_without_force() {
     let key = pool_key();
     let _c = Cleanup(key.clone());
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1268,9 +1268,9 @@ fn session_rm_refuses_dirty_without_force() {
 
     let path = acquire_then_dirty(&key, "messy");
 
-    let out = session_cmd(&key, &["rm", "messy"]).output().unwrap();
+    let out = session_cmd(&key, &["release", "messy"]).output().unwrap();
     assert!(!out.status.success(),
-        "rm should refuse dirty slot without --force.\nstdout={}\nstderr={}",
+        "release should refuse dirty slot without --force.\nstdout={}\nstderr={}",
         String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("dirty"), "stderr should mention dirty: {stderr}");
@@ -1278,7 +1278,7 @@ fn session_rm_refuses_dirty_without_force() {
 }
 
 #[test]
-fn session_rm_force_discards_dirty() {
+fn session_release_force_discards_dirty() {
     let key = pool_key();
     let _c = Cleanup(key.clone());
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1287,14 +1287,14 @@ fn session_rm_force_discards_dirty() {
 
     let path = acquire_then_dirty(&key, "messy");
 
-    let out = session_cmd(&key, &["rm", "messy", "--force"]).output().unwrap();
-    assert_ok(&out, "rm --force should succeed on dirty slot");
+    let out = session_cmd(&key, &["release", "messy", "--force"]).output().unwrap();
+    assert_ok(&out, "release --force should succeed on dirty slot");
     // The slot is un-renamed back to canonical id (ios-N) — operator namespace cleared.
-    assert!(!path.exists(), "operator-named slot dir should be gone after rm --force");
+    assert!(!path.exists(), "operator-named slot dir should be gone after release --force");
 }
 
 #[test]
-fn session_rm_force_discards_unmerged_branch() {
+fn session_release_force_discards_unmerged_branch() {
     let key = pool_key();
     let _c = Cleanup(key.clone());
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1310,21 +1310,21 @@ fn session_rm_force_discards_unmerged_branch() {
     git_commit(&path, "ahead of main");
 
     // Without --force: refuse.
-    let out = session_cmd(&key, &["rm", "ahead"]).output().unwrap();
+    let out = session_cmd(&key, &["release", "ahead"]).output().unwrap();
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("not in main"), "got: {stderr}");
 
     // With --force: succeed.
-    let out = session_cmd(&key, &["rm", "ahead", "--force"]).output().unwrap();
-    assert_ok(&out, "rm --force should discard unmerged commits");
+    let out = session_cmd(&key, &["release", "ahead", "--force"]).output().unwrap();
+    assert_ok(&out, "release --force should discard unmerged commits");
     assert!(!path.exists());
 }
 
 #[test]
-fn session_rm_force_accepted_before_positionals() {
-    // Pin the parser contract: `rm --force <name>` works as well as
-    // `rm <name> --force`. Operators reach for either order.
+fn session_release_force_accepted_before_positionals() {
+    // Pin the parser contract: `release --force <name>` works as well as
+    // `release <name> --force`. Operators reach for either order.
     let key = pool_key();
     let _c = Cleanup(key.clone());
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1332,13 +1332,13 @@ fn session_rm_force_accepted_before_positionals() {
     init_pool(&key, &bare);
 
     let path = acquire_then_dirty(&key, "messy");
-    let out = session_cmd(&key, &["rm", "--force", "messy"]).output().unwrap();
-    assert_ok(&out, "rm --force <name> should succeed");
+    let out = session_cmd(&key, &["release", "--force", "messy"]).output().unwrap();
+    assert_ok(&out, "release --force <name> should succeed");
     assert!(!path.exists());
 }
 
 #[test]
-fn session_rm_force_still_refuses_broken_slot() {
+fn session_release_force_still_refuses_broken_slot() {
     // --force means "discard work I know is junk" — it does NOT mean
     // "rm -rf a path that can't be released through git". Broken slots
     // need explicit `rm -rf` (no git state to release).
@@ -1350,9 +1350,9 @@ fn session_rm_force_still_refuses_broken_slot() {
 
     let path = acquire_then_break(&key, "ghost", true);
 
-    let out = session_cmd(&key, &["rm", "ghost", "--force"]).output().unwrap();
+    let out = session_cmd(&key, &["release", "ghost", "--force"]).output().unwrap();
     assert!(!out.status.success(),
-        "rm --force must still refuse broken slot.\nstdout={}\nstderr={}",
+        "release --force must still refuse broken slot.\nstdout={}\nstderr={}",
         String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("is broken (no valid .git"), "got: {stderr}");

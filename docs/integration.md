@@ -4,14 +4,14 @@
 
 ## Integration patterns
 
-The minimal-friction integration is **no integration at all** — auto-resolution + `.wt-hooks.sh` covers the common cases. From inside the source repo or any slot, `wt go feature-x`, `wt land`, `wt ls`, `wt rm feature-x` work without consumer wrappers. Project-specific extras live in `<source>/.wt-hooks.sh`; see [[wt.md#hooks-sourcewt-hookssh]].
+The minimal-friction integration is **no integration at all** — auto-resolution + `.wt-hooks.sh` covers the common cases. From inside the source repo or any slot, `wt go feature-x`, `wt land`, `wt ls`, `wt release feature-x` work without consumer wrappers. Project-specific extras live in `<source>/.wt-hooks.sh`; see [[wt.md#hooks-sourcewt-hookssh]].
 
 Consumers only need a `just` recipe (or shell alias) when the wrapper adds *operator-facing* surface — independent verbs like `wt-meta`, `wt-dev-start` — not for pre-filling the pool key. Avoid the old pattern of a recipe per verb just to inject the key:
 
 ```bash
 # OLD — redundant; auto-resolution makes this unnecessary.
 wt-go name:    @wt go myapp {{quote(name)}}
-wt-rm name:    @wt rm myapp {{quote(name)}}
+wt-release name: @wt release myapp {{quote(name)}}
 # … (delete; just type `wt go feature-x` directly)
 ```
 

@@ -8,7 +8,7 @@ Bash dispatcher in `bin/wt`. Subcommands wrapping the slot + git-flow lifecycle 
 wt [--pool <key>] init    [--max-slots <n>] [pool-init-flags...] # --source inferred from cwd; --max-slots defaults to 16
 wt [--pool <key>] path    <name>     # print slot path; exit 0 if exists, 1 if not, 2 on error
 wt [--pool <key>] go      <name> [--from <commit-ish>] [pool-acquire-flags...]
-wt [--pool <key>] rm      <name> [--force]   # safety-checked release; --force discards dirty/unmerged
+wt [--pool <key>] release <name> [--force]   # safety-checked release; --force discards dirty/unmerged
 wt [--pool <key>] cleanup <name>     # 🟢/🟡/🔴 exit-trap classifier
 wt [--pool <key>] sweep              # run cleanup over every held slot in the pool
 wt [--pool <key>] ls      [--bare]   # held slots + git status (BRANCH/DIRTY/UNTRK/AHEAD); --bare skips git calls
@@ -32,11 +32,11 @@ This means inside `~/Develop/myapp` (the source repo), or inside any slot of tha
 
 **TTY guard.** `go` refuses early if stdin or stdout isn't a TTY. The launcher (`ai` / `claude`) needs an interactive terminal; without one it exits in <1s and the EXIT trap would silently 🟢-recycle a fresh slot — destroying the diagnostic surface. Common cause: running `wt go` from inside an existing AI session. For non-interactive automation use `worktree-pool acquire` directly, or set `WT_GO_ALLOW_NOTTY=1` to bypass the guard.
 
-`--from <commit-ish>` (optional) forks the new branch from the given ref; translated to `acquire --commit <X>`. Omit to use the pool's `default_commit`. If a slot with `<name>` already exists, `go` resumes it with a loud warning (acquire flags are ignored on resume — slot stays at its existing commit); the underlying `ai` is invoked with `--continue`. Use `rm` first if you want to recreate from scratch.
+`--from <commit-ish>` (optional) forks the new branch from the given ref; translated to `acquire --commit <X>`. Omit to use the pool's `default_commit`. If a slot with `<name>` already exists, `go` resumes it with a loud warning (acquire flags are ignored on resume — slot stays at its existing commit); the underlying `ai` is invoked with `--continue`. Use `release` first if you want to recreate from scratch.
 
 Acquire (and therefore `go`/resume) implicitly sweeps stale `git index.lock` files left over from a crashed git process in any slot — see [[lifecycle.md#crash-recovery]]. A stuck `git status` / `git commit` reporting `Unable to create 'index.lock': File exists` clears on the next `wt go`.
 
-`rm` is the manual one-shot with the same safety checks (refuse on dirty / unmerged); used directly when the session is gone but state persists. Pass `--force` (`-f`) to discard dirty tracked changes and/or unmerged commits — applies the work-loss waiver but still refuses 🔴 BROKEN slots (no git state to release through; recover those via `rm -rf`). `--force` is intentionally an `rm`-only knob, not a `cleanup` flag: `cleanup` is the auto-invoked exit-trap classifier whose entire purpose is preserving uncommitted work on shell exit, so a force-recycle there would defeat the trap. Operators discarding work always do so explicitly via `rm --force`.
+`release` is the manual one-shot with the same safety checks (refuse on dirty / unmerged); used directly when the session is gone but state persists. Pass `--force` (`-f`) to discard dirty tracked changes and/or unmerged commits — applies the work-loss waiver but still refuses 🔴 BROKEN slots (no git state to release through; recover those via `rm -rf`). `--force` is intentionally a `release`-only knob, not a `cleanup` flag: `cleanup` is the auto-invoked exit-trap classifier whose entire purpose is preserving uncommitted work on shell exit, so a force-recycle there would defeat the trap. Operators discarding work always do so explicitly via `release --force`.
 
 `path` is the predicate query — prints `$WORKTREE_ROOT/<key>/<name>` on stdout (always, when key + pool are valid) and exits 0 if the slot exists, 1 if it doesn't, 2 on usage / pool-not-initialized. Lets consumer scripts branch on resume vs. fresh acquire (`if wt path … >/dev/null; then …`) without re-stitching the pool-root path themselves. Pattern matches `git rev-parse --git-dir`, `brew --prefix`, `pyenv prefix`.
 
@@ -57,7 +57,7 @@ If the source repo has a `.wt-hooks.sh` at its toplevel, `wt` sources it before 
 | Function | When | Failure semantics |
 |---|---|---|
 | `wt_pre_go` | After acquire/resume, before launching the shell | Non-zero aborts launch (set -e); EXIT trap then fires `cleanup` |
-| `wt_pre_rm` | After safety checks pass, before `release` | Best-effort (errors don't block release) |
+| `wt_pre_release` | After safety checks pass, before `release` | Best-effort (errors don't block release) |
 | `wt_pre_cleanup` | Before the cleanup classifier runs | Best-effort |
 | `wt_post_cleanup` | After classifier, only on the green/recycled path | Best-effort |
 | `wt_post_land` | After `land` succeeds; sees `$WT_MAIN_BEFORE` / `$WT_MAIN_AFTER` (full SHAs) | Best-effort |
@@ -73,7 +73,7 @@ WT_LAUNCHER="ai --chrome"
 wt_pre_go() {
   cd "$WT_PATH/app" && bun install --silent
 }
-wt_pre_rm()      { just _dev-stop "$WT_NAME" || true; }
+wt_pre_release() { just _dev-stop "$WT_NAME" || true; }
 wt_pre_cleanup() { just _dev-stop "$WT_NAME" || true; }
 wt_post_cleanup() { rm -f "$WT_PATH.log"; }
 wt_post_land() {
@@ -91,11 +91,11 @@ Always exits 0 — it's an exit-trap target, so `wt go`'s exit trap doesn't mudd
 |---|---|---|
 | 🟢 | clean working tree AND 0 commits ahead local `main` | un-rename + delete branch + release (recycle) |
 | 🟡 | dirty / untracked files | leave personalized — resume with `wt go` later |
-| 🟡 misfire | fresh acquire AND launcher exited in <`LAUNCH_MISFIRE_SECS` (default 3) AND tree clean AND 0 ahead | leave in place; suggests `wt go <name>` to retry, `wt rm --force <name>` to discard. Fired by the EXIT-trap handler before delegating to cleanup; preserves the slot when no real session ran. |
+| 🟡 misfire | fresh acquire AND launcher exited in <`LAUNCH_MISFIRE_SECS` (default 3) AND tree clean AND 0 ahead | leave in place; suggests `wt go <name>` to retry, `wt release --force <name>` to discard. Fired by the EXIT-trap handler before delegating to cleanup; preserves the slot when no real session ran. |
 | 🔴 UNMERGED | non-zero commits ahead local `main` (unmerged) | loud refuse — operator resolves before recycling |
 | 🔴 BROKEN | slot dir exists but `<slot>/.git` is missing or dangling (ghost dir from partial cleanup debris) | loud refuse — operator recovers via `rm -rf` (the dir is unrecoverable as a worktree; nothing of value lives in `.git`-less debris) |
 
-Re-running `wt go <name>` resumes any 🟡 / 🟡 misfire / 🔴 UNMERGED slot. 🔴 BROKEN slots can't be resumed — `go` and `rm` both refuse them.
+Re-running `wt go <name>` resumes any 🟡 / 🟡 misfire / 🔴 UNMERGED slot. 🔴 BROKEN slots can't be resumed — `go` and `release` both refuse them.
 
 ## Land flow
 

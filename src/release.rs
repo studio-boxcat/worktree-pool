@@ -154,7 +154,7 @@ fn release_tail(
 /// **Migration.** Pre-fix pools have lock files but no marker. Before classifying,
 /// auto-stamp the marker on any slot whose lock is present (lock presence proves
 /// pool ownership — only `acquire` writes locks). Pre-fix `(Renamed, no lock)`
-/// zombies have lost provenance and must be cleared via `wt rm --force`.
+/// zombies have lost provenance and must be cleared via `wt release --force`.
 pub fn reclaim_stale(pool_root: &Path, cfg: &PoolConfig) -> Result<()> {
     let entries = slot::enumerate(pool_root, cfg)?;
 
@@ -194,7 +194,7 @@ pub fn reclaim_stale(pool_root: &Path, cfg: &PoolConfig) -> Result<()> {
                 if !marker_path.exists() {
                     eprintln!(
                         "reclaim_stale: '{}' (renamed dir, no lock, no pool marker) \
-                         — not pool-owned; leaving untouched. Recover with `wt rm --force {}` if intended.",
+                         — not pool-owned; leaving untouched. Recover with `wt release --force {}` if intended.",
                         entry.name, entry.name
                     );
                     continue;

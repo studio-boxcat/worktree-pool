@@ -6,7 +6,7 @@
 # Usage:
 #   wt [--pool <key>] init    [--max-slots <n>] [pool-init-flags...]   # default --max-slots 16
 #   wt [--pool <key>] go      <name> [--from <commit-ish>] [pool-acquire-flags...]
-#   wt [--pool <key>] rm      <name> [--force]
+#   wt [--pool <key>] release <name> [--force]
 #   wt [--pool <key>] cleanup <name>     # 🟢/🟡/🔴 exit-trap classifier
 #   wt [--pool <key>] path    <name>     # exit 0 if exists, 1 if not, 2 on error
 #   wt [--pool <key>] ls      [--git-status]
@@ -30,7 +30,7 @@
 # $WT_KEY $WT_NAME $WT_PATH $WT_FRESH (1=fresh acquire, 0=resume) in env:
 #
 #   wt_pre_go       — runs after acquire/resume, before launching the shell
-#   wt_pre_rm       — runs after safety checks, before `release`
+#   wt_pre_release  — runs after safety checks, before `release`
 #   wt_pre_cleanup  — runs before the cleanup classifier
 #   wt_post_cleanup — runs after classifier, only on the green/recycled path
 #   wt_post_land    — runs after land succeeds; sees $WT_MAIN_BEFORE/$WT_MAIN_AFTER
@@ -398,7 +398,7 @@ Recover with: rm -rf $(printf '%q' "$path"), then re-run."
     fi
     local Y='' X=''
     [ -t 2 ] && { Y=$'\e[33m'; X=$'\e[0m'; }
-    printf '%s⚠ slot %s/%s already exists — resuming (acquire flags ignored). Use `%s rm %s` first to recreate.%s\n' \
+    printf '%s⚠ slot %s/%s already exists — resuming (acquire flags ignored). Use `%s release %s` first to recreate.%s\n' \
       "$Y" "$POOL_KEY" "$name" "${0##*/}" "$name" "$X" >&2
   else
     path=$(worktree-pool --pool "$POOL_KEY" acquire --name "$name" ${acquire_args[@]+"${acquire_args[@]}"} | tail -1)
@@ -494,7 +494,7 @@ cmd__exit_handler() {
        && [ -z "$porcelain" ] && [ "$ahead" = "0" ]; then
       local Y='' X=''
       [ -t 2 ] && { Y=$'\e[33m'; X=$'\e[0m'; }
-      printf '%s🟡 launcher misfire: slot %s/%s left in place (ran %ss < %ss, fresh acquire, tree clean).\n   Inspect: %s go %s   |   Discard: %s rm --force %s%s\n' \
+      printf '%s🟡 launcher misfire: slot %s/%s left in place (ran %ss < %ss, fresh acquire, tree clean).\n   Inspect: %s go %s   |   Discard: %s release --force %s%s\n' \
         "$Y" "$POOL_KEY" "$name" "$dur" "$LAUNCH_MISFIRE_SECS" \
         "${0##*/}" "$name" "${0##*/}" "$name" "$X" >&2
       exit 0
@@ -985,9 +985,9 @@ cmd_cleanup() {
     exit 0
   fi
 
-  # Only print 🟢 if release actually succeeded — silencing rm's exit code
+  # Only print 🟢 if release actually succeeded — silencing release's exit code
   # would lie about a still-broken slot.
-  if "$0" --pool "$POOL_KEY" rm "$name"; then
+  if "$0" --pool "$POOL_KEY" release "$name"; then
     printf '%s🟢 recycled cleanly: %s/%s%s\n' "$G" "$POOL_KEY" "$name" "$X"
     call_hook wt_post_cleanup || true
   else
@@ -1002,10 +1002,10 @@ cmd_cleanup() {
 # Always exits 0 — same trap-friendly contract as cleanup itself.
 #
 # **Concurrency.** Not serialized against parallel `wt go`s. Safe because
-# (a) cleanup→rm→`worktree-pool release` takes the pool mutex per-slot, and
-# (b) new acquires draw from the idle canonical namespace (`slot-N` /
+# (a) cleanup→release→`worktree-pool release` takes the pool mutex per-slot,
+# and (b) new acquires draw from the idle canonical namespace (`slot-N` /
 # `{group}-N`), never from user-renamed names sweep is iterating. A racing
-# operator-driven `wt rm` of a slot sweep is about to clean up just makes
+# operator-driven `wt release` of a slot sweep is about to clean up just makes
 # cleanup's "already recycled" path fire — harmless.
 cmd_sweep() {
   [ $# -eq 0 ] || die "sweep takes no arguments"
@@ -1046,7 +1046,7 @@ cmd_sweep() {
   fi
 }
 
-cmd_rm() {
+cmd_release() {
   set -e
   # Pre-parse `--force` / `-f` so it can appear before or after positionals.
   # `--force` skips the work-preservation safety (dirty + unmerged); the
@@ -1064,14 +1064,14 @@ cmd_rm() {
     case "$arg" in
       --)         seen_endopts=1 ;;
       --force|-f) force=1 ;;
-      --*|-*)     die "rm: unknown flag '$arg' — usage: wt rm <name> [--force|-f]" ;;
+      --*|-*)     die "release: unknown flag '$arg' — usage: wt release <name> [--force|-f]" ;;
       *)          args+=("$arg") ;;
     esac
   done
   set -- ${args[@]+"${args[@]}"}
 
   local name="${1:-}"; shift || true
-  require_arg name "$name" "wt rm <name> [--force]"
+  require_arg name "$name" "wt release <name> [--force]"
 
   local path="$POOL_ROOT/$name"
   [ -d "$path" ] || die "no slot named '$name' in pool '$POOL_KEY' at $POOL_ROOT.
@@ -1101,8 +1101,8 @@ cmd_rm() {
     fi
   fi
 
-  # Pre-rm hook (e.g. dev-server stop). Best-effort.
-  fire_hook wt_pre_rm 0 || true
+  # Pre-release hook (e.g. dev-server stop). Best-effort.
+  fire_hook wt_pre_release 0 || true
 
   # Remote branch delete is delegated to release.rs's silent push_delete
   # (best-effort).
@@ -1273,9 +1273,9 @@ is invoked with --continue.
   --from <ref>   fork from <commit-ish> (passed as --commit to acquire)
 EOF
       ;;
-    rm)
+    release)
       cat <<'EOF'
-wt [--pool <key>] rm <name> [--force|-f]
+wt [--pool <key>] release <name> [--force|-f]
 
 Manual safety-checked release. Refuses on dirty working tree or commits not
 in main; refuses 🔴 BROKEN slots (recover via `rm -rf`).
@@ -1356,7 +1356,7 @@ wt — dev-session wrapper around `worktree-pool`.
 Pool lifecycle:
   init     initialize a pool (run from inside the source repo)
   go       acquire/resume a slot and launch a session
-  rm       safety-checked release of a slot
+  release  safety-checked release of a slot
   cleanup  classifier invoked by `go`'s EXIT trap (🟢/🟡/🔴)
   sweep    run cleanup over every held slot
 
@@ -1422,7 +1422,7 @@ case "$verb" in
   cleanup) require_pool; cmd_cleanup "$@" ;;
   _exit_handler) require_pool; cmd__exit_handler "$@" ;;
   sweep)   require_pool; cmd_sweep   "$@" ;;
-  rm)      require_pool; cmd_rm      "$@" ;;
+  release) require_pool; cmd_release "$@" ;;
   orient)  cmd_orient  "$@" ;;
   whoami)  cmd_whoami  "$@" ;;
   ls)      require_pool; cmd_ls      "$@" ;;
