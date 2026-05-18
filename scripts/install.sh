@@ -1,40 +1,26 @@
 #!/usr/bin/env bash
-# Symlinks the committed worktree-pool binary into ~/.local/bin/.
-# Idempotent: re-runnable safely.
+# Install worktree-pool + wt into ~/.local/bin/ via symlink.
+# Builds the Rust binary first (release profile); the symlink points at the
+# stable cargo artifact path, so re-running `cargo build --release` in the
+# repo updates the installed tool in place (no re-install step needed).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LINK_DIR="$HOME/.local/bin"
 mkdir -p "$LINK_DIR"
 
-# Symlinks: <tool> → <repo>/bin/<artifact>
-declare -a LINKS=(
-  "worktree-pool:$REPO_ROOT/bin/worktree-pool-darwin-arm64"
-  "wt:$REPO_ROOT/bin/wt"
-)
+echo "building worktree-pool (release profile)…"
+cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml"
 
-if [ "$(uname -sm)" != "Darwin arm64" ]; then
-  echo "warn: committed Rust binary is darwin-arm64; you're on $(uname -sm)." >&2
-fi
+ln -sfn "$REPO_ROOT/target/release/worktree-pool" "$LINK_DIR/worktree-pool"
+ln -sfn "$REPO_ROOT/bin/wt" "$LINK_DIR/wt"
+echo "linked $LINK_DIR/worktree-pool → $REPO_ROOT/target/release/worktree-pool"
+echo "linked $LINK_DIR/wt → $REPO_ROOT/bin/wt"
 
-for entry in "${LINKS[@]}"; do
-  name="${entry%%:*}"
-  src="${entry#*:}"
-  dst="$LINK_DIR/$name"
-  if [ ! -x "$src" ]; then
-    echo "missing or non-executable: $src" >&2
-    [ "$name" = "worktree-pool" ] && echo "  rebuild via: just release-binary" >&2
-    exit 1
-  fi
-  ln -sfn "$src" "$dst"
-  echo "linked $dst → $src"
-done
-
-# Sanity-check the Rust binary; the bash script doesn't need exercising.
 if "$LINK_DIR/worktree-pool" doctor >/dev/null 2>&1; then
   echo "doctor passed."
 else
-  echo "warn: '$LINK_DIR/worktree-pool doctor' did not exit cleanly; run it manually to inspect." >&2
+  echo "warn: '$LINK_DIR/worktree-pool doctor' did not exit cleanly; run it manually." >&2
 fi
 
 case ":$PATH:" in

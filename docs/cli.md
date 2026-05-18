@@ -48,12 +48,12 @@ worktree-pool doctor
 
 ## Distribution
 
-arm64 macOS only. Two artifacts ship from `bin/`:
+arm64 macOS only. Two tools end up on `$PATH`:
 
-- `bin/worktree-pool-darwin-arm64` — the Rust binary (the pool primitive). Ad-hoc codesigned (`codesign --sign - --force`).
-- `bin/wt` — Bash wrapper for the common dev-session lifecycle. Project-agnostic; auto-resolves pool key from cwd (override with `--pool`).
+- `worktree-pool` — the Rust binary (the pool primitive). Built locally via `cargo build --release`; the install script symlinks `~/.local/bin/worktree-pool` → `target/release/worktree-pool`, so any subsequent `cargo build --release` updates the installed tool in place.
+- `wt` — Bash wrapper for the common dev-session lifecycle. Project-agnostic; auto-resolves pool key from cwd (override with `--pool`). Symlinked from `bin/wt`.
 
-`scripts/install.sh` (also `just install`) symlinks both into `~/.local/bin/`.
+`scripts/install.sh` (also `just install`) builds + symlinks both into `~/.local/bin/`.
 
 ```sh
 git clone https://github.com/studio-boxcat/worktree-pool.git ~/Develop/worktree-pool
