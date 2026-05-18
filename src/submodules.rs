@@ -296,7 +296,7 @@ pub fn delete_branch_recursive(dir: &Path, branch_name: &str) {
     // Inline-fallback on OS thread-create failure: see `parallel` module.
     crate::parallel::for_each(&entries, |e| {
         let sub_path = dir.join(&e.path);
-        let _ = git::checkout_detach(&sub_path);
+        let _ = git::detach_head(&sub_path);
         let _ = git::branch_delete(&sub_path, branch_name);
     });
 

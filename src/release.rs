@@ -75,10 +75,10 @@ fn release_tail(
 
     // Best-effort branch cleanup: detach, delete local branch, delete remote.
     // Order matters: can't delete the branch we're currently on; must detach first.
-    let (detach_ok, _, detach_err) = git::checkout_detach(slot_path)?;
+    let (detach_ok, _, detach_err) = git::detach_head(slot_path)?;
     if !detach_ok {
         eprintln!(
-            "warn: 'git checkout --detach' failed in {}; branch '{}' may persist as a dangling ref. {}",
+            "warn: detach HEAD failed in {}; branch '{}' may persist as a dangling ref. {}",
             slot_path.display(),
             name,
             detach_err

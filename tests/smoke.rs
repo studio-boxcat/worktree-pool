@@ -1359,6 +1359,50 @@ fn session_release_force_still_refuses_broken_slot() {
     assert!(path.exists());
 }
 
+#[test]
+fn release_succeeds_despite_stale_index_lock() {
+    // Reproduces the meow-tower 2026-05-18 warn: a crashed git left a non-empty,
+    // recent `<gitdir>/index.lock` that escaped `reclaim_stale`'s 0-byte+age
+    // guard, then release's old `git checkout --detach` step hit `EEXIST` on
+    // the lock and the slot's branch persisted as a dangling ref. The fix
+    // (release.rs → `git::detach_head` via plumbing rev-parse + update-ref
+    // --no-deref) never touches the index, so the lock is irrelevant.
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let out = acquire_dev(&key, "leaky");
+    assert_ok(&out, "acquire failed");
+    let slot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+
+    // Fabricate the crashed-git leftover: non-empty (escapes 0-byte guard) and
+    // freshly mtime'd (escapes the 60s age guard). Either condition alone keeps
+    // it from being swept; both make the test deterministic.
+    let gitdir = slot_gitdir_path(&slot);
+    let index_lock = gitdir.join("index.lock");
+    std::fs::write(&index_lock, b"partial write before SIGKILL\n").unwrap();
+
+    // Invoke the binary directly: the `wt` wrapper would itself run `git status
+    // --porcelain` for the dirty-tree precheck and could race the same lock,
+    // muddying what this test is meant to pin (release.rs's detach step).
+    let out = Command::cargo_bin("worktree-pool").unwrap()
+        .args(["--pool", &key, "release", "--name", "leaky"])
+        .output().unwrap();
+    assert_ok(&out, "release should succeed despite stale index.lock");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("may persist as a dangling ref"),
+        "release should not hit detach-failure warn (the bug being fixed): {stderr}");
+    assert!(!slot.exists(), "slot should be un-renamed to canonical id");
+
+    // Branch should be gone — confirms the detach actually freed the ref for
+    // the subsequent `branch -D`. (If detach silently no-op'd, `branch -D`
+    // would refuse because we'd still be ON `leaky`.)
+    let branches = run_git_capture(&bare, &["branch", "--list", "leaky"]);
+    assert!(branches.trim().is_empty(), "'leaky' branch should be deleted; got: {branches:?}");
+}
+
 /// Build a `bash <wt> <verb-args>` command rooted at `cwd`, used for verbs that
 /// auto-resolve the pool key from cwd (e.g. `wt land`, which takes no `--pool`).
 fn session_cmd_cwd(cwd: &Path, args: &[&str]) -> StdCommand {
