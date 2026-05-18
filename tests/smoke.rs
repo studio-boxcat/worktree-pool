@@ -494,6 +494,50 @@ fn stale_init_mutex_reclaimed_inline() {
     assert!(path.ends_with("/post-reclaim"));
 }
 
+/// Dead-PID init mutex must be reclaimed *immediately* by the next acquire —
+/// the SIGKILL/panic=abort/cmd+W→SIGHUP path doesn't run Drop, so the mutex
+/// file survives but the holder is gone. Without PID-liveness the slot would
+/// be wedged for up to STALE_AFTER (60min). Fresh mtime suppresses the
+/// mtime fallback so this test specifically pins the PID-liveness path.
+#[test]
+fn dead_pid_init_mutex_reclaimed_inline() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    // Spawn + reap a short-lived child; the kernel frees its PID slot on wait().
+    // PID reuse is theoretically possible but vanishingly unlikely in the
+    // microseconds between `wait()` and the acquire below.
+    let mut dead = StdCommand::new("/usr/bin/true").spawn().unwrap();
+    let dead_pid = dead.id();
+    dead.wait().unwrap();
+
+    let init_dir = pool_root(&key).join(".meta/init");
+    std::fs::create_dir_all(&init_dir).unwrap();
+    let mutex_path = init_dir.join("ios-0.lock");
+    std::fs::write(&mutex_path, format!("{dead_pid}\n")).unwrap();
+    // Fresh mtime by construction (just wrote); STALE_AFTER fallback won't fire.
+
+    let out = Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args([
+            "--pool", &key, "acquire", "--name", "post-reclaim-pid",
+            "--group", "ios",
+        ])
+        .output()
+        .unwrap();
+    assert_ok(&out, "");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("reclaiming init mutex") && stderr.contains("no longer running"),
+        "expected PID-aware reclaim warning; got: {stderr}"
+    );
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(path.ends_with("/post-reclaim-pid"));
+}
+
 /// Stale pool-wide mutex (planted with old mtime) must be reclaimed by the next
 /// acquire. Without auto-recovery a SIGKILL'd holder wedges every consumer of
 /// the pool until manual `rm <pool>/.meta/pool.lock`. The threshold is well above

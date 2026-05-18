@@ -11,6 +11,7 @@ pub fn unstick(pool_root: &Path, _cfg: &PoolConfig, args: UnstickArgs) -> Result
     let pool_mutex_path = crate::fs_paths::pool_mutex(pool_root);
     if pool_mutex_path.exists() {
         let age = mutex::age_of(&pool_mutex_path).map(|d| d.as_secs()).unwrap_or(0);
+        let dead = mutex::dead_holder_pid(&pool_mutex_path);
         if args.pool_mutex {
             std::fs::remove_file(&pool_mutex_path)
                 .with_context(|| format!("rm {}", pool_mutex_path.display()))?;
@@ -18,6 +19,13 @@ pub fn unstick(pool_root: &Path, _cfg: &PoolConfig, args: UnstickArgs) -> Result
                 "force-cleared pool mutex {} (age {}s)",
                 pool_mutex_path.display(),
                 age
+            );
+        } else if let Some(pid) = dead {
+            println!(
+                "pool mutex held by dead pid {} at {} — next acquire/release auto-reclaims; \
+                 pass --pool-mutex to clear now",
+                pid,
+                pool_mutex_path.display()
             );
         } else {
             println!(
@@ -62,15 +70,21 @@ pub fn unstick(pool_root: &Path, _cfg: &PoolConfig, args: UnstickArgs) -> Result
             }
         };
 
-        if age >= mutex::STALE_AFTER {
+        let dead_pid = mutex::dead_holder_pid(&path);
+        if age >= mutex::STALE_AFTER || dead_pid.is_some() {
             std::fs::remove_file(&path)
                 .with_context(|| format!("rm {}", path.display()))?;
             cleared += 1;
-            println!(
-                "cleared stale mutex {} (age {}s)",
-                slot_id,
-                age.as_secs()
-            );
+            match dead_pid {
+                Some(pid) => println!(
+                    "cleared mutex {} (holder pid {} no longer running, age {}s)",
+                    slot_id, pid, age.as_secs()
+                ),
+                None => println!(
+                    "cleared stale mutex {} (age {}s)",
+                    slot_id, age.as_secs()
+                ),
+            }
         } else {
             println!(
                 "live mutex {} (age {}s, threshold {}s)",
