@@ -66,7 +66,7 @@ The HEAD-detached check is the disambiguator for the canonical-with-lock row: a 
 
 **Pool-wide mutex** (`<pool>/.meta/pool.lock`): the holder writes its PID into the file at create time. On contention, a new acquire reads the PID and probes `kill(pid, 0)` — if the holder process is gone (cmd+W → SIGHUP, SIGKILL, OOM, panic under `panic=abort`), the lock is reclaimed immediately. Mtime ≥ `POOL_MUTEX_STALE_AFTER` (120s) is kept as a fallback for legacy lock files and the microsecond create-then-write-PID race window.
 
-**Init mutex** (`<pool>/.meta/init/<slot-id>.lock`): mtime-heartbeated every 30s during init; reclaimable by another acquire after 60min of no heartbeat (covers SIGKILL'd cold submodule clones), with a stderr warning logged. Manual cleanup via `worktree-pool --pool <key> unstick [--slot <id>]`.
+**Init mutex** (`<pool>/.meta/init/<slot-id>.lock`): same PID+mtime reclaim shape as the pool mutex. Holder writes its PID at create time; contenders probe `kill(pid, 0)` first and reclaim immediately if the holder is gone. Mtime ≥ `STALE_AFTER` (60min) is the fallback — heartbeated every 30s during legitimate inits so the threshold can sit well above a cold submodule clone (30+ min). Manual cleanup via `worktree-pool --pool <key> unstick [--slot <id>]`; `unstick` also reclaims dead-PID locks regardless of age.
 
 ## Capacity-bound failures
 

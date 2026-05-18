@@ -35,11 +35,7 @@ impl InitMutex {
         match Self::create_excl_with_pid(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // PID-aware reclaim first — bounds wait to ~0 when the holder
-                // died without running Drop (SIGKILL, panic=abort, cmd+W→SIGHUP,
-                // OOM). Without this, init mutex held for up to STALE_AFTER
-                // (60min) wedges the slot — meaningful because init can legitimately
-                // run minutes (cold submodule clone) so we can't shorten STALE_AFTER.
+                // PID-aware reclaim first; mtime fallback (see module header).
                 if let Some(pid) = dead_holder_pid(&path) {
                     eprintln!(
                         "warn: reclaiming init mutex {} (holder pid {} no longer running)",
@@ -49,9 +45,7 @@ impl InitMutex {
                     std::fs::remove_file(&path).ok();
                     Self::create_excl_with_pid(&path)
                         .with_context(|| format!("re-creating mutex {}", path.display()))?;
-                } else if Self::is_stale(&path)? {
-                    // Mtime fallback for legacy locks (pre-PID format), unparseable
-                    // PIDs, and the microsecond create-then-write-PID race window.
+                } else if age_of(&path)? >= STALE_AFTER {
                     eprintln!(
                         "warn: reclaiming stale init mutex {} (no heartbeat for >{}s)",
                         path.display(),
@@ -116,9 +110,6 @@ impl InitMutex {
         Ok(())
     }
 
-    fn is_stale(path: &Path) -> Result<bool> {
-        Ok(age_of(path)? >= STALE_AFTER)
-    }
 }
 
 /// File mtime → age (`now - mtime`). Used for stale-mutex detection across the tool.
@@ -137,10 +128,8 @@ fn read_pid_file(path: &Path) -> Option<u32> {
     s.trim().parse().ok()
 }
 
-/// If the lock file has a parseable PID and that PID is no longer alive,
-/// return Some(pid) — caller can reclaim without waiting for the mtime-stale
-/// threshold. None means either no/garbled PID (legacy or write-race) or the
-/// holder is still running.
+/// Some(pid) if the lock file's PID is parseable and not alive; None otherwise
+/// (live holder, legacy/empty file, or the create-then-write-PID race window).
 pub fn dead_holder_pid(path: &Path) -> Option<u32> {
     let pid = read_pid_file(path)?;
     (!pid_alive(pid)).then_some(pid)
@@ -196,11 +185,7 @@ impl PoolMutex {
             match InitMutex::create_excl_with_pid(&path) {
                 Ok(()) => return Ok(Self { path }),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Liveness check first — closes the gap when the holder died
-                    // without running Drop (cmd+W → SIGHUP, SIGKILL, OOM, panic
-                    // under panic=abort). PID-aware reclaim is immediate; the
-                    // mtime fallback below catches pre-PID-aware lock files and
-                    // the microsecond create-then-write-PID race window.
+                    // PID-aware reclaim first; mtime fallback (see module header).
                     if let Some(pid) = dead_holder_pid(&path) {
                         eprintln!(
                             "warn: reclaiming pool mutex {} (holder pid {} no longer running)",

@@ -14,8 +14,7 @@ cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml"
 
 ln -sfn "$REPO_ROOT/target/release/worktree-pool" "$LINK_DIR/worktree-pool"
 ln -sfn "$REPO_ROOT/bin/wt" "$LINK_DIR/wt"
-echo "linked $LINK_DIR/worktree-pool → $REPO_ROOT/target/release/worktree-pool"
-echo "linked $LINK_DIR/wt → $REPO_ROOT/bin/wt"
+echo "linked $LINK_DIR/{worktree-pool,wt}"
 
 if "$LINK_DIR/worktree-pool" doctor >/dev/null 2>&1; then
   echo "doctor passed."

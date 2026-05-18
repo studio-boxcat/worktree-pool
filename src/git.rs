@@ -335,13 +335,9 @@ pub fn checkout_force_branch(slot: &Path, name: &str) -> Result<()> {
 }
 
 /// Detach HEAD (so we can delete the current branch) via plumbing — `rev-parse`
-/// + `update-ref --no-deref`. Mirrors `checkout_force_branch`'s acquire-side
-/// design (lines above): pure ref manipulation, never touches the index or
-/// working tree, so it never contends with `<gitdir>/index.lock`. A stale
-/// index.lock left by a crashed git used to block `git checkout --detach` here
-/// and leave the slot's branch as a dangling ref; that's gone. The working
-/// tree is reset at next acquire anyway, so the cosmetic side-effect of
-/// `checkout --detach` (refresh files from index) was never needed.
+/// + `update-ref --no-deref`. Pure ref manipulation: no index, no working-tree
+/// walk, so no contention with a crashed-git `<gitdir>/index.lock` (which
+/// previously blocked `git checkout --detach` and left dangling branch refs).
 pub fn detach_head(slot: &Path) -> Result<(bool, String, String)> {
     let (ok, stdout, stderr) = run_lenient(slot, &["rev-parse", "HEAD"])?;
     if !ok {
