@@ -34,20 +34,20 @@ bench-cli:
     echo
     echo "==> acquire (cold + warm)"
     hyperfine --warmup 1 --runs 5 \
-      --prepare "'$BIN' --pool '$KEY' release --name foo 2>/dev/null || true" \
-      "'$BIN' --pool '$KEY' acquire --name foo --commit main --group ios"
+      --prepare "'$BIN' --pool '$KEY' release foo 2>/dev/null || true" \
+      "'$BIN' --pool '$KEY' acquire foo --commit main --group ios"
     echo
     echo "==> release"
-    "$BIN" --pool "$KEY" acquire --name foo --commit main --group ios >/dev/null
+    "$BIN" --pool "$KEY" acquire foo --commit main --group ios >/dev/null
     hyperfine --warmup 1 --runs 5 \
-      --prepare "'$BIN' --pool '$KEY' acquire --name foo --commit main --group ios >/dev/null 2>&1 || true" \
-      "'$BIN' --pool '$KEY' release --name foo"
+      --prepare "'$BIN' --pool '$KEY' acquire foo --commit main --group ios >/dev/null 2>&1 || true" \
+      "'$BIN' --pool '$KEY' release foo"
     echo
     echo "==> ls (no held slots)"
     hyperfine --warmup 1 --runs 10 "'$BIN' --pool '$KEY' ls"
     echo
     echo "==> ls --git-status (1 held slot)"
-    "$BIN" --pool "$KEY" acquire --name foo --commit main --group ios >/dev/null
+    "$BIN" --pool "$KEY" acquire foo --commit main --group ios >/dev/null
     hyperfine --warmup 1 --runs 5 "'$BIN' --pool '$KEY' ls --git-status"
 
 # Capture an acquire+release sampling profile via samply. Opens in Firefox profiler UI.
@@ -64,4 +64,4 @@ profile:
     BARE=$(scripts/bench-fixture.sh "$TMP")
     "$BIN" --pool "$KEY" init --source "$BARE" --max-slots 4 --groups ios
     echo "==> profiling acquire (cold)"
-    samply record -- "$BIN" --pool "$KEY" acquire --name foo --commit main --group ios
+    samply record -- "$BIN" --pool "$KEY" acquire foo --commit main --group ios

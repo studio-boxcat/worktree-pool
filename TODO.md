@@ -42,8 +42,6 @@ Reviewers ran over the perf changes (`a504730`..`c17a34b`). Real bugs fixed inli
 ### Correctness / hardening (deferred)
 
 - **Cross-acquire `<source>/.git/config` lockfile contention (theoretical)** — `submodules::update` phase 1 sequentially writes `submodule.<name>.url` per submodule via `git -C <slot> config …`, which targets the shared `<source>/.git/config`. Two parallel acquires on different slots in the same source can cluster their writes (~17 × ~5ms each per acquire) and contend on git's `O_EXCL` lockfile retry. Not observed in 4-way stress test on macmini (window is small and git's internal retry usually wins). If it surfaces: take a per-source mutex around the phase-1 loop (cheap, scoped narrower than `pool_mu`), or set `extensions.worktreeConfig=true` and write submodule config per-worktree.
-- **`wt land`'s `land.lock` still uses PID + mtime** — the Rust mutex switched to flock (`std::fs::File::try_lock`, OS auto-releases on death). `bin/wt`'s `cmd_land` carries its own bash-level `land.lock` with PID-write + `kill -0` probe + 5-min mtime fallback. Equivalent semantics, separate implementation. Worth porting to flock-equivalent (`flock(1)` or a tiny rust helper) for consistency, but not load-bearing — bash flock works fine on macOS via `shlock`/`util-linux` if available.
-
 ### Test coverage gaps (deferred)
 
 - **`--exclude-submodule-tags` deinit path completely untested end-to-end** — `submodules.rs` deinit-on-tag-excluded code path has only unit tests for `parse_gitmodules_*`. Add a fixture with two submodules, one tagged `editor` via `worktreePoolTag = editor`, acquire with `--exclude-submodule-tags editor`, assert the tagged submodule's working dir is absent post-acquire and the other is checked out.

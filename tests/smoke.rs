@@ -128,43 +128,6 @@ fn slot_id_from_output(out: &std::process::Output) -> String {
     PathBuf::from(&path).file_name().unwrap().to_string_lossy().into_owned()
 }
 
-/// Init-mutex flock guard. The OS releases the flock on drop (file close).
-///
-/// **Why tests need this:** acquire/release CLI processes exit promptly, so
-/// the OS frees their init-mutex flock immediately on return. The next
-/// pool-mutex op runs `reclaim_stale`, sees a held slot with no live holder,
-/// and replays release — silently un-holding the slot the test just acquired.
-/// Tests that need a slot to remain held across multiple worktree-pool CLI
-/// invocations grab this guard *after* acquire returns to keep the slot live.
-struct InitMutexHold {
-    _file: std::fs::File,
-}
-
-impl InitMutexHold {
-    fn acquire(key: &str, slot_id: &str) -> Self {
-        let path = pool_root(key).join(".meta/init").join(format!("{slot_id}.lock"));
-        let file = std::fs::OpenOptions::new()
-            .read(true).write(true).create(true).truncate(false)
-            .open(&path)
-            .unwrap_or_else(|e| panic!("open init mutex {}: {e}", path.display()));
-        file.try_lock()
-            .unwrap_or_else(|e| panic!("flock init mutex {}: {e}", path.display()));
-        Self { _file: file }
-    }
-}
-
-/// Acquire a slot AND hold its init-mutex flock so reclaim_stale won't sweep
-/// it between CLI invocations. Returns (slot_path, flock_guard).
-fn acquire_held(key: &str, name: &str) -> (PathBuf, InitMutexHold) {
-    let out = acquire_dev(key, name);
-    assert_ok(&out, "acquire failed");
-    let slot_id = slot_id_from_output(&out);
-    let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
-    let hold = InitMutexHold::acquire(key, &slot_id);
-    (path, hold)
-}
-
-
 // ---------- e2e tests ----------
 
 #[test]
@@ -228,8 +191,6 @@ fn unique_sha_refuses_second_acquire() {
         .unwrap();
     assert_ok(&out1, "first acquire");
     // Hold init-mutex flock so subsequent reclaim_stale sees the slot as live.
-    let _hold1 = InitMutexHold::acquire(&key, &slot_id_from_output(&out1));
-
     let out = Command::cargo_bin("worktree-pool")
         .unwrap()
         .args([
@@ -322,7 +283,7 @@ fn ls_renders_with_git_status_for_held_only() {
     let tmp = tempfile::TempDir::new().unwrap();
     let bare = make_fixture(tmp.path());
     init_pool(&key, &bare);
-    let (_, _hold) = acquire_held(&key, "feat-x");
+    let _ = acquire_dev(&key, "feat-x");
 
     let out = Command::cargo_bin("worktree-pool")
         .unwrap()
@@ -386,19 +347,15 @@ fn parallel_acquires_get_different_slots() {
 
     // pool_mutex serializes acquires, so true parallelism manifests only as
     // contention on that mutex (each acquire then runs to completion in
-    // isolation). The load-bearing assertion is "different slots picked",
-    // which we keep — but each acquire's init-mutex flock is grabbed
-    // synchronously so the next acquire's reclaim_stale sees it as live.
+    // isolation). The load-bearing assertion is "different slots picked".
     let mut outs = Vec::new();
-    let mut holds = Vec::new();
     for i in 0..3 {
-        let (path, hold) = acquire_held(&key, &format!("dev-{i}"));
-        outs.push(path);
-        holds.push(hold);
+        let out = acquire_dev(&key, &format!("dev-{i}"));
+        assert_ok(&out, "acquire failed");
+        outs.push(PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string()));
     }
     let paths: std::collections::HashSet<_> = outs.iter().cloned().collect();
     assert_eq!(paths.len(), 3, "duplicate slot paths: {paths:?}");
-    drop(holds);
 }
 
 /// Capacity exhaustion: when all max_slots in a group are held, the next acquire
@@ -420,8 +377,8 @@ fn acquire_capacity_exhaustion() {
         .assert()
         .success();
 
-    let (_, _h1) = acquire_held(&key, "a");
-    let (_, _h2) = acquire_held(&key, "b");
+    assert_ok(&acquire_dev(&key, "a"), "acquire a");
+    assert_ok(&acquire_dev(&key, "b"), "acquire b");
     let out = acquire_dev(&key, "c");
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -502,8 +459,6 @@ fn parallel_unique_sha_at_most_one_succeeds() {
         .output()
         .unwrap();
     assert_ok(&out1, "first --unique-sha acquire");
-    let _hold = InitMutexHold::acquire(&key, &slot_id_from_output(&out1));
-
     let out2 = Command::cargo_bin("worktree-pool")
         .unwrap()
         .args([
@@ -590,7 +545,6 @@ fn acquire_branches_submodule_release_cleans_up() {
         String::from_utf8_lossy(&out.stderr)
     );
     let slot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
-    let _hold = InitMutexHold::acquire(&key, &slot_id_from_output(&out));
     let sub = slot.join("sub");
 
     // HEAD attached to refs/heads/<slot_name> (not detached).
@@ -1185,7 +1139,6 @@ fn session_land_keeps_first_parent_on_mainline_after_parallel_land() {
     let out_a = acquire_dev(&key, "slot-a");
     assert_ok(&out_a, "acquire slot-a");
     let slot_a = PathBuf::from(String::from_utf8_lossy(&out_a.stdout).trim().to_string());
-    let _hold_a = InitMutexHold::acquire(&key, &slot_id_from_output(&out_a));
     let out_b = acquire_dev(&key, "slot-b");
     assert_ok(&out_b, "acquire slot-b");
     let slot_b = PathBuf::from(String::from_utf8_lossy(&out_b.stdout).trim().to_string());
@@ -1410,7 +1363,6 @@ fn session_land_refreshes_slot_submodule_when_main_brought_advance() {
     let out = acquire_dev_sub(&key, "slot-a");
     assert_ok(&out, "acquire slot-a");
     let slot_a = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
-    let _hold_a = InitMutexHold::acquire(&key, &slot_id_from_output(&out));
     let out = acquire_dev_sub(&key, "slot-b");
     assert_ok(&out, "acquire slot-b");
     let slot_b = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
@@ -1893,7 +1845,6 @@ fn reclaim_does_not_disturb_live_held_slot() {
     let out = acquire_dev(&key, "live-1");
     assert_ok(&out, "");
     let live_slot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
-    let _hold = InitMutexHold::acquire(&key, &slot_id_from_output(&out));
     let live_gitdir = slot_gitdir_path(&live_slot);
     let live_lock_before = std::fs::read(live_gitdir.join("worktree-pool/lock")).unwrap();
 

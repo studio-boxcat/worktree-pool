@@ -164,11 +164,7 @@ fn build_row(entry: &slot::SlotEntry) -> Result<Row> {
         Err(_) => (State::Idle, None, "-".into()),
     };
 
-    let group = entry
-        .group
-        .clone()
-        .or_else(|| lock.as_ref().and_then(|l| l.group.clone()))
-        .unwrap_or_else(|| "-".into());
+    let group = entry.group.clone().unwrap_or_else(|| "-".into());
 
     let name = if state == State::Held {
         git::current_branch(&entry.path).unwrap_or_else(|| "(detached)".into())
