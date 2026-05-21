@@ -157,6 +157,51 @@ land_die()  { printf 'land: %s\n' "$*" >&2; exit 1; }
 # documented hook extension point.
 git_no_hooks() { git -c core.hooksPath=/dev/null "$@"; }
 
+# Submodule ancestry pre-flight. For each top-level submodule whose gitlink
+# the parent merge moved (`git diff --raw $main_before $slot_head`), fetch
+# the slot's branch into main's clone and verify the slot's tip is reachable
+# from main's clone HEAD (i.e. the ff step 12 will do is feasible). Without
+# this, divergent submodule histories surface mid-propagation at step 12
+# with parent already at slot_head and a `merge --ff-only` refusal —
+# recoverable but the error message is generic.
+#
+# Oracle = clone-tip ancestry (not gitlink ancestry). Gitlinks can move
+# forwards-and-backwards between main and slot trees independently of the
+# clone-tip history that ff actually targets.
+#
+# Returns 0 when no divergence (or no gitlinks moved); 1 on any per-sub
+# divergence (printed once per sub to stderr; final summary line emitted).
+# Extracted into a function so smoke tests can exercise it in isolation
+# without setting up the rest of cmd_land's preconditions.
+_land_preflight_submodules() {
+  local main_before=$1 slot_head=$2 main_path=$3 slot_path=$4 branch=$5
+  local moved sub slot_sub_tip main_sub_tip preflight_failed=0
+  moved=$(git -C "$slot_path" diff --raw "$main_before" "$slot_head" \
+    | awk '$2=="160000" {print $6}')
+  [ -n "$moved" ] || return 0
+  while IFS= read -r sub; do
+    [ -n "$sub" ] || continue
+    [ -e "$slot_path/$sub/.git" ] || continue
+    [ -e "$main_path/$sub/.git" ] || continue
+    slot_sub_tip=$(git -C "$slot_path/$sub" rev-parse HEAD 2>/dev/null) || continue
+    git -C "$main_path/$sub" fetch --quiet "$slot_path/$sub" "$branch" 2>/dev/null || true
+    main_sub_tip=$(git -C "$main_path/$sub" rev-parse HEAD 2>/dev/null) || continue
+    if ! git -C "$main_path/$sub" merge-base --is-ancestor "$main_sub_tip" "$slot_sub_tip" 2>/dev/null; then
+      land_warn "submodule '$sub' diverged — main's clone HEAD ${main_sub_tip:0:7} is not an ancestor of slot tip ${slot_sub_tip:0:7}"
+      echo "  step 12 will need to ff $main_path/$sub to ${slot_sub_tip:0:7}, but main's clone has commits not in that history." >&2
+      echo "  recovery (pick one): " >&2
+      echo "    discard main-side: git -C $main_path/$sub reset --hard ${slot_sub_tip:0:7}   # loses ${main_sub_tip:0:7}" >&2
+      echo "    merge main-side:   git -C $main_path/$sub merge ${slot_sub_tip:0:7}   # then 'git -C $main_path add $sub && git commit' to bump source's gitlink" >&2
+      preflight_failed=1
+    fi
+  done <<< "$moved"
+  if [ "$preflight_failed" != 0 ]; then
+    land_warn "submodule preflight failed — main NOT advanced. Resolve and re-run."
+    return 1
+  fi
+  return 0
+}
+
 # If SUB_PATH's HEAD is detached, attach it to the first branch from the
 # remaining args that exists. Used by `wt land`'s submodule fetch+attach+ff
 # blocks — different attach priorities per direction, but identical loop.
@@ -807,45 +852,8 @@ cmd_land() {
   local slot_head
   slot_head=$(git rev-parse HEAD)
 
-  # Submodule ancestry pre-flight. For each top-level submodule whose gitlink
-  # the parent merge moved, fetch the slot's branch into main's clone and
-  # verify the slot's tip is reachable from main's clone HEAD (i.e. the ff
-  # step 8 will do is feasible). Without this, divergent submodule histories
-  # surface mid-propagation at step 8 with parent already at slot_head and a
-  # `merge --ff-only` refusal — recoverable but the error message is generic.
-  # Aggregate all submodules and report once. Fetches are local-only.
-  #
-  # Oracle = clone-tip ancestry (not gitlink ancestry). Gitlinks can move
-  # forwards-and-backwards between main and slot trees independently of the
-  # clone-tip history that ff actually targets.
-  local moved_preflight preflight_failed=0
-  moved_preflight=$(git diff --raw "$main_before" "$slot_head" | awk '$2=="160000" {print $6}')
-  if [ -n "$moved_preflight" ]; then
-    while IFS= read -r sub; do
-      [ -n "$sub" ] || continue
-      [ -e "$slot_path/$sub/.git" ] || continue
-      [ -e "$main_path/$sub/.git" ] || continue
-      local slot_sub_tip main_sub_tip
-      slot_sub_tip=$(git -C "$slot_path/$sub" rev-parse HEAD 2>/dev/null) || continue
-      # Fetch first so main's clone has the slot's tip reachable for the
-      # ancestry probe (and step 8's `merge --ff-only` will reuse the fetched
-      # objects — no double work).
-      git -C "$main_path/$sub" fetch --quiet "$slot_path/$sub" "$branch" 2>/dev/null || true
-      main_sub_tip=$(git -C "$main_path/$sub" rev-parse HEAD 2>/dev/null) || continue
-      if ! git -C "$main_path/$sub" merge-base --is-ancestor "$main_sub_tip" "$slot_sub_tip" 2>/dev/null; then
-        land_warn "submodule '$sub' diverged — main's clone HEAD ${main_sub_tip:0:7} is not an ancestor of slot tip ${slot_sub_tip:0:7}"
-        echo "  step 12 will need to ff $main_path/$sub to ${slot_sub_tip:0:7}, but main's clone has commits not in that history." >&2
-        echo "  recovery (pick one): " >&2
-        echo "    discard main-side: git -C $main_path/$sub reset --hard ${slot_sub_tip:0:7}   # loses ${main_sub_tip:0:7}" >&2
-        echo "    merge main-side:   git -C $main_path/$sub merge ${slot_sub_tip:0:7}   # then 'git -C $main_path add $sub && git commit' to bump source's gitlink" >&2
-        preflight_failed=1
-      fi
-    done <<< "$moved_preflight"
-    if [ "$preflight_failed" != 0 ]; then
-      land_warn "submodule preflight failed — main NOT advanced. Resolve and re-run."
-      exit 1
-    fi
-  fi
+  _land_preflight_submodules "$main_before" "$slot_head" "$main_path" "$slot_path" "$branch" \
+    || exit 1
 
   # Order: submodule propagation BEFORE parent ff-merge. If propagation fails,
   # parent stays at main_before and re-running land retries cleanly (each
@@ -1510,6 +1518,7 @@ case "$verb" in
   land)    cmd_land    "$@" ;;
   cleanup) require_pool; cmd_cleanup "$@" ;;
   _exit_handler) require_pool; cmd__exit_handler "$@" ;;
+  _land_preflight_submodules) _land_preflight_submodules "$@" ;;
   sweep)   require_pool; cmd_sweep   "$@" ;;
   release) require_pool; cmd_release "$@" ;;
   orient)  cmd_orient  "$@" ;;

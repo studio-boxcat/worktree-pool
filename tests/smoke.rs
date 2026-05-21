@@ -184,6 +184,62 @@ fn full_lifecycle() {
         .success();
 }
 
+/// `ExitKind::Contended` (exit code 3): when every candidate init mutex is
+/// held by another process, acquire must exit 3 (not the generic 1 or the
+/// capacity-4) so retry-aware callers can distinguish "transient — retry"
+/// from "no capacity — release something". Locks the contract from
+/// docs/cli.md §Exit codes.
+#[test]
+fn contended_init_mutex_exits_3() {
+    use std::fs::{File, OpenOptions};
+
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool_groupless_max1(&key, &bare);
+
+    // Hold the only candidate's init-mutex flock from the test process. The
+    // acquire subprocess opens the same path (different OFD) and `try_lock`
+    // returns WouldBlock → InitMutex::try_acquire returns None → no candidate
+    // wins → bail_exit!(Contended).
+    let mutex_path = pool_root(&key).join(".meta/init/slot-0.lock");
+    std::fs::create_dir_all(mutex_path.parent().unwrap()).unwrap();
+    let holder: File = OpenOptions::new()
+        .read(true).write(true).create(true).truncate(false)
+        .open(&mutex_path).unwrap();
+    holder.try_lock().expect("test process must take the flock");
+
+    let out = acquire_dev_groupless(&key, "blocked");
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(3),
+        "init-mutex contention must exit 3; got {:?}", out.status.code());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("init mutexes held"),
+        "expected contended-message; got: {stderr}");
+
+    drop(holder);
+}
+
+fn init_pool_groupless_max1(key: &str, bare: &Path) {
+    Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", key, "init"])
+        .arg("--source")
+        .arg(bare)
+        .args(["--max-slots", "1"])
+        .assert()
+        .success();
+}
+
+fn acquire_dev_groupless(key: &str, name: &str) -> std::process::Output {
+    Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", key, "acquire", name])
+        .output()
+        .unwrap()
+}
+
 /// Groupless pool: slots are named `slot-N` and `--group` is rejected.
 #[test]
 fn groupless_pool_full_lifecycle() {
@@ -583,6 +639,124 @@ fn make_fixture_with_submodule(dir: &Path) -> PathBuf {
     git_commit(&staging, "with submodule");
     run_git(&staging, &["push", "--quiet", "-u", "origin", "main"]);
     bare
+}
+
+/// Make a parent bare whose top-level submodule `outer` itself registers a
+/// nested submodule `inner`. Exercises the full-depth parallel-recursion
+/// path in `submodules::update_recursive`.
+///
+/// Layout:
+///   <dir>/inner.git    (innermost bare, one commit)
+///   <dir>/outer.git    (registers inner as a submodule at `inner/`)
+///   <dir>/source.git   (registers outer as a submodule at `outer/`)
+fn make_fixture_with_nested_submodule(dir: &Path) -> PathBuf {
+    // Innermost bare.
+    let inner_bare = dir.join("inner.git");
+    run_git_root(&["init", "--quiet", "--bare", &inner_bare.display().to_string()]);
+    let inner_staging = dir.join("inner-staging");
+    run_git_root(&[
+        "clone", "--quiet",
+        &inner_bare.display().to_string(),
+        &inner_staging.display().to_string(),
+    ]);
+    std::fs::write(inner_staging.join("FILE"), b"inner-content").unwrap();
+    git_commit(&inner_staging, "inner init");
+    run_git(&inner_staging, &["push", "--quiet", "-u", "origin", "main"]);
+
+    // Outer bare with nested inner.
+    let outer_bare = dir.join("outer.git");
+    run_git_root(&["init", "--quiet", "--bare", &outer_bare.display().to_string()]);
+    let outer_staging = dir.join("outer-staging");
+    run_git_root(&[
+        "clone", "--quiet",
+        &outer_bare.display().to_string(),
+        &outer_staging.display().to_string(),
+    ]);
+    std::fs::write(outer_staging.join("OUTER_FILE"), b"outer-content").unwrap();
+    run_git(&outer_staging, &["add", "OUTER_FILE"]);
+    run_git(
+        &outer_staging,
+        &[
+            "-c", "protocol.file.allow=always",
+            "submodule", "add", "--quiet",
+            &inner_bare.display().to_string(),
+            "inner",
+        ],
+    );
+    git_commit(&outer_staging, "outer with inner");
+    run_git(&outer_staging, &["push", "--quiet", "-u", "origin", "main"]);
+
+    // Source bare registers outer.
+    let bare = dir.join("source.git");
+    run_git_root(&["init", "--quiet", "--bare", &bare.display().to_string()]);
+    let staging = dir.join("staging");
+    run_git_root(&[
+        "clone", "--quiet",
+        &bare.display().to_string(),
+        &staging.display().to_string(),
+    ]);
+    std::fs::write(staging.join("README"), b"hi").unwrap();
+    run_git(&staging, &["add", "README"]);
+    run_git(
+        &staging,
+        &[
+            "-c", "protocol.file.allow=always",
+            "submodule", "add", "--quiet",
+            &outer_bare.display().to_string(),
+            "outer",
+        ],
+    );
+    git_commit(&staging, "with nested outer");
+    run_git(&staging, &["push", "--quiet", "-u", "origin", "main"]);
+    bare
+}
+
+/// Nested submodules materialize end-to-end on acquire: outer + inner both
+/// present, inner's HEAD attached to the slot's branch (the
+/// `update_recursive` branch-attach convention applies to every depth).
+#[test]
+fn acquire_recurses_into_nested_submodules() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture_with_nested_submodule(tmp.path());
+    init_pool(&key, &bare);
+
+    let slot_name = "feat-nest";
+    let out = acquire_dev_sub(&key, slot_name);
+    assert_ok(&out, "nested acquire");
+    let slot_path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+
+    let outer_file = slot_path.join("outer/OUTER_FILE");
+    let inner_file = slot_path.join("outer/inner/FILE");
+    assert!(outer_file.exists(), "outer materialization missing: {}", outer_file.display());
+    assert!(inner_file.exists(), "nested inner materialization missing: {}", inner_file.display());
+
+    // Branch-attach convention applies at every depth.
+    let inner_path = slot_path.join("outer/inner");
+    let head = StdCommand::new("git")
+        .args(["symbolic-ref", "HEAD"])
+        .current_dir(&inner_path)
+        .output()
+        .unwrap();
+    assert!(head.status.success(), "nested submodule HEAD detached");
+    assert_eq!(
+        String::from_utf8_lossy(&head.stdout).trim(),
+        format!("refs/heads/{slot_name}"),
+        "nested submodule branch should match slot name"
+    );
+
+    // Release un-creates the nested branch (delete_branch_recursive).
+    release(&key, slot_name);
+    let canonical_inner = pool_root(&key).join("ios-0/outer/inner");
+    let after = StdCommand::new("git")
+        .args(["rev-parse", "--verify", &format!("refs/heads/{slot_name}")])
+        .current_dir(&canonical_inner)
+        .output()
+        .unwrap();
+    assert!(!after.status.success(),
+        "nested submodule branch should be deleted on release; rev-parse returned: {}",
+        String::from_utf8_lossy(&after.stdout));
 }
 
 /// Make a bare repo with two submodules; `editor_sub` is tagged
@@ -1897,6 +2071,143 @@ fn session_land_propagates_submodule_to_main() {
         "submodule's new tracked file did not land in main worktree");
 }
 
+
+/// Unit-style test for `_land_preflight_submodules`: invoke it directly via
+/// the hidden wt subcommand, with a pre-built diverged-submodule scenario.
+/// Bypasses cmd_land's preconditions (main_dirty status check etc.) that
+/// make a full-integration test structurally impossible — see TODO.md.
+#[test]
+fn land_preflight_refuses_diverged_submodule_clones() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    make_fixture_with_submodule(tmp.path());
+    let bare = tmp.path().join("source.git");
+
+    let clone = |dst: &Path| {
+        run_git_root(&[
+            "clone", "--quiet",
+            &bare.display().to_string(),
+            &dst.display().to_string(),
+        ]);
+        run_git(
+            dst,
+            &["-c", "protocol.file.allow=always", "submodule", "update", "--init"],
+        );
+    };
+
+    // Two independent clones of the source.
+    let main_repo = tmp.path().join("main-repo");
+    clone(&main_repo);
+    let slot_repo = tmp.path().join("slot-repo");
+    clone(&slot_repo);
+
+    let main_before = String::from_utf8_lossy(
+        &StdCommand::new("git").args(["-C", &main_repo.display().to_string(), "rev-parse", "HEAD"])
+            .output().unwrap().stdout).trim().to_string();
+
+    // Slot side: branch `feat-x` in slot/sub, commit, bump parent gitlink.
+    let slot_sub = slot_repo.join("sub");
+    run_git(&slot_sub, &["checkout", "--quiet", "-b", "feat-x"]);
+    std::fs::write(slot_sub.join("FROM_SLOT"), b"slot side\n").unwrap();
+    git_commit(&slot_sub, "slot-side commit");
+    git_commit(&slot_repo, "bump sub");
+    let slot_head = String::from_utf8_lossy(
+        &StdCommand::new("git").args(["-C", &slot_repo.display().to_string(), "rev-parse", "HEAD"])
+            .output().unwrap().stdout).trim().to_string();
+
+    // Main side: branch `main-side` in main/sub, commit (diverges from B
+    // sharing only the original A as ancestor). Don't bump parent gitlink —
+    // we deliberately leave main's tree at the original (the preflight only
+    // cares about the clone HEADs).
+    let main_sub = main_repo.join("sub");
+    run_git(&main_sub, &["checkout", "--quiet", "-b", "main-side"]);
+    std::fs::write(main_sub.join("FROM_MAIN"), b"main side\n").unwrap();
+    git_commit(&main_sub, "main-side commit");
+
+    let out = session_cmd(
+        &key,
+        &[
+            "_land_preflight_submodules",
+            &main_before,
+            &slot_head,
+            &main_repo.display().to_string(),
+            &slot_repo.display().to_string(),
+            "feat-x",
+        ],
+    )
+    .output()
+    .unwrap();
+    assert!(!out.status.success(),
+        "preflight must refuse on diverged clones; stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("diverged"),
+        "expected divergence message; got: {stderr}");
+    assert!(stderr.contains("preflight failed"),
+        "expected final summary line; got: {stderr}");
+}
+
+/// Positive case for `_land_preflight_submodules`: main's clone stays at
+/// the original commit (ancestor of slot's tip), so preflight passes.
+/// Locks the "no false positive" half of the contract.
+#[test]
+fn land_preflight_passes_when_main_clone_is_ancestor() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    make_fixture_with_submodule(tmp.path());
+    let bare = tmp.path().join("source.git");
+
+    let clone = |dst: &Path| {
+        run_git_root(&[
+            "clone", "--quiet",
+            &bare.display().to_string(),
+            &dst.display().to_string(),
+        ]);
+        run_git(
+            dst,
+            &["-c", "protocol.file.allow=always", "submodule", "update", "--init"],
+        );
+    };
+    let main_repo = tmp.path().join("main-repo");
+    clone(&main_repo);
+    let slot_repo = tmp.path().join("slot-repo");
+    clone(&slot_repo);
+
+    let main_before = String::from_utf8_lossy(
+        &StdCommand::new("git").args(["-C", &main_repo.display().to_string(), "rev-parse", "HEAD"])
+            .output().unwrap().stdout).trim().to_string();
+
+    // Slot bumps sub (B descends from A); main stays at A.
+    let slot_sub = slot_repo.join("sub");
+    run_git(&slot_sub, &["checkout", "--quiet", "-b", "feat-x"]);
+    std::fs::write(slot_sub.join("FROM_SLOT"), b"slot side\n").unwrap();
+    git_commit(&slot_sub, "slot-side commit");
+    git_commit(&slot_repo, "bump sub");
+    let slot_head = String::from_utf8_lossy(
+        &StdCommand::new("git").args(["-C", &slot_repo.display().to_string(), "rev-parse", "HEAD"])
+            .output().unwrap().stdout).trim().to_string();
+
+    let out = session_cmd(
+        &key,
+        &[
+            "_land_preflight_submodules",
+            &main_before,
+            &slot_head,
+            &main_repo.display().to_string(),
+            &slot_repo.display().to_string(),
+            "feat-x",
+        ],
+    )
+    .output()
+    .unwrap();
+    assert!(out.status.success(),
+        "preflight must pass when main is ancestor of slot; stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr));
+}
 
 #[test]
 fn session_land_refuses_when_main_worktree_on_other_branch() {
