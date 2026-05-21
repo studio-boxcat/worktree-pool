@@ -23,7 +23,7 @@ Pool config (source path, mirror mode) lives in `<pool>/.meta/config.yaml` writt
 
 Slots share `.git/` and `.git/modules/` with the source repo, but **not** the working tree. Things to know when running multiple slots concurrently:
 
-- **Per-slot warmth lives inside the slot dir.** Build artifacts (Unity `Library/`, `Temp/`, `proj-*`, `node_modules/`, gradle caches) survive recycle because pool's `acquire` does `git reset --hard` only — never `git clean`. Across-platform flips inside a single slot rebuild platform-specific caches; don't symlink caches across slots.
+- **Per-slot warmth lives inside the slot dir.** Build artifacts (Unity `Library/`, `Temp/`, `proj-*`, `node_modules/`, gradle caches) survive recycle because the slot stays at its canonical path (no rename) and pool's `acquire` does `git reset --hard` only — never `git clean`. Stable abs paths preserve caches that key on absolute path: Unity Bee compile cache, watchman watches, IDE indexes. Across-platform flips inside a single slot rebuild platform-specific caches; don't symlink caches across slots.
 - **Submodule git-dirs (`<source>/.git/modules/...`) are shared.** Concurrent submodule updates can race on ref locks (`index.lock` / `worktrees.lock`); git's own internal `O_EXCL` retry handles transient contention. A *crashed-git* leftover `index.lock` in a slot's per-worktree gitdir (distinct case — SIGKILL/panic mid-write) is swept on the next acquire/release; see [[lifecycle.md#crash-recovery]].
 - **Shared docs (`TODO.md`, `CLAUDE.md`, `docs/`) are high-traffic.** Keep edits scoped, commit in their own commit, rebase early. A long-held dev session diverging on these is the usual source of conflicts.
 - **Branch refs accumulate in the source repo.** `release` deletes the branch (local + remote best-effort), so steady state has zero buildup. Crashed acquires that bypass release leave orphans — operator can prune via `git for-each-ref refs/heads/ | xargs ...`.
@@ -41,7 +41,7 @@ Cuts that simplify the design:
 - **No reclaim on holder death.** A SIGKILL'd holder leaves a held marker; operator notices via `ls` and runs `release`. (Distinct from protocol-crash recovery, which IS automatic — see [[lifecycle.md#crash-recovery]].)
 - **No `--fresh` / `--volatile` flags.** Caller wipes warmth itself if needed; release is the only "give back" verb.
 
-If you need GC-like behavior, write a 5-line script: `worktree-pool ls` → filter → `release --name <X>` per match. Keeps the binary lean.
+If you need GC-like behavior, write a 5-line script: `worktree-pool ls` → filter → `release <NAME>` per match. Keeps the binary lean.
 
 ---
 

@@ -99,6 +99,7 @@ fn dispatch(
         Release(args) => release::run(pool_path, cfg, args),
         Ls(args) => dashboard::ls(pool_path, cfg, args),
         Inspect(args) => dashboard::inspect(pool_path, cfg, args),
+        Path(args) => dashboard::path(pool_path, cfg, args),
         Unstick(args) => admin::unstick(pool_path, cfg, args),
         ValidateGitmodules => admin::validate_gitmodules(pool_path, cfg),
     }

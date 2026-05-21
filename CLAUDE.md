@@ -15,7 +15,7 @@ This file is the contract. `README.md` is a symlink to it. Detail lives in `docs
 
 ## Concepts
 
-A **pool** is a fixed-cardinality set of slots backed by a single source repo. Slots are interchangeable git worktrees; each `acquire` picks an idle slot, renames it to the caller's name, creates a branch, and hands back the path. `release` un-renames it back to the idle namespace and deletes the branch. Caches inside the slot dir survive recycling.
+A **pool** is a fixed-cardinality set of slots backed by a single source repo. Slots are interchangeable git worktrees living at canonical paths (`{group}-{N}` or `slot-{N}`); each `acquire` picks an idle slot, writes a held marker, creates a branch named after the caller's `NAME`, and hands back the canonical path. `release` deletes the branch and removes the held marker. The slot dir never moves, so any cache that keys on absolute path (Unity Bee compile cache, watchman watches, IDE indexes) stays warm across recycles.
 
 Pools are referenced by **key** (e.g. `myapp`, `another-pool`). Path: `$WORKTREE_ROOT/<key>/` — env var required, no fallback (set in `~/.zshenv.local`). For pools needing a different physical location (external SSD, etc.), symlink: `ln -s /Volumes/big/<key> "$WORKTREE_ROOT/<key>"`.
 
@@ -28,16 +28,15 @@ A **group** is an optional sub-namespace of slots (e.g. `ios`, `android`). With 
 ```
 $WORKTREE_ROOT/<key>/                                  # pool root
 $WORKTREE_ROOT/<key>/.meta/config.yaml                # pool config (written by `init`)
-$WORKTREE_ROOT/<key>/.meta/init/<slot-id>.lock        # init mutex (per-slot)
+$WORKTREE_ROOT/<key>/.meta/init/<slot-id>.lock        # init mutex (per-slot, flock-held)
 $WORKTREE_ROOT/<key>/.meta/pool.lock                  # pool-wide mutex (acquire + release)
-$WORKTREE_ROOT/<key>/{group}-{N}/                      # idle slot
-$WORKTREE_ROOT/<key>/<name>/                           # held slot (post-rename)
+$WORKTREE_ROOT/<key>/{group}-{N}/                      # slot (always canonical; held iff marker present)
 <source>/.git/worktrees/<git-id>/worktree-pool/lock   # held marker per slot
 ```
 
-The held marker lives in the source repo's per-worktree gitdir (which stays stable across our `fs::rename` + `git worktree repair` flow — see [[docs/lifecycle.md#why-not-git-worktree-move]]). Slot dir stays pristine; `git status` inside a slot shows only the user's actual changes.
+Slot dir stays at its canonical path for the lifetime of the pool — never renamed. Held/idle is signaled by the marker file's existence in the source repo's per-worktree gitdir. The user-given name lives in the git branch ref inside the slot (`git symbolic-ref --short HEAD`), not on disk; `release NAME` looks up the slot by branch.
 
-**Symlinked pool root constraint**: if `$WORKTREE_ROOT/<key>` is a symlink (typical when relocating slots to a faster volume), the symlink basename **must match** the target directory name. Submodule `core.worktree` rewrites are anchored on the pool-key segment, derived from the symlink basename. A mismatch (`ln -s /Volumes/big/myapp-pool "$WORKTREE_ROOT/myapp"`) would silently no-op the rewrites. Standard form: `ln -s /Volumes/big/<key> "$WORKTREE_ROOT/<key>"`.
+Mutex files are advisory flocks (`std::fs::File::try_lock`, stable since Rust 1.89). The OS auto-releases on process death (SIGKILL / panic=abort / SIGHUP), so leftover files carry no semantic load — no PID tracking, heartbeat, or staleness threshold.
 
 ---
 
@@ -51,7 +50,7 @@ full_sha: <40-char>                # always present (resolved at acquire)
 group: ios                         # only if pool has groups configured
 ```
 
-`started_at` is the source of truth for held-since; lock file mtime is the fallback when unparseable. `full_sha` enables same-SHA exclusion. `group` enables un-rename namespace at release.
+`started_at` is the source of truth for held-since; lock file mtime is the fallback when unparseable. `full_sha` enables same-SHA exclusion. `group` is informational (canonical group is derivable from the slot's path basename).
 
 ---
 
@@ -77,9 +76,9 @@ Per-host `init` runs once per pool key. Source path differs by host (build serve
 
 - Code lives in `src/`; one module per concern (`acquire`, `release`, `slot`, `lock`, `mutex`, `submodules`, `parallel`, `dashboard`, `admin`, `doctor`). `parallel` wraps `std::thread::scope` with inline-fallback on OS thread-create failure — `Scope::spawn` panics under thread starvation, and `panic = "abort"` would otherwise kill the process mid-release.
 - Hand-rolled YAML in `yaml.rs` — line-oriented scalars only. `serde_yaml` is unmaintained; ~30 LOC suffices.
-- `git` operations shell out via `git.rs`. We bypass `git worktree move` entirely (refuses on slots with submodules — see [[docs/lifecycle.md#why-not-git-worktree-move]]); `worktree_rename` does `fs::rename` + `git worktree repair` + submodule admin `core.worktree` self-heal instead.
+- `git` operations shell out via `git.rs`. Slot identity is the canonical path; the user-given name is just a branch ref. No rename, no `git worktree move`, no submodule admin self-heal.
 - Atomic writes via `tempfile::NamedTempFile::persist` (handles EXDEV across volumes).
-- Tests: `cargo test` (or `just test` to serialize). Unit + integration covering full lifecycle, race conditions, recycled-slot warmth, and submodule-rewrite self-heal regression.
+- Tests: `cargo test` (or `just test` to serialize). Unit + integration covering full lifecycle, race conditions, recycled-slot warmth, and crash recovery.
 
 `just install` runs `cargo build --release` and symlinks `~/.local/bin/{worktree-pool,wt}` at the cargo artifact path (`target/release/worktree-pool`) and `bin/wt`. Re-running `cargo build --release` after edits updates the installed tool in place. No committed binary; `target/` stays gitignored.
 

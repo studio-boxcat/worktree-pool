@@ -30,20 +30,11 @@ pub fn slot_lock(worktree_gitdir: &Path) -> PathBuf {
     worktree_gitdir.join("worktree-pool/lock")
 }
 
-/// Sticky pool-ownership marker, sibling to `slot_lock`. Written once at
-/// `acquire` time, never deleted by `release`/`reclaim_stale`/cleanup. Its
-/// presence is the positive signal that the slot dir was ever pool-acquired
-/// — without it, `reclaim_stale` would silently absorb manually-`git worktree
-/// add`-ed dirs and destructively un-rename them. See `release::reclaim_stale`.
-pub fn slot_created_marker(worktree_gitdir: &Path) -> PathBuf {
-    worktree_gitdir.join("worktree-pool/created")
-}
-
 /// Git's per-worktree index lock at `<worktree_gitdir>/index.lock`. Foreign to
 /// worktree-pool — git owns the lifecycle — but the file can leak when a git
 /// process dies between `open(O_CREAT|O_EXCL)` and a write (signal, panic,
 /// untracked-cache writeback aborted mid-flight). `reclaim_stale` sweeps the
-/// 0-byte + aged-out case; see `release::sweep_stale_index_lock`.
+/// 0-byte + aged-out case via `release::clear_stale_index_lock`.
 pub fn worktree_index_lock(worktree_gitdir: &Path) -> PathBuf {
     worktree_gitdir.join("index.lock")
 }

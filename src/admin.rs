@@ -1,4 +1,11 @@
-//! Admin verbs: `unstick` (clear stale init mutexes) and `validate-gitmodules`.
+//! Admin verbs: `unstick` (report mutex flock state) and `validate-gitmodules`.
+//!
+//! With OS-managed flocks (`std::fs::File::try_lock`), leftover mutex files
+//! carry no semantic load — the kernel auto-releases the lock on process
+//! death. `unstick` is therefore a read-only diagnostic: report which init
+//! mutexes are currently held by a live process. There's no "force-clear" —
+//! flock can't be released from outside the holding process (kill the holder
+//! if you really need it gone).
 use anyhow::{Context, Result};
 use std::path::Path;
 
@@ -7,33 +14,17 @@ use crate::config::PoolConfig;
 use crate::mutex;
 
 pub fn unstick(pool_root: &Path, _cfg: &PoolConfig, args: UnstickArgs) -> Result<()> {
-    // Pool-wide mutex: report status, force-clear if `--pool-mutex` was passed.
     let pool_mutex_path = crate::fs_paths::pool_mutex(pool_root);
     if pool_mutex_path.exists() {
-        let age = mutex::age_of(&pool_mutex_path).map(|d| d.as_secs()).unwrap_or(0);
-        let dead = mutex::dead_holder_pid(&pool_mutex_path);
-        if args.pool_mutex {
-            std::fs::remove_file(&pool_mutex_path)
-                .with_context(|| format!("rm {}", pool_mutex_path.display()))?;
+        if mutex::is_held(&pool_mutex_path) {
             println!(
-                "force-cleared pool mutex {} (age {}s)",
-                pool_mutex_path.display(),
-                age
-            );
-        } else if let Some(pid) = dead {
-            println!(
-                "pool mutex held by dead pid {} at {} — next acquire/release auto-reclaims; \
-                 pass --pool-mutex to clear now",
-                pid,
+                "pool mutex HELD: {} (live holder; kill the process if it's stuck)",
                 pool_mutex_path.display()
             );
         } else {
             println!(
-                "pool mutex held: {} (age {}s, stale-after {}s — auto-reclaim threshold; \
-                 pass --pool-mutex to force-clear)",
-                pool_mutex_path.display(),
-                age,
-                mutex::POOL_MUTEX_STALE_AFTER.as_secs()
+                "pool mutex free: {} (no live holder)",
+                pool_mutex_path.display()
             );
         }
     }
@@ -45,7 +36,7 @@ pub fn unstick(pool_root: &Path, _cfg: &PoolConfig, args: UnstickArgs) -> Result
     }
 
     let mut total = 0u32;
-    let mut cleared = 0u32;
+    let mut held = 0u32;
 
     for entry in std::fs::read_dir(&init_dir)
         .with_context(|| format!("read_dir {}", init_dir.display()))?
@@ -62,41 +53,17 @@ pub fn unstick(pool_root: &Path, _cfg: &PoolConfig, args: UnstickArgs) -> Result
         }
 
         total += 1;
-        let age = match mutex::age_of(&path) {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("  skip {}: {e:#}", path.display());
-                continue;
-            }
-        };
-
-        let dead_pid = mutex::dead_holder_pid(&path);
-        if age >= mutex::STALE_AFTER || dead_pid.is_some() {
-            std::fs::remove_file(&path)
-                .with_context(|| format!("rm {}", path.display()))?;
-            cleared += 1;
-            match dead_pid {
-                Some(pid) => println!(
-                    "cleared mutex {} (holder pid {} no longer running, age {}s)",
-                    slot_id, pid, age.as_secs()
-                ),
-                None => println!(
-                    "cleared stale mutex {} (age {}s)",
-                    slot_id, age.as_secs()
-                ),
-            }
+        if mutex::is_held(&path) {
+            held += 1;
+            println!("init mutex {}: HELD", slot_id);
         } else {
-            println!(
-                "live mutex {} (age {}s, threshold {}s)",
-                slot_id,
-                age.as_secs(),
-                mutex::STALE_AFTER.as_secs()
-            );
+            println!("init mutex {}: free", slot_id);
         }
     }
 
     println!(
-        "unstick: {cleared} cleared, {total} total {}",
+        "unstick: {held} held, {} free, {total} total {}",
+        total - held,
         if args.slot.is_some() { "(filtered)" } else { "" }
     );
     Ok(())

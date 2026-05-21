@@ -31,6 +31,10 @@ pub enum Command {
     /// Dump lock + git state for a held slot.
     Inspect(InspectArgs),
 
+    /// Print the canonical filesystem path of the slot whose branch matches
+    /// NAME. Exit 0 if found, 1 if no held slot has that branch.
+    Path(PathArgs),
+
     /// Clear stale init mutexes.
     Unstick(UnstickArgs),
 
@@ -87,8 +91,7 @@ impl SubmoduleMirrorMode {
 
 #[derive(clap::Args, Debug)]
 pub struct AcquireArgs {
-    /// Slot identity post-rename + branch name.
-    #[arg(long)]
+    /// Branch name created in the slot. Identifies the slot for release/inspect.
     pub name: String,
 
     /// Commit-ish to check out. Default: pool's `default_commit`.
@@ -112,7 +115,7 @@ pub struct AcquireArgs {
 
 #[derive(clap::Args, Debug)]
 pub struct ReleaseArgs {
-    #[arg(long)]
+    /// Branch name of the held slot to release.
     pub name: String,
 }
 
@@ -125,21 +128,19 @@ pub struct LsArgs {
 
 #[derive(clap::Args, Debug)]
 pub struct InspectArgs {
-    #[arg(long)]
+    /// Branch name of the held slot to inspect.
+    pub name: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct PathArgs {
+    /// Branch name of the held slot.
     pub name: String,
 }
 
 #[derive(clap::Args, Debug)]
 pub struct UnstickArgs {
-    /// Specific slot id (e.g. `ios-2`). Without it, list all stale mutexes.
+    /// Specific slot id (e.g. `ios-2`). Without it, report all init mutexes.
     #[arg(long)]
     pub slot: Option<String>,
-
-    /// Force-clear the pool-wide mutex (`<pool>/.meta/pool.lock`). Use only when
-    /// you're certain no legitimate acquire/release is in progress — an active
-    /// holder will lose its serialization guarantee and may corrupt slot state.
-    /// Stale holders (older than the pool-mutex threshold) are auto-reclaimed by
-    /// the next acquire/release; this flag is for impatient operators only.
-    #[arg(long)]
-    pub pool_mutex: bool,
 }

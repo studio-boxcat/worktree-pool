@@ -12,20 +12,22 @@ worktree-pool --pool myapp init \
   --max-slots 16 \
   --groups ios,android
 
-# Acquire a slot at a specific commit
-worktree-pool --pool myapp acquire --name abc12345 --commit abc12345 --group ios
-# → prints worktree path on stdout
+# Acquire a slot at a specific commit. Prints the canonical slot path
+# (e.g. `$WORKTREE_ROOT/myapp/ios-0`) on stdout. NAME becomes the branch ref
+# inside the slot.
+worktree-pool --pool myapp acquire abc12345 --commit abc12345 --group ios
 
 # Acquire a dev session at the pool's default_commit
-worktree-pool --pool myapp acquire --name feature-x --group ios
+worktree-pool --pool myapp acquire feature-x --group ios
 
-# Release
-worktree-pool --pool myapp release --name abc12345
+# Release (looks up the held slot by branch name)
+worktree-pool --pool myapp release abc12345
 
 # Inspect
 worktree-pool --pool myapp ls
-worktree-pool --pool myapp ls --git-status     # adds branch/dirty/untracked/ahead columns
-worktree-pool --pool myapp inspect --name abc12345
+worktree-pool --pool myapp ls --git-status     # adds dirty/untracked/ahead columns
+worktree-pool --pool myapp inspect abc12345
+worktree-pool --pool myapp path abc12345       # prints the canonical slot path; exit 1 if not held
 ```
 
 ## CLI
@@ -33,16 +35,26 @@ worktree-pool --pool myapp inspect --name abc12345
 ```
 worktree-pool --pool <key> init --source <repo> [--submodule-mirror-mode <m>] [--submodule-mirror-base <p>] [--default-commit <ref>] --max-slots <n> [--groups <g1,g2>]
 
-worktree-pool --pool <key> acquire --name <n> [--commit <commitish>] [--group <g>] [--unique-sha] [--exclude-submodule-tags <t1,t2>]
+worktree-pool --pool <key> acquire NAME [--commit <commitish>] [--group <g>] [--unique-sha] [--exclude-submodule-tags <t1,t2>]
 
-worktree-pool --pool <key> release --name <n>
+worktree-pool --pool <key> release NAME
 worktree-pool --pool <key> ls [--git-status]
-worktree-pool --pool <key> inspect --name <n>
+worktree-pool --pool <key> inspect NAME
+worktree-pool --pool <key> path NAME
 worktree-pool --pool <key> unstick [--slot <id>]
 worktree-pool --pool <key> validate-gitmodules
 
 worktree-pool doctor
 ```
+
+`NAME` is positional. For `acquire`, it becomes the branch ref inside the
+chosen canonical slot. For `release`/`inspect`/`path`, it's the lookup key —
+the tool scans held slots and matches by branch name.
+
+`unstick` is a read-only diagnostic now: it reports whether each init mutex
+file is currently locked by a live process. With OS-managed flocks
+(`std::fs::File::try_lock`, stable since Rust 1.89) the kernel
+auto-releases on process death, so there's nothing to force-clear.
 
 `doctor` is host-level (no `--pool`) and read-only. Checks: arch, `git --version`, `$WORKTREE_ROOT` + pool count, binary quarantine xattr, and stale `index.lock` files across every initialized pool. Stale-lock signature + reclamation path live in [[lifecycle.md#crash-recovery]].
 

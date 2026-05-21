@@ -126,6 +126,27 @@ slot_repo_ok() {
   [ -e "$1/.git" ] && git -C "$1" rev-parse --git-dir >/dev/null 2>&1
 }
 
+# Resolve a HELD slot's canonical path by branch name OR by canonical slot id.
+# Echoes the path on stdout (exit 0) when held; nothing + exit 1 when not.
+#
+# Two-step resolution lets operators use either identity: branch name from
+# their workflow (`wt release feat-x`) or slot id (`wt release ios-0` — useful
+# when HEAD is detached from a crashed mid-acquire). The fallback requires lock
+# presence so `wt go ios-0` against an idle canonical dir doesn't mis-resume.
+slot_path_for() {
+  local name=$1 path gitdir
+  if path=$(worktree-pool --pool "$POOL_KEY" path "$name" 2>/dev/null) && [ -n "$path" ]; then
+    printf '%s\n' "$path"
+    return 0
+  fi
+  path="$POOL_ROOT/$name"
+  [ -d "$path" ] || return 1
+  gitdir=$(git -C "$path" rev-parse --git-dir 2>/dev/null) || return 1
+  case "$gitdir" in /*) ;; *) gitdir="$path/$gitdir" ;; esac
+  [ -f "$gitdir/worktree-pool/lock" ] || return 1
+  printf '%s\n' "$path"
+}
+
 # True iff cwd is somewhere under $1 (after symlink resolution on both sides).
 # Returns 1 if $1 doesn't exist — caller decides whether that's a refuse or a pass.
 inside_dir() {
@@ -314,10 +335,12 @@ fire_hook() {
 
 # ---------- subcommands ----------
 
-# Print the absolute slot path. Always emits the path on stdout (when the pool
-# is valid) so callers that only need exists/not can `>/dev/null` it. Exit:
-#   0 — slot exists at that path (resumable / introspectable)
-#   1 — pool exists but slot doesn't
+# Print the absolute slot path. With canonical-only slots, the path basename is
+# always `{group}-N` / `slot-N` — the user-given name lives in the branch ref.
+# Resolution delegated to `slot_path_for` (branch lookup, then canonical-id
+# fallback for held slots with detached HEAD). Exit:
+#   0 — held slot found at the printed path
+#   1 — no held slot matches NAME (printed path is a literal canonical-id guess)
 #   2 — usage error or pool not initialized
 cmd_path() {
   local name="${1:-}"; shift || true
@@ -325,9 +348,14 @@ cmd_path() {
     echo "usage: ${0##*/} path <name>" >&2
     exit 2
   fi
-  local path="$POOL_ROOT/$name"
-  printf '%s\n' "$path"
-  [ -d "$path" ]
+  local path
+  if path=$(slot_path_for "$name"); then
+    printf '%s\n' "$path"
+    return 0
+  fi
+  # Not held — emit a best-guess literal-canonical path for the caller to inspect.
+  printf '%s\n' "$POOL_ROOT/$name"
+  return 1
 }
 
 cmd_go() {
@@ -388,20 +416,25 @@ WT_GO_ALLOW_NOTTY=1."
   # (slot stays at its existing commit). A dir whose `.git` gitlink is missing
   # or dangling (ghost slot — partial cleanup debris) is NOT resumable; we
   # refuse loudly so the operator can decide between recovery and rm -rf.
+  # Broken-dir guard: a canonical dir whose `.git` gitlink is missing or
+  # dangling. `slot_path_for` (which requires a lock) would skip these and
+  # fall through to fresh-acquire, silently masking the operator's debris.
+  # Surface it loudly here before deciding resume vs fresh.
+  local literal_path="$POOL_ROOT/$name"
+  if [ -d "$literal_path" ] && ! slot_repo_ok "$literal_path"; then
+    die "slot '$name' at $literal_path is broken (no valid .git — likely partial-cleanup debris). \
+Recover with: rm -rf $(printf '%q' "$literal_path"), then re-run."
+  fi
+
   local path existing=0
-  if [ -d "$POOL_ROOT/$name" ]; then
+  if path=$(slot_path_for "$name"); then
     existing=1
-    path="$POOL_ROOT/$name"
-    if ! slot_repo_ok "$path"; then
-      die "slot '$name' at $path is broken (no valid .git — likely partial-cleanup debris). \
-Recover with: rm -rf $(printf '%q' "$path"), then re-run."
-    fi
     local Y='' X=''
     [ -t 2 ] && { Y=$'\e[33m'; X=$'\e[0m'; }
     printf '%s⚠ slot %s/%s already exists — resuming (acquire flags ignored). Use `%s release %s` first to recreate.%s\n' \
       "$Y" "$POOL_KEY" "$name" "${0##*/}" "$name" "$X" >&2
   else
-    path=$(worktree-pool --pool "$POOL_KEY" acquire --name "$name" ${acquire_args[@]+"${acquire_args[@]}"} | tail -1)
+    path=$(worktree-pool --pool "$POOL_KEY" acquire "$name" ${acquire_args[@]+"${acquire_args[@]}"} | tail -1)
     if [[ -z "$path" || ! -d "$path" ]]; then
       die "pool returned no path."
     fi
@@ -474,9 +507,9 @@ cmd__exit_handler() {
   local name="${1:-}"
   [ -n "$name" ] || exit 0
 
-  local path="$POOL_ROOT/$name"
-  if [ ! -d "$path" ] || ! slot_repo_ok "$path"; then
-    # Dir gone or broken — defer to cleanup, which has the existing recovery messaging.
+  local path
+  if ! path=$(slot_path_for "$name") || ! slot_repo_ok "$path"; then
+    # Slot gone or broken — defer to cleanup, which has the existing recovery messaging.
     exec "$0" --pool "$POOL_KEY" cleanup "$name"
   fi
 
@@ -932,8 +965,6 @@ cmd_cleanup() {
   local name="${1:-}"; shift || true
   [ -n "$name" ] || { echo "usage: cleanup <name>" >&2; exit 0; }
 
-  local path="$POOL_ROOT/$name"
-
   local G Y R X
   if [ -t 1 ]; then
     G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[1;31m'; X=$'\e[0m'
@@ -941,16 +972,21 @@ cmd_cleanup() {
     G=''; Y=''; R=''; X=''
   fi
 
-  if [ ! -d "$path" ]; then
-    printf '%s🟢 slot %s/%s already recycled%s\n' "$G" "$POOL_KEY" "$name" "$X"
+  # Ghost-dir guard FIRST — broken canonical dirs would otherwise look "already
+  # recycled" since slot_path_for skips them (no lock).
+  local literal_path="$POOL_ROOT/$name"
+  if [ -d "$literal_path" ] && ! slot_repo_ok "$literal_path"; then
+    printf '%s🔴 BROKEN: %s — slot dir has no valid .git (partial-cleanup debris). NOT recycling.%s\n' \
+      "$R" "$name" "$X" >&2
+    printf '   Recover: rm -rf %q\n' "$literal_path" >&2
     exit 0
   fi
 
-  # Ghost-dir guard: slot dir exists but `.git` is missing or dangling.
-  if ! slot_repo_ok "$path"; then
-    printf '%s🔴 BROKEN: %s — slot dir has no valid .git (partial-cleanup debris). NOT recycling.%s\n' \
-      "$R" "$name" "$X" >&2
-    printf '   Recover: rm -rf %q\n' "$path" >&2
+  local path
+  path=$(slot_path_for "$name") || path=""
+
+  if [ -z "$path" ] || [ ! -d "$path" ]; then
+    printf '%s🟢 slot %s/%s already recycled%s\n' "$G" "$POOL_KEY" "$name" "$X"
     exit 0
   fi
 
@@ -1023,14 +1059,15 @@ cmd_sweep() {
   while IFS= read -r name; do
     [ -n "$name" ] || continue
     total=$((total + 1))
-    # Detect recycle by dir disappearance — cleanup itself always exits 0,
-    # so we can't read its exit code, and parsing its colored output is brittle.
+    # Detect recycle by checking whether the slot is still held after cleanup.
+    # cleanup itself always exits 0, so we can't read its exit code, and
+    # parsing its colored output is brittle.
     before=1
-    [ -d "$POOL_ROOT/$name" ] || before=0
+    slot_path_for "$name" >/dev/null || before=0
     "$0" --pool "$POOL_KEY" cleanup "$name"
     if [ "$before" = 0 ]; then
       vanished=$((vanished + 1))
-    elif [ ! -d "$POOL_ROOT/$name" ]; then
+    elif ! slot_path_for "$name" >/dev/null; then
       recycled=$((recycled + 1))
     else
       left=$((left + 1))
@@ -1073,9 +1110,15 @@ cmd_release() {
   local name="${1:-}"; shift || true
   require_arg name "$name" "wt release <name> [--force]"
 
-  local path="$POOL_ROOT/$name"
-  [ -d "$path" ] || die "no slot named '$name' in pool '$POOL_KEY' at $POOL_ROOT.
-  If the slot dir is gone but the branch persists (orphan from manual cleanup),
+  # Broken-dir guard: surface ghost dirs loudly (slot_path_for would skip them).
+  local literal_path="$POOL_ROOT/$name"
+  if [ -d "$literal_path" ] && ! slot_repo_ok "$literal_path"; then
+    die "slot '$name' at $literal_path is broken (no valid .git). Recover with: rm -rf $(printf '%q' "$literal_path")"
+  fi
+
+  local path
+  path=$(slot_path_for "$name") || die "no held slot with branch '$name' in pool '$POOL_KEY' at $POOL_ROOT.
+  If the branch persists without a slot (orphan from manual cleanup),
   remove it directly:
     git branch -D $name && git push origin :$name   # only if merged into main"
 
@@ -1106,7 +1149,7 @@ cmd_release() {
 
   # Remote branch delete is delegated to release.rs's silent push_delete
   # (best-effort).
-  worktree-pool --pool "$POOL_KEY" release --name "$name"
+  worktree-pool --pool "$POOL_KEY" release "$name"
 }
 
 # Print the cwd context for an AI-agent bootstrap. One of:
@@ -1232,7 +1275,7 @@ cmd_init() {
 cmd_info() {
   local name="${1:-}"; shift || true
   require_arg name "$name" "wt info <name>"
-  exec worktree-pool --pool "$POOL_KEY" inspect --name "$name" "$@"
+  exec worktree-pool --pool "$POOL_KEY" inspect "$name" "$@"
 }
 
 # ---------- help ----------

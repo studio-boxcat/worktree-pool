@@ -1,9 +1,9 @@
 //! `ls` and `inspect` rendering.
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
 
-use crate::cli::{InspectArgs, LsArgs};
+use crate::cli::{InspectArgs, LsArgs, PathArgs};
 use crate::config::PoolConfig;
 use crate::{fs_paths, git, lock::Lock, slot};
 
@@ -11,22 +11,13 @@ pub fn ls(pool_root: &Path, cfg: &PoolConfig, args: LsArgs) -> Result<()> {
     let entries = slot::enumerate(pool_root, cfg)?;
     let mut rows: Vec<Row> = Vec::new();
 
-    // Held slots (anything with a renamed dir or a canonical dir whose lock exists).
     for entry in &entries {
-        let row = build_row(entry)?;
-        rows.push(row);
+        rows.push(build_row(entry)?);
     }
 
     // Add unmaterialized canonical slots up to max_slots so the table reflects capacity.
-    let canonical_present: std::collections::HashSet<String> = entries
-        .iter()
-        .filter_map(|e| match &e.kind {
-            slot::SlotEntryKind::Canonical { group, n } => {
-                Some(slot::canonical_id(group.as_deref(), *n))
-            }
-            slot::SlotEntryKind::Renamed => None,
-        })
-        .collect();
+    let present: std::collections::HashSet<String> =
+        entries.iter().map(|e| e.id.clone()).collect();
     let groups_for_listing: Vec<Option<String>> = if cfg.groups.is_empty() {
         vec![None]
     } else {
@@ -35,38 +26,49 @@ pub fn ls(pool_root: &Path, cfg: &PoolConfig, args: LsArgs) -> Result<()> {
     for g in &groups_for_listing {
         for n in 0..cfg.max_slots {
             let id = slot::canonical_id(g.as_deref(), n);
-            if !canonical_present.contains(&id) {
+            if !present.contains(&id) {
                 rows.push(Row::fresh(id, g.clone()));
             }
         }
     }
 
-    // Optionally augment held rows with git-status columns. Skip for idle/fresh.
     if args.git_status {
         for r in &mut rows {
             if r.state == State::Held {
-                let _ = augment_with_git(r);
+                augment_with_git(r);
             }
         }
     }
 
-    // Sort: held first (by name), then idle (by canonical id), then fresh.
     rows.sort_by(|a, b| {
-        let order_a = state_order(&a.state);
-        let order_b = state_order(&b.state);
-        order_a.cmp(&order_b).then_with(|| a.id.cmp(&b.id))
+        state_order(&a.state)
+            .cmp(&state_order(&b.state))
+            .then_with(|| a.id.cmp(&b.id))
     });
 
     print_table(&rows, args.git_status);
     Ok(())
 }
 
+pub fn path(pool_root: &Path, cfg: &PoolConfig, args: PathArgs) -> Result<()> {
+    let Some(entry) = slot::find_by_name(pool_root, cfg, &args.name)? else {
+        // Empty stderr + exit 1 so callers can `if wp path X >/dev/null; then`.
+        std::process::exit(1);
+    };
+    println!("{}", entry.path.display());
+    Ok(())
+}
+
 pub fn inspect(pool_root: &Path, cfg: &PoolConfig, args: InspectArgs) -> Result<()> {
-    let slot_path = pool_root.join(&args.name);
-    if !slot_path.exists() {
-        anyhow::bail!("no slot named '{}' in {}", args.name, pool_root.display());
-    }
-    let gitdir = git::worktree_gitdir(&slot_path)?;
+    let entry = slot::find_by_name(pool_root, cfg, &args.name)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no held slot with branch '{}' in {}",
+            args.name,
+            pool_root.display()
+        )
+    })?;
+
+    let gitdir = git::worktree_gitdir(&entry.path)?;
     let lock_path = fs_paths::slot_lock(&gitdir);
     let lock = if lock_path.exists() {
         Some(Lock::read(&lock_path)?)
@@ -74,8 +76,8 @@ pub fn inspect(pool_root: &Path, cfg: &PoolConfig, args: InspectArgs) -> Result<
         None
     };
 
-    println!("# slot: {}", args.name);
-    println!("path: {}", slot_path.display());
+    println!("# slot: {} (branch: {})", entry.id, args.name);
+    println!("path: {}", entry.path.display());
     println!("gitdir: {}", gitdir.display());
     println!("lock: {}", lock_path.display());
     println!();
@@ -93,12 +95,12 @@ pub fn inspect(pool_root: &Path, cfg: &PoolConfig, args: InspectArgs) -> Result<
     }
     println!();
 
-    let (_, status, _) = git::run_lenient(&slot_path, &["status", "-sb"])?;
+    let (_, status, _) = git::run_lenient(&entry.path, &["status", "-sb"])?;
     println!("## git status -sb\n{}", status);
     println!();
 
     let range = format!("{}..HEAD", cfg.default_commit);
-    let (ok, log, _) = git::run_lenient(&slot_path, &["log", "--oneline", "-20", &range])?;
+    let (ok, log, _) = git::run_lenient(&entry.path, &["log", "--oneline", "-20", &range])?;
     println!("## git log --oneline -20 {range}");
     println!("{}", if ok && !log.is_empty() { log } else { "(none)".to_string() });
     Ok(())
@@ -119,7 +121,6 @@ struct Row {
     group: String,
     age: String,
     full_sha: String,
-    branch: String,
     dirty: String,
     untracked: String,
     ahead: String,
@@ -135,7 +136,6 @@ impl Row {
             group: group.unwrap_or_else(|| "-".into()),
             age: "-".into(),
             full_sha: "-".into(),
-            branch: "-".into(),
             dirty: "-".into(),
             untracked: "-".into(),
             ahead: "-".into(),
@@ -145,7 +145,6 @@ impl Row {
 }
 
 fn build_row(entry: &slot::SlotEntry) -> Result<Row> {
-    // Look up the gitdir + lock to decide held vs idle.
     let gitdir_result = git::worktree_gitdir(&entry.path);
     let (state, lock, age) = match gitdir_result {
         Ok(gd) => {
@@ -165,19 +164,16 @@ fn build_row(entry: &slot::SlotEntry) -> Result<Row> {
         Err(_) => (State::Idle, None, "-".into()),
     };
 
-    let group = lock
-        .as_ref()
-        .and_then(|l| l.group.clone())
-        .or_else(|| match &entry.kind {
-            slot::SlotEntryKind::Canonical { group: Some(g), .. } => Some(g.clone()),
-            _ => None,
-        })
+    let group = entry
+        .group
+        .clone()
+        .or_else(|| lock.as_ref().and_then(|l| l.group.clone()))
         .unwrap_or_else(|| "-".into());
 
-    let name = match (&state, &entry.kind) {
-        (State::Held, _) => entry.name.clone(),
-        (_, slot::SlotEntryKind::Canonical { .. }) => "-".into(),
-        _ => entry.name.clone(),
+    let name = if state == State::Held {
+        git::current_branch(&entry.path).unwrap_or_else(|| "(detached)".into())
+    } else {
+        "-".into()
     };
 
     let full_sha = lock
@@ -186,13 +182,12 @@ fn build_row(entry: &slot::SlotEntry) -> Result<Row> {
         .unwrap_or_else(|| "-".into());
 
     Ok(Row {
-        id: entry.name.clone(),
+        id: entry.id.clone(),
         state,
         name,
         group,
         age,
         full_sha,
-        branch: "-".into(),
         dirty: "-".into(),
         untracked: "-".into(),
         ahead: "-".into(),
@@ -200,42 +195,33 @@ fn build_row(entry: &slot::SlotEntry) -> Result<Row> {
     })
 }
 
-fn augment_with_git(row: &mut Row) -> Result<()> {
+fn augment_with_git(row: &mut Row) {
     if row.path.as_os_str().is_empty() {
-        return Err(anyhow!("no path"));
+        return;
     }
-    // Branch name (or `(detached)` when HEAD isn't on a branch — e.g. operator
-    // ran `git checkout <sha>` or hand-deleted the slot's branch). Detached
-    // slots still recycle on cleanup but flag them so operators can spot the
-    // anomaly without running `wt info` per slot.
-    let (ok, branch, _) = git::run_lenient(&row.path, &["symbolic-ref", "-q", "--short", "HEAD"])?;
-    row.branch = if ok && !branch.trim().is_empty() {
-        branch.trim().to_string()
-    } else {
-        "(detached)".into()
-    };
-    let (ok, porcelain, _) = git::run_lenient(&row.path, &["status", "--porcelain"])?;
-    if ok {
-        let mut dirty = 0u32;
-        let mut untracked = 0u32;
-        for line in porcelain.lines().filter(|l| !l.is_empty()) {
-            if line.starts_with("??") {
-                untracked += 1;
-            } else {
-                dirty += 1;
+    if let Ok((ok, porcelain, _)) = git::run_lenient(&row.path, &["status", "--porcelain"]) {
+        if ok {
+            let mut dirty = 0u32;
+            let mut untracked = 0u32;
+            for line in porcelain.lines().filter(|l| !l.is_empty()) {
+                if line.starts_with("??") {
+                    untracked += 1;
+                } else {
+                    dirty += 1;
+                }
             }
+            row.dirty = dirty.to_string();
+            row.untracked = untracked.to_string();
         }
-        row.dirty = dirty.to_string();
-        row.untracked = untracked.to_string();
     }
-    let (ok, ahead, _) = git::run_lenient(
+    if let Ok((ok, ahead, _)) = git::run_lenient(
         &row.path,
         &["rev-list", "--count", "HEAD", "^refs/heads/main"],
-    )?;
-    if ok {
-        row.ahead = ahead.trim().to_string();
+    ) {
+        if ok {
+            row.ahead = ahead.trim().to_string();
+        }
     }
-    Ok(())
 }
 
 fn format_age(then: DateTime<Utc>) -> String {
@@ -262,7 +248,7 @@ fn state_order(s: &State) -> u8 {
 fn print_table(rows: &[Row], with_git: bool) {
     let mut headers = vec!["ID", "STATE", "NAME", "GROUP", "AGE", "SHA"];
     if with_git {
-        headers.extend(["BRANCH", "DIRTY", "UNTRK", "AHEAD"]);
+        headers.extend(["DIRTY", "UNTRK", "AHEAD"]);
     }
     let cells: Vec<Vec<String>> = rows
         .iter()
@@ -276,12 +262,7 @@ fn print_table(rows: &[Row], with_git: bool) {
                 r.full_sha.clone(),
             ];
             if with_git {
-                row.extend([
-                    r.branch.clone(),
-                    r.dirty.clone(),
-                    r.untracked.clone(),
-                    r.ahead.clone(),
-                ]);
+                row.extend([r.dirty.clone(), r.untracked.clone(), r.ahead.clone()]);
             }
             row
         })
@@ -323,4 +304,3 @@ fn state_label(s: &State) -> &'static str {
         State::Fresh => "fresh",
     }
 }
-

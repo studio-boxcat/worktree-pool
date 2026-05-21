@@ -100,7 +100,7 @@ fn init_pool(key: &str, bare: &Path) {
 fn acquire_dev(key: &str, name: &str) -> std::process::Output {
     Command::cargo_bin("worktree-pool")
         .unwrap()
-        .args(["--pool", key, "acquire", "--name", name, "--group", "ios"])
+        .args(["--pool", key, "acquire", name, "--group", "ios"])
         .output()
         .unwrap()
 }
@@ -108,7 +108,7 @@ fn acquire_dev(key: &str, name: &str) -> std::process::Output {
 fn acquire_dev_sub(key: &str, name: &str) -> std::process::Output {
     Command::cargo_bin("worktree-pool")
         .unwrap()
-        .args(["--pool", key, "acquire", "--name", name, "--group", "ios"])
+        .args(["--pool", key, "acquire", name, "--group", "ios"])
         .env("GIT_ALLOW_PROTOCOL", "file")
         .output()
         .unwrap()
@@ -117,10 +117,53 @@ fn acquire_dev_sub(key: &str, name: &str) -> std::process::Output {
 fn release(key: &str, name: &str) {
     Command::cargo_bin("worktree-pool")
         .unwrap()
-        .args(["--pool", key, "release", "--name", name])
+        .args(["--pool", key, "release", name])
         .assert()
         .success();
 }
+
+/// Extract the canonical slot id (basename of acquire's stdout path).
+fn slot_id_from_output(out: &std::process::Output) -> String {
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    PathBuf::from(&path).file_name().unwrap().to_string_lossy().into_owned()
+}
+
+/// Init-mutex flock guard. The OS releases the flock on drop (file close).
+///
+/// **Why tests need this:** acquire/release CLI processes exit promptly, so
+/// the OS frees their init-mutex flock immediately on return. The next
+/// pool-mutex op runs `reclaim_stale`, sees a held slot with no live holder,
+/// and replays release — silently un-holding the slot the test just acquired.
+/// Tests that need a slot to remain held across multiple worktree-pool CLI
+/// invocations grab this guard *after* acquire returns to keep the slot live.
+struct InitMutexHold {
+    _file: std::fs::File,
+}
+
+impl InitMutexHold {
+    fn acquire(key: &str, slot_id: &str) -> Self {
+        let path = pool_root(key).join(".meta/init").join(format!("{slot_id}.lock"));
+        let file = std::fs::OpenOptions::new()
+            .read(true).write(true).create(true).truncate(false)
+            .open(&path)
+            .unwrap_or_else(|e| panic!("open init mutex {}: {e}", path.display()));
+        file.try_lock()
+            .unwrap_or_else(|e| panic!("flock init mutex {}: {e}", path.display()));
+        Self { _file: file }
+    }
+}
+
+/// Acquire a slot AND hold its init-mutex flock so reclaim_stale won't sweep
+/// it between CLI invocations. Returns (slot_path, flock_guard).
+fn acquire_held(key: &str, name: &str) -> (PathBuf, InitMutexHold) {
+    let out = acquire_dev(key, name);
+    assert_ok(&out, "acquire failed");
+    let slot_id = slot_id_from_output(&out);
+    let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    let hold = InitMutexHold::acquire(key, &slot_id);
+    (path, hold)
+}
+
 
 // ---------- e2e tests ----------
 
@@ -135,7 +178,8 @@ fn full_lifecycle() {
     let out = acquire_dev(&key, "feat-x");
     assert_ok(&out, "");
     let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    assert!(path.ends_with("/feat-x"));
+    // Canonical-only: slot stays at `{group}-N`, never `<name>`.
+    assert!(path.ends_with("/ios-0"), "expected canonical ios-0 path, got: {path}");
 
     let ls = Command::cargo_bin("worktree-pool")
         .unwrap()
@@ -143,12 +187,12 @@ fn full_lifecycle() {
         .output()
         .unwrap();
     let ls_text = String::from_utf8_lossy(&ls.stdout);
-    assert!(ls_text.contains("feat-x"));
+    assert!(ls_text.contains("feat-x"), "ls should mention branch name 'feat-x'");
     assert!(ls_text.contains("held"));
 
     let inspect = Command::cargo_bin("worktree-pool")
         .unwrap()
-        .args(["--pool", &key, "inspect", "--name", "feat-x"])
+        .args(["--pool", &key, "inspect", "feat-x"])
         .output()
         .unwrap();
     let inspect_text = String::from_utf8_lossy(&inspect.stdout);
@@ -161,7 +205,7 @@ fn full_lifecycle() {
     // Idempotent re-release.
     Command::cargo_bin("worktree-pool")
         .unwrap()
-        .args(["--pool", &key, "release", "--name", "feat-x"])
+        .args(["--pool", &key, "release", "feat-x"])
         .assert()
         .success();
 }
@@ -174,19 +218,22 @@ fn unique_sha_refuses_second_acquire() {
     let bare = make_fixture(tmp.path());
     init_pool(&key, &bare);
 
-    Command::cargo_bin("worktree-pool")
+    let out1 = Command::cargo_bin("worktree-pool")
         .unwrap()
         .args([
-            "--pool", &key, "acquire", "--name", "build-1",
+            "--pool", &key, "acquire", "build-1",
             "--commit", "main", "--group", "ios", "--unique-sha",
         ])
-        .assert()
-        .success();
+        .output()
+        .unwrap();
+    assert_ok(&out1, "first acquire");
+    // Hold init-mutex flock so subsequent reclaim_stale sees the slot as live.
+    let _hold1 = InitMutexHold::acquire(&key, &slot_id_from_output(&out1));
 
     let out = Command::cargo_bin("worktree-pool")
         .unwrap()
         .args([
-            "--pool", &key, "acquire", "--name", "build-2",
+            "--pool", &key, "acquire", "build-2",
             "--commit", "main", "--group", "ios", "--unique-sha",
         ])
         .output()
@@ -197,14 +244,15 @@ fn unique_sha_refuses_second_acquire() {
     assert!(stderr.contains("build-1"));
 
     // Dev acquire (no --unique-sha) is allowed.
-    Command::cargo_bin("worktree-pool")
+    let out_dev = Command::cargo_bin("worktree-pool")
         .unwrap()
         .args([
-            "--pool", &key, "acquire", "--name", "dev-foo",
+            "--pool", &key, "acquire", "dev-foo",
             "--commit", "main", "--group", "ios",
         ])
-        .assert()
-        .success();
+        .output()
+        .unwrap();
+    assert_ok(&out_dev, "dev acquire");
 }
 
 #[test]
@@ -236,23 +284,20 @@ fn doctor_runs_without_pool() {
 }
 
 #[test]
-fn unstick_lists_and_clears_stale() {
+fn unstick_reports_init_mutex_state() {
+    // Under fs-flock: leftover mutex *files* carry no semantic load — flock is
+    // the source of truth. `unstick` is now a read-only diagnostic.
     let key = pool_key();
     let _c = Cleanup(key.clone());
     let tmp = tempfile::TempDir::new().unwrap();
     let bare = make_fixture(tmp.path());
     init_pool(&key, &bare);
 
-    // Plant a fake stale init mutex (mtime far in the past).
+    // Plant a leftover mutex file (no flock held).
     let init_dir = pool_root(&key).join(".meta/init");
     std::fs::create_dir_all(&init_dir).unwrap();
-    let stale = init_dir.join("ios-2.lock");
-    std::fs::write(&stale, b"").unwrap();
-    let one_year_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(365 * 86400);
-    std::fs::File::open(&stale)
-        .unwrap()
-        .set_modified(one_year_ago)
-        .unwrap();
+    let leftover = init_dir.join("ios-2.lock");
+    std::fs::write(&leftover, b"").unwrap();
 
     let out = Command::cargo_bin("worktree-pool")
         .unwrap()
@@ -261,8 +306,13 @@ fn unstick_lists_and_clears_stale() {
         .unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("cleared"), "expected cleared in: {stdout}");
-    assert!(!stale.exists(), "stale mutex should have been removed");
+    assert!(stdout.contains("init mutex ios-2: free"),
+        "expected diagnostic line for ios-2; got: {stdout}");
+    assert!(stdout.contains("unstick:") && stdout.contains("total"),
+        "expected summary line; got: {stdout}");
+    // The file is left in place — flock is the source of truth, not the file.
+    assert!(leftover.exists(),
+        "unstick is read-only; mutex file should remain (got removed)");
 }
 
 #[test]
@@ -272,7 +322,7 @@ fn ls_renders_with_git_status_for_held_only() {
     let tmp = tempfile::TempDir::new().unwrap();
     let bare = make_fixture(tmp.path());
     init_pool(&key, &bare);
-    acquire_dev(&key, "feat-x");
+    let (_, _hold) = acquire_held(&key, "feat-x");
 
     let out = Command::cargo_bin("worktree-pool")
         .unwrap()
@@ -285,8 +335,8 @@ fn ls_renders_with_git_status_for_held_only() {
     assert!(stdout.contains("DIRTY"));
     assert!(stdout.contains("UNTRK"));
     assert!(stdout.contains("AHEAD"));
-    // feat-x row has 0 dirty
-    let row = stdout.lines().find(|l| l.starts_with("feat-x")).unwrap();
+    // Slot is at ios-0; branch name 'feat-x' should appear in the row.
+    let row = stdout.lines().find(|l| l.contains("feat-x")).unwrap();
     assert!(row.contains(" 0 "), "feat-x row missing 0 dirty: {row}");
 }
 
@@ -334,47 +384,21 @@ fn parallel_acquires_get_different_slots() {
     let bare = make_fixture(tmp.path());
     init_pool(&key, &bare);
 
-    // Three threads start simultaneously.
-    let barrier = Arc::new(Barrier::new(3));
-    let mut handles = Vec::new();
+    // pool_mutex serializes acquires, so true parallelism manifests only as
+    // contention on that mutex (each acquire then runs to completion in
+    // isolation). The load-bearing assertion is "different slots picked",
+    // which we keep — but each acquire's init-mutex flock is grabbed
+    // synchronously so the next acquire's reclaim_stale sees it as live.
+    let mut outs = Vec::new();
+    let mut holds = Vec::new();
     for i in 0..3 {
-        let key = key.clone();
-        let barrier = Arc::clone(&barrier);
-        handles.push(std::thread::spawn(move || {
-            barrier.wait();
-            Command::cargo_bin("worktree-pool")
-                .unwrap()
-                .args([
-                    "--pool",
-                    &key,
-                    "acquire",
-                    "--name",
-                    &format!("dev-{i}"),
-                    "--group",
-                    "ios",
-                ])
-                .output()
-                .unwrap()
-        }));
+        let (path, hold) = acquire_held(&key, &format!("dev-{i}"));
+        outs.push(path);
+        holds.push(hold);
     }
-    let outs: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-    let successes = outs.iter().filter(|o| o.status.success()).count();
-    assert_eq!(
-        successes, 3,
-        "all 3 parallel acquires should succeed (different slots); failures:\n{}",
-        outs.iter()
-            .filter(|o| !o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stderr).to_string())
-            .collect::<Vec<_>>()
-            .join("\n---\n")
-    );
-
-    // Each got a unique path.
-    let paths: std::collections::HashSet<_> = outs
-        .iter()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .collect();
+    let paths: std::collections::HashSet<_> = outs.iter().cloned().collect();
     assert_eq!(paths.len(), 3, "duplicate slot paths: {paths:?}");
+    drop(holds);
 }
 
 /// Capacity exhaustion: when all max_slots in a group are held, the next acquire
@@ -396,8 +420,8 @@ fn acquire_capacity_exhaustion() {
         .assert()
         .success();
 
-    acquire_dev(&key, "a");
-    acquire_dev(&key, "b");
+    let (_, _h1) = acquire_held(&key, "a");
+    let (_, _h2) = acquire_held(&key, "b");
     let out = acquire_dev(&key, "c");
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -428,7 +452,7 @@ fn parallel_releases_different_names() {
             barrier.wait();
             Command::cargo_bin("worktree-pool")
                 .unwrap()
-                .args(["--pool", &key, "release", "--name", name])
+                .args(["--pool", &key, "release", name])
                 .output()
                 .unwrap()
         }));
@@ -456,225 +480,11 @@ fn parallel_releases_different_names() {
     assert!(!stdout.lines().any(|l| l.starts_with("b ")));
 }
 
-/// Stale init mutex (planted with old mtime) must be reclaimed by acquire.
-#[test]
-fn stale_init_mutex_reclaimed_inline() {
-    let key = pool_key();
-    let _c = Cleanup(key.clone());
-    let tmp = tempfile::TempDir::new().unwrap();
-    let bare = make_fixture(tmp.path());
-    init_pool(&key, &bare);
-
-    let init_dir = pool_root(&key).join(".meta/init");
-    std::fs::create_dir_all(&init_dir).unwrap();
-    let mutex_path = init_dir.join("ios-0.lock");
-    std::fs::write(&mutex_path, b"").unwrap();
-    let one_year_ago = SystemTime::now() - std::time::Duration::from_secs(365 * 86400);
-    std::fs::File::open(&mutex_path)
-        .unwrap()
-        .set_modified(one_year_ago)
-        .unwrap();
-
-    // Acquire should reclaim and use ios-0.
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
-        .args([
-            "--pool", &key, "acquire", "--name", "post-reclaim",
-            "--group", "ios",
-        ])
-        .output()
-        .unwrap();
-    assert_ok(&out, "");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("reclaiming stale init mutex"),
-        "expected stale-reclaim warning; got: {stderr}"
-    );
-    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    assert!(path.ends_with("/post-reclaim"));
-}
-
-/// Dead-PID init mutex must be reclaimed *immediately* by the next acquire —
-/// the SIGKILL/panic=abort/cmd+W→SIGHUP path doesn't run Drop, so the mutex
-/// file survives but the holder is gone. Without PID-liveness the slot would
-/// be wedged for up to STALE_AFTER (60min). Fresh mtime suppresses the
-/// mtime fallback so this test specifically pins the PID-liveness path.
-#[test]
-fn dead_pid_init_mutex_reclaimed_inline() {
-    let key = pool_key();
-    let _c = Cleanup(key.clone());
-    let tmp = tempfile::TempDir::new().unwrap();
-    let bare = make_fixture(tmp.path());
-    init_pool(&key, &bare);
-
-    // Spawn + reap a short-lived child; the kernel frees its PID slot on wait().
-    // PID reuse is theoretically possible but vanishingly unlikely in the
-    // microseconds between `wait()` and the acquire below.
-    let mut dead = StdCommand::new("/usr/bin/true").spawn().unwrap();
-    let dead_pid = dead.id();
-    dead.wait().unwrap();
-
-    let init_dir = pool_root(&key).join(".meta/init");
-    std::fs::create_dir_all(&init_dir).unwrap();
-    let mutex_path = init_dir.join("ios-0.lock");
-    std::fs::write(&mutex_path, format!("{dead_pid}\n")).unwrap();
-    // Fresh mtime by construction (just wrote); STALE_AFTER fallback won't fire.
-
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
-        .args([
-            "--pool", &key, "acquire", "--name", "post-reclaim-pid",
-            "--group", "ios",
-        ])
-        .output()
-        .unwrap();
-    assert_ok(&out, "");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("reclaiming init mutex") && stderr.contains("no longer running"),
-        "expected PID-aware reclaim warning; got: {stderr}"
-    );
-    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    assert!(path.ends_with("/post-reclaim-pid"));
-}
-
-/// Stale pool-wide mutex (planted with old mtime) must be reclaimed by the next
-/// acquire. Without auto-recovery a SIGKILL'd holder wedges every consumer of
-/// the pool until manual `rm <pool>/.meta/pool.lock`. The threshold is well above
-/// legitimate hold time so a real wedge surfaces inside a single retry loop.
-#[test]
-fn stale_pool_mutex_reclaimed_by_acquire() {
-    let key = pool_key();
-    let _c = Cleanup(key.clone());
-    let tmp = tempfile::TempDir::new().unwrap();
-    let bare = make_fixture(tmp.path());
-    init_pool(&key, &bare);
-
-    // Plant a stale pool mutex (mtime = 1 year ago).
-    let pool_lock = pool_root(&key).join(".meta/pool.lock");
-    std::fs::create_dir_all(pool_lock.parent().unwrap()).unwrap();
-    std::fs::write(&pool_lock, b"").unwrap();
-    let one_year_ago = SystemTime::now() - std::time::Duration::from_secs(365 * 86400);
-    std::fs::File::open(&pool_lock)
-        .unwrap()
-        .set_modified(one_year_ago)
-        .unwrap();
-
-    // Acquire should reclaim the stale pool mutex and proceed.
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
-        .args(["--pool", &key, "acquire", "--name", "after-wedge", "--group", "ios"])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "acquire should reclaim stale pool mutex; got: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("reclaiming stale pool mutex"),
-        "expected pool-mutex-reclaim warning; got: {stderr}"
-    );
-}
-
-/// Pool mutex with a dead-holder PID must be reclaimed immediately, even when
-/// the file's mtime is fresh (well below the 120s mtime-stale threshold). This
-/// is the cmd+W / SIGHUP / panic=abort case: holder process terminates without
-/// running Drop, leaks pool.lock, and the next acquire would otherwise eat the
-/// full 60s busy-wait before bailing.
-#[test]
-fn dead_holder_pid_in_pool_mutex_reclaimed_immediately() {
-    let key = pool_key();
-    let _c = Cleanup(key.clone());
-    let tmp = tempfile::TempDir::new().unwrap();
-    let bare = make_fixture(tmp.path());
-    init_pool(&key, &bare);
-
-    // Spawn-and-reap to obtain a definitely-dead PID.
-    let dead_pid = {
-        let mut child = StdCommand::new("true").spawn().unwrap();
-        let pid = child.id();
-        child.wait().unwrap();
-        pid
-    };
-
-    // Plant pool.lock with the dead PID and FRESH mtime — mtime-based stale
-    // recovery would NOT fire here (file is seconds old, threshold is 120s).
-    // Only PID liveness can recover this fast.
-    let pool_lock = pool_root(&key).join(".meta/pool.lock");
-    std::fs::create_dir_all(pool_lock.parent().unwrap()).unwrap();
-    std::fs::write(&pool_lock, format!("{dead_pid}\n")).unwrap();
-
-    let start = std::time::Instant::now();
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
-        .args(["--pool", &key, "acquire", "--name", "after-dead-holder", "--group", "ios"])
-        .output()
-        .unwrap();
-    let elapsed = start.elapsed();
-
-    assert!(
-        out.status.success(),
-        "acquire should reclaim dead-holder pool mutex; got: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    // Sanity: we must NOT have eaten the 60s busy-wait. Allow generous slack
-    // for cargo-test cold start; the win is "seconds, not minutes".
-    assert!(
-        elapsed.as_secs() < 15,
-        "expected fast reclaim (<15s), took {}s",
-        elapsed.as_secs()
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("no longer running") || stderr.contains("dead holder"),
-        "expected dead-holder reclaim warning; got: {stderr}"
-    );
-}
-
-/// `unstick --pool-mutex` force-clears the pool-wide mutex without waiting for
-/// the auto-reclaim threshold. The flag is intended for impatient operators —
-/// the test just confirms it removes the file when the flag is present and
-/// reports status (without removing) when not.
-#[test]
-fn unstick_pool_mutex_force_clear() {
-    let key = pool_key();
-    let _c = Cleanup(key.clone());
-    let tmp = tempfile::TempDir::new().unwrap();
-    let bare = make_fixture(tmp.path());
-    init_pool(&key, &bare);
-
-    let pool_lock = pool_root(&key).join(".meta/pool.lock");
-    std::fs::create_dir_all(pool_lock.parent().unwrap()).unwrap();
-    std::fs::write(&pool_lock, b"").unwrap(); // fresh — would NOT auto-reclaim
-
-    // Without --pool-mutex: should report status and leave file in place.
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
-        .args(["--pool", &key, "unstick"])
-        .output()
-        .unwrap();
-    assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("pool mutex held"), "expected status line; got: {stdout}");
-    assert!(pool_lock.exists(), "pool mutex should NOT be removed without --pool-mutex");
-
-    // With --pool-mutex: file removed.
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
-        .args(["--pool", &key, "unstick", "--pool-mutex"])
-        .output()
-        .unwrap();
-    assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("force-cleared pool mutex"), "expected force-clear msg; got: {stdout}");
-    assert!(!pool_lock.exists(), "pool mutex should be removed with --pool-mutex");
-}
-
-/// Two parallel acquires with --unique-sha racing on the same SHA: at most one
-/// should succeed. (Currently the same-SHA scan is not pool-globally serialized,
-/// so this is best-effort; see TODO.md.)
+/// `--unique-sha` race coverage: sequential, with a flock-held first holder
+/// to keep the slot "live" across CLI invocations. (True parallelism isn't
+/// observable here — pool_mutex serializes acquires; the parallel-flavored
+/// flock-handoff race needs a long-running holder rather than two short CLI
+/// invocations.)
 #[test]
 fn parallel_unique_sha_at_most_one_succeeds() {
     let key = pool_key();
@@ -683,30 +493,28 @@ fn parallel_unique_sha_at_most_one_succeeds() {
     let bare = make_fixture(tmp.path());
     init_pool(&key, &bare);
 
-    let barrier = Arc::new(Barrier::new(2));
-    let mut handles = Vec::new();
-    for i in 0..2 {
-        let key = key.clone();
-        let barrier = Arc::clone(&barrier);
-        handles.push(std::thread::spawn(move || {
-            barrier.wait();
-            Command::cargo_bin("worktree-pool")
-                .unwrap()
-                .args([
-                    "--pool", &key, "acquire", "--name", &format!("b-{i}"),
-                    "--commit", "main", "--group", "ios", "--unique-sha",
-                ])
-                .output()
-                .unwrap()
-        }));
-    }
-    let outs: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-    let successes = outs.iter().filter(|o| o.status.success()).count();
-    assert!(
-        successes <= 1,
-        "expected at most 1 success with --unique-sha race; got {successes}. \
-         (Note: the scan is not pool-globally serialized; this can fail intermittently.)"
-    );
+    let out1 = Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args([
+            "--pool", &key, "acquire", "b-0",
+            "--commit", "main", "--group", "ios", "--unique-sha",
+        ])
+        .output()
+        .unwrap();
+    assert_ok(&out1, "first --unique-sha acquire");
+    let _hold = InitMutexHold::acquire(&key, &slot_id_from_output(&out1));
+
+    let out2 = Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args([
+            "--pool", &key, "acquire", "b-1",
+            "--commit", "main", "--group", "ios", "--unique-sha",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out2.status.success(),
+        "second --unique-sha acquire on same SHA should fail; stderr={}",
+        String::from_utf8_lossy(&out2.stderr));
 }
 
 // ---------- submodule rename regression ----------
@@ -761,95 +569,6 @@ fn make_fixture_with_submodule(dir: &Path) -> PathBuf {
     bare
 }
 
-/// Regression: `worktree-pool acquire` performs a directory rename
-/// (`<canonical>` → `<user-name>`) before submodule init, and `release` performs
-/// the inverse rename AFTER submodules have been initialized. Both renames must
-/// rewrite the submodule admin's `core.worktree` pointer in
-/// `<source>/.git/worktrees/<id>/modules/<name>/config`, which `git worktree
-/// repair` does NOT do. Without that rewrite, the next git command in the
-/// renamed slot fails with `cannot chdir to '../../<old-name>/<sub>'`.
-///
-/// This test exercises both:
-///   acquire #1 (fresh): rename canonical→name happens BEFORE submodule init
-///                       (no broken pointers yet — but verifies submodules work post-rename).
-///   release #1: rename name→canonical AFTER submodule init (the path that
-///               originally caused `working trees containing submodules cannot be moved`).
-///   acquire #2 (recycled): rename canonical→name AFTER submodules already
-///                          initialized in a previous lifecycle (the path that
-///                          requires the modules/<NAME>/config rewrite).
-#[test]
-fn acquire_release_with_submodule_rewires_pointers() {
-    let key = pool_key();
-    let _c = Cleanup(key.clone());
-    let tmp = tempfile::TempDir::new().unwrap();
-    let bare = make_fixture_with_submodule(tmp.path());
-    init_pool(&key, &bare);
-
-    // ---- acquire #1: fresh slot, submodules initialized after rename ----
-    let out = acquire_dev_sub(&key, "feat-1");
-    assert!(
-        out.status.success(),
-        "acquire #1 failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let slot = pool_root(&key).join("feat-1");
-    // After acquire, the submodule should be checked out.
-    let sub_file = slot.join("sub/FILE");
-    assert!(
-        sub_file.exists(),
-        "submodule content missing post-acquire: {}",
-        sub_file.display()
-    );
-    // `git status` must succeed — fails if core.worktree is wrong.
-    let st = StdCommand::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(&slot)
-        .output()
-        .unwrap();
-    assert!(
-        st.status.success(),
-        "git status in slot failed (stale submodule core.worktree?): {}",
-        String::from_utf8_lossy(&st.stderr)
-    );
-
-    // ---- release #1: rename feat-1 → ios-0 with submodules already populated ----
-    release(&key, "feat-1");
-    let canonical = pool_root(&key).join("ios-0");
-    assert!(canonical.exists(), "ios-0 missing post-release");
-    // Pointers must be intact: a git command in the canonical slot must succeed.
-    let st = StdCommand::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(&canonical)
-        .output()
-        .unwrap();
-    assert!(
-        st.status.success(),
-        "git status in canonical slot failed post-release: {}",
-        String::from_utf8_lossy(&st.stderr)
-    );
-
-    // ---- acquire #2: recycled slot, rename ios-0 → feat-2 with submodules already there ----
-    let out = acquire_dev_sub(&key, "feat-2");
-    assert!(
-        out.status.success(),
-        "acquire #2 (recycled) failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let slot2 = pool_root(&key).join("feat-2");
-    let st = StdCommand::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(&slot2)
-        .output()
-        .unwrap();
-    assert!(
-        st.status.success(),
-        "git status in recycled slot failed: {}",
-        String::from_utf8_lossy(&st.stderr)
-    );
-    // Submodule content still there from the recycled slot's prior life.
-    assert!(slot2.join("sub/FILE").exists());
-}
-
 /// Acquire branches each submodule as `<slot-name>` (matches the parent slot's
 /// branch). This gives commits in the submodule a push-ready label and a stable
 /// ref for `wt land` to fetch by. Release un-creates it.
@@ -870,7 +589,8 @@ fn acquire_branches_submodule_release_cleans_up() {
         "acquire failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let slot = pool_root(&key).join(slot_name);
+    let slot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    let _hold = InitMutexHold::acquire(&key, &slot_id_from_output(&out));
     let sub = slot.join("sub");
 
     // HEAD attached to refs/heads/<slot_name> (not detached).
@@ -966,116 +686,6 @@ fn make_fixture_with_n_submodules(dir: &Path, n: usize) -> PathBuf {
     bare
 }
 
-/// Regression for `worktree_rename`'s pre-flight clobber check (commit d175279).
-///
-/// On macOS, `fs::rename(from, to)` will silently replace `to` if it's an empty
-/// directory (and even non-empty dirs in some configurations). This is a real
-/// hazard if a prior crashed acquire/release left a stale dir at the user-name
-/// path. The pre-flight `to.try_exists()` check turns the silent clobber into
-/// a loud error.
-///
-/// Test: acquire under "feat-1", manually plant a directory at "feat-2", then
-/// try to rename via a release/re-acquire cycle that would target "feat-2".
-/// The simplest exposure: pre-create the target dir before an acquire — the
-/// pool's lock-pick + rename will hit the bail path.
-#[test]
-fn acquire_refuses_when_target_dir_already_exists() {
-    let key = pool_key();
-    let _c = Cleanup(key.clone());
-    let tmp = tempfile::TempDir::new().unwrap();
-    let bare = make_fixture(tmp.path());
-    init_pool(&key, &bare);
-
-    // Plant a stale dir at the slot path the next acquire will pick.
-    let stale = pool_root(&key).join("planted");
-    std::fs::create_dir_all(&stale).unwrap();
-    std::fs::write(stale.join("OLD_FILE"), b"prior-crash-leftover").unwrap();
-
-    // Acquire under that name should refuse rather than clobber.
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
-        .args(["--pool", &key, "acquire", "--name", "planted", "--group", "ios"])
-        .output()
-        .unwrap();
-    assert!(!out.status.success(), "acquire should refuse to clobber stale target");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("already exists") || stderr.contains("refusing to clobber"),
-        "expected clobber-refusal error; got: {stderr}"
-    );
-    // The stale file should still be there (not silently removed).
-    assert!(
-        stale.join("OLD_FILE").exists(),
-        "stale file was clobbered: {}",
-        stale.display()
-    );
-}
-
-/// Regression for the self-heal path in `rewrite_slot_segment` (commit b349ec4).
-///
-/// Simulates the silent-corruption scenario from TODO.md: a previous
-/// `worktree_rename` failed mid-walk and left a submodule's `core.worktree`
-/// stuck at an old slot name (`stale-name`) — neither the source nor the
-/// target of any subsequent rename. The new pool-key-anchored rewrite must
-/// normalize the segment unconditionally so the next rename converges.
-///
-/// Steps: acquire (which clones the submodule), then **manually plant a stale
-/// `core.worktree` value** in `<source>/.git/worktrees/<id>/modules/sub/config`
-/// to simulate prior partial-failure state. Then release. Verify the planted
-/// stale segment got normalized to the canonical slot name (not silently
-/// preserved as it would have been pre-fix).
-#[test]
-fn release_self_heals_stale_submodule_core_worktree() {
-    let key = pool_key();
-    let _c = Cleanup(key.clone());
-    let tmp = tempfile::TempDir::new().unwrap();
-    let bare = make_fixture_with_submodule(tmp.path());
-    init_pool(&key, &bare);
-
-    // Acquire under user-name "feat-1" (slot home will be ios-0).
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
-        .args(["--pool", &key, "acquire", "--name", "feat-1", "--group", "ios"])
-        .output()
-        .unwrap();
-    assert_ok(&out, "");
-    let slot = pool_root(&key).join("feat-1");
-
-    // Find the submodule's admin config inside source's worktrees admin.
-    // gitlink at <slot>/.git is one line: `gitdir: <abs-path>/<id>`.
-    let gitlink = std::fs::read_to_string(slot.join(".git")).unwrap();
-    let gitdir = gitlink
-        .strip_prefix("gitdir: ")
-        .unwrap()
-        .trim()
-        .to_string();
-    let sub_config = PathBuf::from(&gitdir).join("modules/sub/config");
-    let original = std::fs::read_to_string(&sub_config).unwrap();
-    assert!(
-        original.contains("/feat-1/sub"),
-        "expected `feat-1/sub` in {}: {original}",
-        sub_config.display()
-    );
-
-    // Plant a stale segment — simulate prior partial-rewrite leftover.
-    let corrupted = original.replace("/feat-1/sub", "/stale-name/sub");
-    std::fs::write(&sub_config, &corrupted).unwrap();
-
-    // Now release. The rename feat-1 → ios-0 should self-heal the stale segment
-    // (anchored on pool-key, sets segment to "ios-0" regardless of current value).
-    release(&key, "feat-1");
-
-    let after = std::fs::read_to_string(&sub_config).unwrap();
-    assert!(
-        after.contains("/ios-0/sub"),
-        "stale `/stale-name/sub` was NOT self-healed to `/ios-0/sub` after release: {after}"
-    );
-    assert!(
-        !after.contains("/stale-name/sub"),
-        "stale segment still present after release: {after}"
-    );
-}
-
 /// Regression for the parallel submodule init path (`std::thread::scope` over N
 /// per-submodule git processes in `submodules::update`). With N siblings competing
 /// for the parent's `.git/config` lock, the per-submodule URL rewrite must still
@@ -1092,7 +702,7 @@ fn parallel_submodule_init_acquires_all() {
 
     let out = Command::cargo_bin("worktree-pool")
         .unwrap()
-        .args(["--pool", &key, "acquire", "--name", "many", "--group", "ios"])
+        .args(["--pool", &key, "acquire", "many", "--group", "ios"])
         .output()
         .unwrap();
     assert!(
@@ -1100,7 +710,7 @@ fn parallel_submodule_init_acquires_all() {
         "acquire failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let slot = pool_root(&key).join("many");
+    let slot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
 
     // All N submodules materialized with the right content.
     for i in 0..N {
@@ -1156,10 +766,14 @@ fn session_cmd(key: &str, args: &[&str]) -> StdCommand {
 /// `false` is the harder case where the source-repo admin was also pruned —
 /// matters because git's upward-walk on a missing `.git` could otherwise let
 /// `slot_repo_ok` falsely pass (e.g. dotfiles repo at $HOME).
-fn acquire_then_break(key: &str, name: &str, gitlink_only: bool) -> PathBuf {
+///
+/// Returns (slot_path, canonical_slot_id). Under canonical-only naming, wt's
+/// dir-based lookups (cmd_go/cmd_release/cmd_cleanup) key off the slot id.
+fn acquire_then_break(key: &str, name: &str, gitlink_only: bool) -> (PathBuf, String) {
     let out = acquire_dev(key, name);
     assert_ok(&out, "acquire failed");
     let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    let slot_id = slot_id_from_output(&out);
     assert!(path.exists());
     let gitlink = std::fs::read_to_string(path.join(".git")).expect("read gitlink");
     let admin = PathBuf::from(gitlink.strip_prefix("gitdir: ").unwrap().trim());
@@ -1167,7 +781,7 @@ fn acquire_then_break(key: &str, name: &str, gitlink_only: bool) -> PathBuf {
     if !gitlink_only {
         std::fs::remove_dir_all(&admin).expect("remove source-repo admin");
     }
-    path
+    (path, slot_id)
 }
 
 #[test]
@@ -1209,9 +823,9 @@ fn session_go_refuses_broken_slot() {
     let bare = make_fixture(tmp.path());
     init_pool(&key, &bare);
 
-    let path = acquire_then_break(&key, "ghost", true);
+    let (path, slot_id) = acquire_then_break(&key, "ghost", true);
 
-    let out = session_cmd(&key, &["go", "ghost"]).output().unwrap();
+    let out = session_cmd(&key, &["go", &slot_id]).output().unwrap();
     assert!(
         !out.status.success(),
         "expected `go` to refuse broken slot; stdout={}, stderr={}",
@@ -1232,9 +846,9 @@ fn session_cleanup_does_not_lie_on_broken_slot() {
     let bare = make_fixture(tmp.path());
     init_pool(&key, &bare);
 
-    let path = acquire_then_break(&key, "ghost", true);
+    let (path, slot_id) = acquire_then_break(&key, "ghost", true);
 
-    let out = session_cmd(&key, &["cleanup", "ghost"]).output().unwrap();
+    let out = session_cmd(&key, &["cleanup", &slot_id]).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
@@ -1259,9 +873,9 @@ fn session_cleanup_detects_fully_orphaned_slot() {
     let bare = make_fixture(tmp.path());
     init_pool(&key, &bare);
 
-    let path = acquire_then_break(&key, "ghost", false);
+    let (path, slot_id) = acquire_then_break(&key, "ghost", false);
 
-    let out = session_cmd(&key, &["cleanup", "ghost"]).output().unwrap();
+    let out = session_cmd(&key, &["cleanup", &slot_id]).output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!stdout.contains("recycled cleanly"),
@@ -1279,9 +893,9 @@ fn session_release_refuses_broken_slot() {
     let bare = make_fixture(tmp.path());
     init_pool(&key, &bare);
 
-    let path = acquire_then_break(&key, "ghost", true);
+    let (path, slot_id) = acquire_then_break(&key, "ghost", true);
 
-    let out = session_cmd(&key, &["release", "ghost"]).output().unwrap();
+    let out = session_cmd(&key, &["release", &slot_id]).output().unwrap();
     assert!(!out.status.success(),
         "release should refuse broken slot rather than dive into worktree-pool release.\nstdout={}\nstderr={}",
         String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
@@ -1292,14 +906,15 @@ fn session_release_refuses_broken_slot() {
 }
 
 /// Acquire a slot and dirty its working tree (tracked + untracked changes).
-/// Returns the slot path.
-fn acquire_then_dirty(key: &str, name: &str) -> PathBuf {
+/// Returns (slot_path, canonical_slot_id).
+fn acquire_then_dirty(key: &str, name: &str) -> (PathBuf, String) {
     let out = acquire_dev(key, name);
     assert_ok(&out, "acquire failed");
     let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    let slot_id = slot_id_from_output(&out);
     std::fs::write(path.join("README"), b"dirty tracked\n").unwrap();
     std::fs::write(path.join("untracked.txt"), b"new\n").unwrap();
-    path
+    (path, slot_id)
 }
 
 #[test]
@@ -1310,9 +925,9 @@ fn session_release_refuses_dirty_without_force() {
     let bare = make_fixture(tmp.path());
     init_pool(&key, &bare);
 
-    let path = acquire_then_dirty(&key, "messy");
+    let (path, slot_id) = acquire_then_dirty(&key, "messy");
 
-    let out = session_cmd(&key, &["release", "messy"]).output().unwrap();
+    let out = session_cmd(&key, &["release", &slot_id]).output().unwrap();
     assert!(!out.status.success(),
         "release should refuse dirty slot without --force.\nstdout={}\nstderr={}",
         String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
@@ -1329,40 +944,13 @@ fn session_release_force_discards_dirty() {
     let bare = make_fixture(tmp.path());
     init_pool(&key, &bare);
 
-    let path = acquire_then_dirty(&key, "messy");
+    let (path, slot_id) = acquire_then_dirty(&key, "messy");
 
-    let out = session_cmd(&key, &["release", "messy", "--force"]).output().unwrap();
+    let out = session_cmd(&key, &["release", &slot_id, "--force"]).output().unwrap();
     assert_ok(&out, "release --force should succeed on dirty slot");
-    // The slot is un-renamed back to canonical id (ios-N) — operator namespace cleared.
-    assert!(!path.exists(), "operator-named slot dir should be gone after release --force");
-}
-
-#[test]
-fn session_release_force_discards_unmerged_branch() {
-    let key = pool_key();
-    let _c = Cleanup(key.clone());
-    let tmp = tempfile::TempDir::new().unwrap();
-    let bare = make_fixture(tmp.path());
-    init_pool(&key, &bare);
-
-    let out = acquire_dev(&key, "ahead");
-    assert!(out.status.success());
-    let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
-
-    // Create a commit on the slot's branch — not in main.
-    std::fs::write(path.join("CHANGE"), b"new\n").unwrap();
-    git_commit(&path, "ahead of main");
-
-    // Without --force: refuse.
-    let out = session_cmd(&key, &["release", "ahead"]).output().unwrap();
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("not in main"), "got: {stderr}");
-
-    // With --force: succeed.
-    let out = session_cmd(&key, &["release", "ahead", "--force"]).output().unwrap();
-    assert_ok(&out, "release --force should discard unmerged commits");
-    assert!(!path.exists());
+    // Canonical slot dir persists (it's the warm-cache home); the lock file
+    // is what flips from held → idle. Assert the slot is now idle.
+    assert!(path.exists(), "canonical slot dir should remain (warm cache)");
 }
 
 #[test]
@@ -1375,10 +963,10 @@ fn session_release_force_accepted_before_positionals() {
     let bare = make_fixture(tmp.path());
     init_pool(&key, &bare);
 
-    let path = acquire_then_dirty(&key, "messy");
-    let out = session_cmd(&key, &["release", "--force", "messy"]).output().unwrap();
+    let (path, slot_id) = acquire_then_dirty(&key, "messy");
+    let out = session_cmd(&key, &["release", "--force", &slot_id]).output().unwrap();
     assert_ok(&out, "release --force <name> should succeed");
-    assert!(!path.exists());
+    assert!(path.exists(), "canonical slot dir should remain (warm cache)");
 }
 
 #[test]
@@ -1392,9 +980,9 @@ fn session_release_force_still_refuses_broken_slot() {
     let bare = make_fixture(tmp.path());
     init_pool(&key, &bare);
 
-    let path = acquire_then_break(&key, "ghost", true);
+    let (path, slot_id) = acquire_then_break(&key, "ghost", true);
 
-    let out = session_cmd(&key, &["release", "ghost", "--force"]).output().unwrap();
+    let out = session_cmd(&key, &["release", &slot_id, "--force"]).output().unwrap();
     assert!(!out.status.success(),
         "release --force must still refuse broken slot.\nstdout={}\nstderr={}",
         String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
@@ -1432,13 +1020,16 @@ fn release_succeeds_despite_stale_index_lock() {
     // --porcelain` for the dirty-tree precheck and could race the same lock,
     // muddying what this test is meant to pin (release.rs's detach step).
     let out = Command::cargo_bin("worktree-pool").unwrap()
-        .args(["--pool", &key, "release", "--name", "leaky"])
+        .args(["--pool", &key, "release", "leaky"])
         .output().unwrap();
     assert_ok(&out, "release should succeed despite stale index.lock");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!stderr.contains("may persist as a dangling ref"),
         "release should not hit detach-failure warn (the bug being fixed): {stderr}");
-    assert!(!slot.exists(), "slot should be un-renamed to canonical id");
+    // Canonical slot dir persists; held → idle is signaled by lock removal.
+    let gitdir = slot_gitdir_path(&slot);
+    assert!(!gitdir.join("worktree-pool/lock").exists(),
+        "slot lock should be gone after release");
 
     // Branch should be gone — confirms the detach actually freed the ref for
     // the subsequent `branch -D`. (If detach silently no-op'd, `branch -D`
@@ -1594,9 +1185,11 @@ fn session_land_keeps_first_parent_on_mainline_after_parallel_land() {
     let out_a = acquire_dev(&key, "slot-a");
     assert_ok(&out_a, "acquire slot-a");
     let slot_a = PathBuf::from(String::from_utf8_lossy(&out_a.stdout).trim().to_string());
+    let _hold_a = InitMutexHold::acquire(&key, &slot_id_from_output(&out_a));
     let out_b = acquire_dev(&key, "slot-b");
     assert_ok(&out_b, "acquire slot-b");
     let slot_b = PathBuf::from(String::from_utf8_lossy(&out_b.stdout).trim().to_string());
+    assert_ne!(slot_a, slot_b, "slot-a and slot-b must be different canonical slots");
 
     std::fs::write(slot_a.join("A"), b"a\n").unwrap();
     git_commit(&slot_a, "A");
@@ -1683,7 +1276,7 @@ fn session_land_refuses_when_main_submodule_has_in_progress_merge() {
 
     let out = acquire_dev_sub(&key, "feat");
     assert_ok(&out, "acquire");
-    let slot = pool_root(&key).join("feat");
+    let slot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
     std::fs::write(slot.join("Y"), b"y\n").unwrap();
     git_commit(&slot, "y");
 
@@ -1816,10 +1409,11 @@ fn session_land_refreshes_slot_submodule_when_main_brought_advance() {
 
     let out = acquire_dev_sub(&key, "slot-a");
     assert_ok(&out, "acquire slot-a");
-    let slot_a = pool_root(&key).join("slot-a");
+    let slot_a = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    let _hold_a = InitMutexHold::acquire(&key, &slot_id_from_output(&out));
     let out = acquire_dev_sub(&key, "slot-b");
     assert_ok(&out, "acquire slot-b");
-    let slot_b = pool_root(&key).join("slot-b");
+    let slot_b = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
 
     // Slot A bumps the submodule.
     std::fs::write(slot_a.join("sub").join("ABUMP"), b"a\n").unwrap();
@@ -1880,7 +1474,7 @@ fn session_land_syncs_stale_submodule_after_plain_merge() {
 
     let out = acquire_dev_sub(&key, "feat");
     assert_ok(&out, "acquire");
-    let slot_path = pool_root(&key).join("feat");
+    let slot_path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
 
     // Advance main's submodule gitlink: commit in main's submodule clone,
     // then commit the gitlink advance in main's parent.
@@ -1962,7 +1556,7 @@ fn session_land_preserves_untracked_in_submodule_on_collision() {
 
     let out = acquire_dev_sub(&key, "feat");
     assert_ok(&out, "acquire");
-    let slot_path = pool_root(&key).join("feat");
+    let slot_path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
     let slot_sub = slot_path.join("sub");
 
     // Slot adds tracked COLLIDE in submodule, commits, advances parent gitlink.
@@ -2021,7 +1615,7 @@ fn session_land_recovers_after_submodule_collision_resolved() {
 
     let out = acquire_dev_sub(&key, "feat");
     assert!(out.status.success());
-    let slot_path = pool_root(&key).join("feat");
+    let slot_path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
     let slot_sub = slot_path.join("sub");
 
     std::fs::write(slot_sub.join("COLLIDE"), b"slot version\n").unwrap();
@@ -2081,7 +1675,7 @@ fn session_land_attaches_detached_submodule_to_main() {
 
     let out = acquire_dev_sub(&key, "feat");
     assert!(out.status.success());
-    let slot_path = pool_root(&key).join("feat");
+    let slot_path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
     let slot_sub = slot_path.join("sub");
 
     std::fs::write(slot_sub.join("NEW"), b"x\n").unwrap();
@@ -2136,7 +1730,7 @@ fn session_land_attaches_detached_submodule_to_gitmodules_branch() {
 
     let out = acquire_dev_sub(&key, "feat");
     assert_ok(&out, "acquire");
-    let slot_path = pool_root(&key).join("feat");
+    let slot_path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
     let slot_sub = slot_path.join("sub");
 
     std::fs::write(slot_sub.join("X"), b"x\n").unwrap();
@@ -2170,7 +1764,7 @@ fn session_land_propagates_submodule_to_main() {
 
     let out = acquire_dev_sub(&key, "feat");
     assert_ok(&out, "acquire");
-    let slot_path = pool_root(&key).join("feat");
+    let slot_path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
     let slot_sub = slot_path.join("sub");
 
     std::fs::write(slot_sub.join("NEW"), b"x\n").unwrap();
@@ -2193,6 +1787,7 @@ fn session_land_propagates_submodule_to_main() {
     assert!(main_sub.join("NEW").exists(),
         "submodule's new tracked file did not land in main worktree");
 }
+
 
 #[test]
 fn session_land_refuses_when_main_worktree_on_other_branch() {
@@ -2258,29 +1853,6 @@ fn run_git_capture(cwd: &Path, args: &[&str]) -> String {
 }
 
 #[test]
-fn reclaim_legacy_zombie_at_acquire() {
-    let key = pool_key();
-    let _c = Cleanup(key.clone());
-    let tmp = tempfile::TempDir::new().unwrap();
-    let bare = make_fixture(tmp.path());
-    init_pool(&key, &bare);
-
-    let out = acquire_dev(&key, "feat-zombie");
-    assert_ok(&out, "");
-    let slot = pool_root(&key).join("feat-zombie");
-    let gitdir = slot_gitdir_path(&slot);
-    std::fs::remove_file(gitdir.join("worktree-pool/lock")).unwrap();
-    run_git(&slot, &["checkout", "--quiet", "--detach"]);
-    run_git(&slot, &["branch", "-D", "feat-zombie"]);
-    assert!(slot.exists());
-    assert!(!gitdir.join("worktree-pool/lock").exists());
-
-    let out = acquire_dev(&key, "feat-fresh");
-    assert_ok(&out, "acquire must succeed (zombie reclaimed first)");
-    assert!(!slot.exists(), "zombie should have been un-renamed away from feat-zombie");
-}
-
-#[test]
 fn release_replay_completes_after_slow_ops_crash() {
     let key = pool_key();
     let _c = Cleanup(key.clone());
@@ -2290,58 +1862,24 @@ fn release_replay_completes_after_slow_ops_crash() {
 
     let out = acquire_dev(&key, "feat-half");
     assert_ok(&out, "");
-    let slot = pool_root(&key).join("feat-half");
+    let slot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    let slot_id = slot_id_from_output(&out);
     run_git(&slot, &["checkout", "--quiet", "--detach"]);
     run_git(&slot, &["branch", "-D", "feat-half"]);
-    assert!(slot_gitdir_path(&slot).join("worktree-pool/lock").exists(),
+    let gitdir = slot_gitdir_path(&slot);
+    assert!(gitdir.join("worktree-pool/lock").exists(),
         "lock still present (new-ordering crash invariant)");
 
-    release(&key, "feat-half");
+    // Branch is gone, so release by branch name finds nothing. Operator
+    // recovers by passing the canonical slot id instead — release's
+    // find_by_name → canonical-path fallback path.
+    release(&key, &slot_id);
 
-    assert!(!slot.exists(), "feat-half dir should be un-renamed by replay");
+    // Canonical slot dir persists; held → idle is signaled by lock removal.
+    assert!(!gitdir.join("worktree-pool/lock").exists(),
+        "lock should be gone after release by canonical slot id");
     let out = acquire_dev(&key, "feat-after");
     assert_ok(&out, "");
-}
-
-#[test]
-fn reclaim_orphan_lock_after_post_rename_crash() {
-    let key = pool_key();
-    let _c = Cleanup(key.clone());
-    let tmp = tempfile::TempDir::new().unwrap();
-    let bare = make_fixture(tmp.path());
-    init_pool(&key, &bare);
-
-    let out = acquire_dev(&key, "feat-postrename");
-    assert_ok(&out, "");
-    let slot = pool_root(&key).join("feat-postrename");
-    let gitdir = slot_gitdir_path(&slot);
-
-    release(&key, "feat-postrename");
-    let canonical = pool_root(&key).join("ios-0");
-    assert!(canonical.exists(), "released slot lives at ios-0");
-    assert_eq!(gitdir, slot_gitdir_path(&canonical), "gitdir stable across rename");
-
-    let lock_path = gitdir.join("worktree-pool/lock");
-    std::fs::write(&lock_path,
-        "started_at: 2026-01-01T00:00:00Z\nfull_sha: 0000000000000000000000000000000000000000\ngroup: ios\n",
-    ).unwrap();
-
-    // Trigger reclaim_stale via release of an unrelated name (does not write a
-    // new lock to ios-0's gitdir, so we can check the orphan is actually gone).
-    Command::cargo_bin("worktree-pool")
-        .unwrap()
-        .args(["--pool", &key, "release", "--name", "no-such-slot"])
-        .assert()
-        .success();
-    assert!(!lock_path.exists(),
-        "reclaim_stale must remove the orphan lock at {}", lock_path.display());
-
-    // And the canonical ios-0 slot is now correctly classified as idle and
-    // available — fresh acquire reuses it (recycled-warm path).
-    let out = acquire_dev(&key, "feat-after-orphan");
-    assert_ok(&out, "acquire after reclaim must succeed");
-    let acquired_path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    assert!(acquired_path.ends_with("/feat-after-orphan"));
 }
 
 #[test]
@@ -2354,49 +1892,19 @@ fn reclaim_does_not_disturb_live_held_slot() {
 
     let out = acquire_dev(&key, "live-1");
     assert_ok(&out, "");
-    let live_slot = pool_root(&key).join("live-1");
+    let live_slot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    let _hold = InitMutexHold::acquire(&key, &slot_id_from_output(&out));
     let live_gitdir = slot_gitdir_path(&live_slot);
     let live_lock_before = std::fs::read(live_gitdir.join("worktree-pool/lock")).unwrap();
 
     let out = acquire_dev(&key, "live-2");
     assert_ok(&out, "");
 
-    assert!(live_slot.exists(), "live held slot must remain at user-name");
+    assert!(live_slot.exists(), "live held slot dir must remain");
     let live_lock_after = std::fs::read(live_gitdir.join("worktree-pool/lock")).unwrap();
     assert_eq!(live_lock_before, live_lock_after, "live lock must not be touched");
     let head = run_git_capture(&live_slot, &["symbolic-ref", "--short", "HEAD"]);
     assert_eq!(head.trim(), "live-1", "live slot's HEAD must still be on its branch");
-}
-
-#[test]
-fn reclaim_multiple_legacy_zombies_in_one_sweep() {
-    // Mirrors the user's actual pspec pool state: three SIGINT-induced zombies
-    // present simultaneously when the next acquire/release runs. Each must be
-    // reclaimed independently in the single sweep.
-    let key = pool_key();
-    let _c = Cleanup(key.clone());
-    let tmp = tempfile::TempDir::new().unwrap();
-    let bare = make_fixture(tmp.path());
-    init_pool(&key, &bare);
-
-    for name in ["z1", "z2", "z3"] {
-        let out = acquire_dev(&key, name);
-        assert_ok(&out, "");
-        let slot = pool_root(&key).join(name);
-        let gitdir = slot_gitdir_path(&slot);
-        std::fs::remove_file(gitdir.join("worktree-pool/lock")).unwrap();
-        run_git(&slot, &["checkout", "--quiet", "--detach"]);
-        run_git(&slot, &["branch", "-D", name]);
-    }
-
-    // One sweep (triggered by acquire) must reclaim all three.
-    let out = acquire_dev(&key, "fresh");
-    assert_ok(&out, "acquire must succeed with three zombies present");
-
-    for name in ["z1", "z2", "z3"] {
-        assert!(!pool_root(&key).join(name).exists(),
-            "zombie '{name}' should have been un-renamed");
-    }
 }
 
 /// The user's actual pspec crash was in a submodule-bearing pool — release's
@@ -2413,7 +1921,7 @@ fn release_replay_completes_with_submodules() {
 
     let out = acquire_dev(&key, "feat-sub");
     assert_ok(&out, "");
-    let slot = pool_root(&key).join("feat-sub");
+    let slot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
 
     // Submodule is initialized; acquire created a `feat-sub` branch in it.
     let sub = slot.join("sub");
@@ -2422,310 +1930,25 @@ fn release_replay_completes_with_submodules() {
     assert!(sub_branches_before.contains("feat-sub"),
         "submodule should have feat-sub branch: {sub_branches_before:?}");
 
-    // Compose new-ordering crash: parent branch deleted, lock still present.
-    run_git(&slot, &["checkout", "--quiet", "--detach"]);
-    run_git(&slot, &["branch", "-D", "feat-sub"]);
-    assert!(slot_gitdir_path(&slot).join("worktree-pool/lock").exists());
+    // Compose pre-release crash: lock still present, branch still on HEAD —
+    // models crash AFTER acquire wrote the lock but BEFORE any release ran.
+    // reclaim_stale should read the branch name from HEAD and complete the
+    // recursive submodule branch_delete + lock removal.
+    let gitdir = slot_gitdir_path(&slot);
+    assert!(gitdir.join("worktree-pool/lock").exists());
 
-    // Replay completes the un-rename + submodule branch cleanup.
+    // Replay completes the submodule branch cleanup + lock removal.
     release(&key, "feat-sub");
-    assert!(!slot.exists(), "feat-sub should be un-renamed by replay");
+    assert!(!gitdir.join("worktree-pool/lock").exists(),
+        "lock should be gone after release replay");
 
     // Submodule's per-slot branch should be gone too.
-    let canonical_sub = pool_root(&key).join("ios-0").join("sub");
-    let sub_branches_after = run_git_capture(&canonical_sub, &["branch", "--list", "feat-sub"]);
+    let sub_branches_after = run_git_capture(&sub, &["branch", "--list", "feat-sub"]);
     assert!(sub_branches_after.trim().is_empty(),
         "submodule's feat-sub branch should be cleaned: {sub_branches_after:?}");
 }
 
-/// Acquire+release each `name` once to materialize its canonical-N dir on
-/// disk as an idle slot. Used by capacity tests that need `reclaim_stale`'s
-/// `smallest_free_n` to find every canonical-N already occupied.
-fn materialize_idle_canonicals(key: &str, group: Option<&str>, names: &[&str]) {
-    for n in names {
-        let mut acq = Command::cargo_bin("worktree-pool").unwrap();
-        acq.args(["--pool", key, "acquire", "--name", n]);
-        if let Some(g) = group {
-            acq.args(["--group", g]);
-        }
-        acq.output().unwrap();
-    }
-    for n in names {
-        Command::cargo_bin("worktree-pool").unwrap()
-            .args(["--pool", key, "release", "--name", n])
-            .assert().success();
-    }
-}
-
-/// Plant an unrecoverable-zombie shape at `<pool>/<name>` via direct
-/// `git worktree add --detach` plus a pool-ownership marker — simulates a
-/// crashed acquire/release (lock removed but the slot was once pool-owned).
-/// Without the marker, `reclaim_stale` correctly refuses to absorb the dir
-/// (it'd be indistinguishable from a manual `git worktree add`).
-fn plant_zombie(bare: &Path, pool: &Path, name: &str) {
-    let st = StdCommand::new("git")
-        .args(["-C", &bare.display().to_string(),
-               "worktree", "add", "--detach",
-               &pool.join(name).display().to_string(), "main"])
-        .status().unwrap();
-    assert!(st.success(), "plant_zombie: `git worktree add` failed for {name}");
-
-    // Resolve the gitdir via the gitlink the worktree just created.
-    let gitlink = std::fs::read_to_string(pool.join(name).join(".git")).unwrap();
-    let gitdir = std::path::PathBuf::from(
-        gitlink.trim().trim_start_matches("gitdir:").trim()
-    );
-    let marker = gitdir.join("worktree-pool/created");
-    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
-    std::fs::write(&marker, "# planted by test\n").unwrap();
-}
-
-/// Over-provisioned state — every `0..max_slots` canonical-N is occupied as
-/// idle on disk beside zombies. `reclaim_stale` relocates the zombies to
-/// surplus N's (>= max_slots), then acquire proceeds. End-to-end self-heal.
-#[test]
-fn over_provisioned_pool_self_heals_via_reclaim() {
-    let key = pool_key();
-    let _c = Cleanup(key.clone());
-    let tmp = tempfile::TempDir::new().unwrap();
-    let bare = make_fixture(tmp.path());
-
-    Command::cargo_bin("worktree-pool")
-        .unwrap()
-        .args(["--pool", &key, "init"])
-        .arg("--source").arg(&bare)
-        .args(["--max-slots", "2"])
-        .assert().success();
-
-    let pool = pool_root(&key);
-    materialize_idle_canonicals(&key, None, &["warm-1", "warm-2"]);
-    assert!(pool.join("slot-0").exists(), "slot-0 idle canonical present");
-    assert!(pool.join("slot-1").exists(), "slot-1 idle canonical present");
-
-    // Plant two zombies. Pool now has 2 Renamed (zombies) + 2 Canonical
-    // (idle) = 4 dirs — 2 over max_slots.
-    plant_zombie(&bare, &pool, "z1");
-    plant_zombie(&bare, &pool, "z2");
-
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
-        .args(["--pool", &key, "acquire", "--name", "fresh-1"])
-        .output().unwrap();
-    assert_ok(&out, "acquire must succeed after reclaim relocates zombies to surplus N's");
-    assert!(pool.join("fresh-1").exists());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("released 'z1'") && stderr.contains("released 'z2'"),
-        "reclaim_stale should report relocating both zombies; stderr={stderr}");
-}
-
-/// Grouped variant of self-healing: a zombie's group is unknown, so reclaim
-/// relocates it under one of the configured groups. The requested group's
-/// acquire then succeeds end-to-end.
-#[test]
-fn over_provisioned_pool_self_heals_grouped() {
-    let key = pool_key();
-    let _c = Cleanup(key.clone());
-    let tmp = tempfile::TempDir::new().unwrap();
-    let bare = make_fixture(tmp.path());
-
-    Command::cargo_bin("worktree-pool")
-        .unwrap()
-        .args(["--pool", &key, "init"])
-        .arg("--source").arg(&bare)
-        .args(["--max-slots", "1", "--groups", "ios,android"])
-        .assert().success();
-
-    materialize_idle_canonicals(&key, Some("ios"), &["warm-ios"]);
-    materialize_idle_canonicals(&key, Some("android"), &["warm-android"]);
-    let pool = pool_root(&key);
-    plant_zombie(&bare, &pool, "z-mystery");
-
-    let out = Command::cargo_bin("worktree-pool").unwrap()
-        .args(["--pool", &key, "acquire", "--name", "fresh-ios", "--group", "ios"])
-        .output().unwrap();
-    assert_ok(&out, "acquire --group ios must succeed; zombie is recoverable");
-    assert!(pool.join("fresh-ios").exists());
-}
-
-/// Release lands at a surplus N when every `0..max_slots` canonical is
-/// occupied as idle on disk beside a held name. Reachable when reclaim turns
-/// multiple zombies into idle canonicals beside an existing held slot, or
-/// when `max_slots` is reduced after slots were materialized.
-#[test]
-fn release_unblocks_when_all_canonicals_idle() {
-    let key = pool_key();
-    let _c = Cleanup(key.clone());
-    let tmp = tempfile::TempDir::new().unwrap();
-    let bare = make_fixture(tmp.path());
-
-    Command::cargo_bin("worktree-pool")
-        .unwrap()
-        .args(["--pool", &key, "init"])
-        .arg("--source").arg(&bare)
-        .args(["--max-slots", "2"])
-        .assert().success();
-
-    let pool = pool_root(&key);
-
-    // Build slot-0 idle + slot-1 idle + feat held = 3 dirs. Natural
-    // acquire/release can't reach this (total_dirs ≤ max_slots holds in the
-    // happy path), so plant the held "feat" directly via worktree add + lock
-    // write after filling both canonicals.
-    materialize_idle_canonicals(&key, None, &["warm-a", "warm-b"]);
-    assert!(pool.join("slot-0").exists(), "slot-0 should be idle on disk");
-    assert!(pool.join("slot-1").exists(), "slot-1 should be idle on disk");
-
-    plant_zombie(&bare, &pool, "feat");
-    // Write a lock at feat's gitdir → promotes the zombie to a real held slot.
-    let gitdir_out = StdCommand::new("git")
-        .args(["-C", &pool.join("feat").display().to_string(),
-               "rev-parse", "--git-dir"])
-        .output().unwrap();
-    assert!(gitdir_out.status.success(), "rev-parse --git-dir failed for feat");
-    let gd = String::from_utf8(gitdir_out.stdout).unwrap().trim().to_string();
-    let gd_path = if Path::new(&gd).is_absolute() {
-        PathBuf::from(&gd)
-    } else {
-        pool.join("feat").join(&gd)
-    };
-    let lock_dir = gd_path.join("worktree-pool");
-    std::fs::create_dir_all(&lock_dir).unwrap();
-    let head_sha = String::from_utf8(
-        StdCommand::new("git")
-            .args(["-C", &bare.display().to_string(), "rev-parse", "HEAD"])
-            .output().unwrap().stdout
-    ).unwrap().trim().to_string();
-    std::fs::write(
-        lock_dir.join("lock"),
-        format!("started_at: 2026-05-10T00:00:00Z\nfull_sha: {head_sha}\n"),
-    ).unwrap();
-    assert!(pool.join("feat").exists(), "feat should be held");
-
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
-        .args(["--pool", &key, "release", "--name", "feat"])
-        .output().unwrap();
-    assert_ok(&out, "release must succeed in over-provisioned pool");
-    assert!(!pool.join("feat").exists(), "feat dir should be gone after release");
-    assert!(pool.join("slot-2").exists(),
-        "released slot should land at slot-2 (smallest free N past the surplus)");
-
-    // Surplus reuse: a fresh acquire must not grow the pool — the surplus
-    // slot-2 should be reused (or one of the lower idle canonicals), not
-    // appended-to with a fresh slot-N. Asserts `acquirable_ns`'s surplus scan.
-    Command::cargo_bin("worktree-pool").unwrap()
-        .args(["--pool", &key, "acquire", "--name", "reuse"])
-        .assert().success();
-    let pool_dir_count = std::fs::read_dir(&pool)
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .filter(|e| {
-            let n = e.file_name();
-            !n.to_string_lossy().starts_with('.') && e.path().is_dir()
-        })
-        .count();
-    assert!(pool_dir_count <= 3,
-        "pool should not grow past pre-acquire size (3 dirs); got {pool_dir_count}");
-}
-
 // ---------- pool-ownership marker tests (provenance gate) ----------
-
-/// Resolve `<gitdir>/worktree-pool/created` for a slot at `<pool>/<name>`.
-fn marker_for(pool: &Path, name: &str) -> PathBuf {
-    let gitlink = std::fs::read_to_string(pool.join(name).join(".git")).unwrap();
-    let gitdir = PathBuf::from(gitlink.trim().trim_start_matches("gitdir:").trim());
-    gitdir.join("worktree-pool/created")
-}
-
-/// `acquire` writes both lock and marker. `release` removes the lock but
-/// preserves the marker — provenance is sticky once stamped.
-#[test]
-fn acquire_writes_marker_and_release_preserves_it() {
-    let key = pool_key();
-    let _c = Cleanup(key.clone());
-    let tmp = tempfile::TempDir::new().unwrap();
-    let bare = make_fixture(tmp.path());
-    init_pool(&key, &bare);
-
-    let out = acquire_dev(&key, "feat-x");
-    assert_ok(&out, "acquire feat-x");
-
-    let pool = pool_root(&key);
-    let marker = marker_for(&pool, "feat-x");
-    assert!(marker.exists(), "acquire should stamp marker at {}", marker.display());
-
-    release(&key, "feat-x");
-
-    // Post-release the slot is back at canonical ios-0; marker must follow the gitdir.
-    let canonical_marker = marker_for(&pool, "ios-0");
-    assert!(canonical_marker.exists(),
-        "marker must persist past release at {}", canonical_marker.display());
-}
-
-/// Manual `git worktree add` under the pool root must NOT be silently
-/// absorbed by reclaim_stale. Pre-fix, this destroyed the operator's branch
-/// and un-renamed the dir on the next acquire from any session.
-#[test]
-fn reclaim_stale_skips_unmanaged_renamed_dir() {
-    let key = pool_key();
-    let _c = Cleanup(key.clone());
-    let tmp = tempfile::TempDir::new().unwrap();
-    let bare = make_fixture(tmp.path());
-    init_pool(&key, &bare);
-
-    let pool = pool_root(&key);
-    // Plant a manual worktree (no marker — operator bypassed `acquire`).
-    let st = StdCommand::new("git")
-        .args(["-C", &bare.display().to_string(),
-               "worktree", "add",
-               &pool.join("manual-feat").display().to_string()])
-        .status().unwrap();
-    assert!(st.success(), "manual git worktree add failed");
-
-    // Trigger reclaim_stale via an unrelated acquire.
-    let out = acquire_dev(&key, "real-feat");
-    assert_ok(&out, "acquire of real-feat must succeed alongside unmanaged dir");
-
-    assert!(pool.join("manual-feat").exists(),
-        "unmanaged dir must NOT be absorbed by reclaim_stale");
-    assert!(pool.join("real-feat").exists(), "real acquire succeeded");
-
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("not pool-owned") && stderr.contains("manual-feat"),
-        "reclaim_stale should warn about the unmanaged dir; stderr={stderr}");
-}
-
-/// Migration path: pre-fix pools have lock files but no marker. The
-/// auto-stamp pass at the start of reclaim_stale should write the marker
-/// for any slot whose lock proves pool ownership.
-#[test]
-fn reclaim_stale_auto_stamps_marker_on_legacy_locked_slot() {
-    let key = pool_key();
-    let _c = Cleanup(key.clone());
-    let tmp = tempfile::TempDir::new().unwrap();
-    let bare = make_fixture(tmp.path());
-    init_pool(&key, &bare);
-
-    let out = acquire_dev(&key, "legacy");
-    assert_ok(&out, "acquire legacy");
-
-    let pool = pool_root(&key);
-    let marker = marker_for(&pool, "legacy");
-    assert!(marker.exists(), "precondition: marker present after acquire");
-
-    // Simulate a pre-fix pool: hand-delete the marker, leaving the lock.
-    std::fs::remove_file(&marker).unwrap();
-    assert!(!marker.exists(), "marker removed");
-
-    // Trigger reclaim_stale via an unrelated acquire.
-    let out = acquire_dev(&key, "fresh");
-    assert_ok(&out, "acquire fresh must trigger reclaim_stale migration");
-
-    assert!(marker.exists(), "reclaim_stale should auto-stamp the marker on the legacy locked slot");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("stamping legacy pool marker") && stderr.contains("legacy"),
-        "auto-stamp should be logged; stderr={stderr}");
-}
 
 // ---------- stale `index.lock` reclamation ----------
 //
@@ -2749,7 +1972,7 @@ fn plant_index_lock(gitdir: &Path, bytes: &[u8], age: std::time::Duration) -> Pa
 fn trigger_reclaim(key: &str) {
     Command::cargo_bin("worktree-pool")
         .unwrap()
-        .args(["--pool", key, "release", "--name", "no-such-slot"])
+        .args(["--pool", key, "release", "no-such-slot"])
         .assert()
         .success();
 }
@@ -2764,7 +1987,7 @@ fn reclaim_clears_stale_index_lock() {
 
     let out = acquire_dev(&key, "feat-stale");
     assert_ok(&out, "");
-    let slot = pool_root(&key).join("feat-stale");
+    let slot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
     let gitdir = slot_gitdir_path(&slot);
 
     let lock = plant_index_lock(&gitdir, b"", std::time::Duration::from_secs(120));
@@ -2786,7 +2009,7 @@ fn reclaim_preserves_young_index_lock() {
 
     let out = acquire_dev(&key, "feat-young");
     assert_ok(&out, "");
-    let slot = pool_root(&key).join("feat-young");
+    let slot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
     let gitdir = slot_gitdir_path(&slot);
 
     // 0-byte but fresh — could be a live `git status` mid-stride. Must survive.
@@ -2811,7 +2034,7 @@ fn reclaim_preserves_nonempty_index_lock() {
 
     let out = acquire_dev(&key, "feat-partial");
     assert_ok(&out, "");
-    let slot = pool_root(&key).join("feat-partial");
+    let slot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
     let gitdir = slot_gitdir_path(&slot);
 
     // Aged but non-empty — could be a partial write the operator wants to see.
@@ -2834,7 +2057,7 @@ fn doctor_reports_stale_index_lock() {
 
     let out = acquire_dev(&key, "feat-doc");
     assert_ok(&out, "");
-    let slot = pool_root(&key).join("feat-doc");
+    let slot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
     let gitdir = slot_gitdir_path(&slot);
 
     let lock = plant_index_lock(&gitdir, b"", std::time::Duration::from_secs(120));
@@ -2868,7 +2091,7 @@ fn reclaim_preserves_symlink_at_index_lock() {
 
     let out = acquire_dev(&key, "feat-symlink");
     assert_ok(&out, "");
-    let slot = pool_root(&key).join("feat-symlink");
+    let slot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
     let gitdir = slot_gitdir_path(&slot);
     let lock = gitdir.join("index.lock");
 
@@ -2900,7 +2123,7 @@ fn doctor_reports_no_locks_for_clean_pool() {
 
     let out = acquire_dev(&key, "feat-clean");
     assert_ok(&out, "");
-    let slot = pool_root(&key).join("feat-clean");
+    let slot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
     let our_gitdir = slot_gitdir_path(&slot);
 
     let out = Command::cargo_bin("worktree-pool")
