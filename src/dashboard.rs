@@ -12,7 +12,7 @@ pub fn ls(pool_root: &Path, cfg: &PoolConfig, args: LsArgs) -> Result<()> {
     let mut rows: Vec<Row> = Vec::new();
 
     for entry in &entries {
-        rows.push(build_row(entry)?);
+        rows.push(build_row(entry));
     }
 
     // Add unmaterialized canonical slots up to max_slots so the table reflects capacity.
@@ -144,7 +144,7 @@ impl Row {
     }
 }
 
-fn build_row(entry: &slot::SlotEntry) -> Result<Row> {
+fn build_row(entry: &slot::SlotEntry) -> Row {
     let gitdir_result = git::worktree_gitdir(&entry.path);
     let (state, lock, age) = match gitdir_result {
         Ok(gd) => {
@@ -177,7 +177,7 @@ fn build_row(entry: &slot::SlotEntry) -> Result<Row> {
         .map(|l| l.full_sha[..8.min(l.full_sha.len())].to_string())
         .unwrap_or_else(|| "-".into());
 
-    Ok(Row {
+    Row {
         id: entry.id.clone(),
         state,
         name,
@@ -188,35 +188,31 @@ fn build_row(entry: &slot::SlotEntry) -> Result<Row> {
         untracked: "-".into(),
         ahead: "-".into(),
         path: entry.path.clone(),
-    })
+    }
 }
 
 fn augment_with_git(row: &mut Row) {
     if row.path.as_os_str().is_empty() {
         return;
     }
-    if let Ok((ok, porcelain, _)) = git::run_lenient(&row.path, &["status", "--porcelain"]) {
-        if ok {
-            let mut dirty = 0u32;
-            let mut untracked = 0u32;
-            for line in porcelain.lines().filter(|l| !l.is_empty()) {
-                if line.starts_with("??") {
-                    untracked += 1;
-                } else {
-                    dirty += 1;
-                }
+    if let Ok((true, porcelain, _)) = git::run_lenient(&row.path, &["status", "--porcelain"]) {
+        let mut dirty = 0u32;
+        let mut untracked = 0u32;
+        for line in porcelain.lines().filter(|l| !l.is_empty()) {
+            if line.starts_with("??") {
+                untracked += 1;
+            } else {
+                dirty += 1;
             }
-            row.dirty = dirty.to_string();
-            row.untracked = untracked.to_string();
         }
+        row.dirty = dirty.to_string();
+        row.untracked = untracked.to_string();
     }
-    if let Ok((ok, ahead, _)) = git::run_lenient(
+    if let Ok((true, ahead, _)) = git::run_lenient(
         &row.path,
         &["rev-list", "--count", "HEAD", "^refs/heads/main"],
     ) {
-        if ok {
-            row.ahead = ahead.trim().to_string();
-        }
+        row.ahead = ahead.trim().to_string();
     }
 }
 

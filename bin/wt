@@ -1090,9 +1090,9 @@ cmd_release() {
   # `--force` skips the work-preservation safety (dirty + unmerged); the
   # ghost-dir guard remains because release physically can't run without git
   # state — broken slots need explicit `rm -rf`, not --force.
-  # Reject other `--*` flags so a typo (`--name foo`) doesn't get silently
-  # treated as a slot named `--name`. `--` is end-of-options for slot names
-  # that begin with `-` (rare).
+  # Reject other `--*` flags so a stray typo doesn't get silently treated as
+  # a slot named `--whatever`. `--` is end-of-options for slot names that
+  # begin with `-` (rare).
   local force=0 args=() arg seen_endopts=0
   for arg in "$@"; do
     if [ "$seen_endopts" = 1 ]; then

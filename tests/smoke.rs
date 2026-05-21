@@ -190,7 +190,6 @@ fn unique_sha_refuses_second_acquire() {
         .output()
         .unwrap();
     assert_ok(&out1, "first acquire");
-    // Hold init-mutex flock so subsequent reclaim_stale sees the slot as live.
     let out = Command::cargo_bin("worktree-pool")
         .unwrap()
         .args([
@@ -283,7 +282,7 @@ fn ls_renders_with_git_status_for_held_only() {
     let tmp = tempfile::TempDir::new().unwrap();
     let bare = make_fixture(tmp.path());
     init_pool(&key, &bare);
-    let _ = acquire_dev(&key, "feat-x");
+    assert_ok(&acquire_dev(&key, "feat-x"), "acquire feat-x");
 
     let out = Command::cargo_bin("worktree-pool")
         .unwrap()
@@ -437,11 +436,8 @@ fn parallel_releases_different_names() {
     assert!(!stdout.lines().any(|l| l.starts_with("b ")));
 }
 
-/// `--unique-sha` race coverage: sequential, with a flock-held first holder
-/// to keep the slot "live" across CLI invocations. (True parallelism isn't
-/// observable here — pool_mutex serializes acquires; the parallel-flavored
-/// flock-handoff race needs a long-running holder rather than two short CLI
-/// invocations.)
+/// `--unique-sha` coverage: sequential acquires (pool_mutex serializes anyway;
+/// the second acquire's lock-walk sees the first holder's lock and refuses).
 #[test]
 fn parallel_unique_sha_at_most_one_succeeds() {
     let key = pool_key();
