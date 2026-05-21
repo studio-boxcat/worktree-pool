@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::{InspectArgs, LsArgs, PathArgs};
 use crate::config::PoolConfig;
-use crate::{fs_paths, git, lock::Lock, slot};
+use crate::{fs_paths, git, lock::Lock, parallel, slot};
 
 pub fn ls(pool_root: &Path, cfg: &PoolConfig, args: LsArgs) -> Result<()> {
     let entries = slot::enumerate(pool_root, cfg)?;
@@ -33,9 +33,21 @@ pub fn ls(pool_root: &Path, cfg: &PoolConfig, args: LsArgs) -> Result<()> {
     }
 
     if args.git_status {
+        // Parallel: H held slots × 2 git spawns each is the wall-clock
+        // bottleneck. Compute deltas immutably + parallel, apply sequentially.
+        let held_paths: Vec<PathBuf> = rows
+            .iter()
+            .filter(|r| r.state == State::Held)
+            .map(|r| r.path.clone())
+            .collect();
+        let mut aug_iter = parallel::map(&held_paths, |p| compute_git_columns(p)).into_iter();
         for r in &mut rows {
-            if r.state == State::Held {
-                augment_with_git(r);
+            if r.state == State::Held
+                && let Some((dirty, untracked, ahead)) = aug_iter.next()
+            {
+                r.dirty = dirty;
+                r.untracked = untracked;
+                r.ahead = ahead;
             }
         }
     }
@@ -191,29 +203,35 @@ fn build_row(entry: &slot::SlotEntry) -> Row {
     }
 }
 
-fn augment_with_git(row: &mut Row) {
-    if row.path.as_os_str().is_empty() {
-        return;
+/// Returns `(dirty, untracked, ahead)` columns for the held slot at `path`.
+/// Each defaults to `"-"` when its git call failed or the path is empty.
+fn compute_git_columns(path: &Path) -> (String, String, String) {
+    let mut dirty = "-".to_string();
+    let mut untracked = "-".to_string();
+    let mut ahead = "-".to_string();
+    if path.as_os_str().is_empty() {
+        return (dirty, untracked, ahead);
     }
-    if let Ok((true, porcelain, _)) = git::run_lenient(&row.path, &["status", "--porcelain"]) {
-        let mut dirty = 0u32;
-        let mut untracked = 0u32;
+    if let Ok((true, porcelain, _)) = git::run_lenient(path, &["status", "--porcelain"]) {
+        let mut d = 0u32;
+        let mut u = 0u32;
         for line in porcelain.lines().filter(|l| !l.is_empty()) {
             if line.starts_with("??") {
-                untracked += 1;
+                u += 1;
             } else {
-                dirty += 1;
+                d += 1;
             }
         }
-        row.dirty = dirty.to_string();
-        row.untracked = untracked.to_string();
+        dirty = d.to_string();
+        untracked = u.to_string();
     }
-    if let Ok((true, ahead, _)) = git::run_lenient(
-        &row.path,
+    if let Ok((true, a, _)) = git::run_lenient(
+        path,
         &["rev-list", "--count", "HEAD", "^refs/heads/main"],
     ) {
-        row.ahead = ahead.trim().to_string();
+        ahead = a.trim().to_string();
     }
+    (dirty, untracked, ahead)
 }
 
 fn format_age(then: DateTime<Utc>) -> String {

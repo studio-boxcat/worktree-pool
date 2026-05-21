@@ -45,33 +45,36 @@ pub fn resolve_group<'a>(cfg: &'a PoolConfig, requested: Option<&str>) -> Result
     }
 }
 
-/// Iterator-friendly enumeration of canonical slot Ns currently *acquirable*:
-/// either `<pool>/{canonical_id(group, N)}` doesn't exist (fresh) OR it exists but has no
-/// held-marker at its gitdir (recycled idle).
+/// A canonical slot N that's currently acquirable — either fresh (no dir on
+/// disk) or recycled-idle (dir exists, no lock at gitdir). Acquire iterates
+/// these in order, tries the init mutex on each, and uses `is_fresh` to pick
+/// between `worktree add` (fresh) and `reset --hard` (recycled).
+#[derive(Debug, Clone, Copy)]
+pub struct Acquirable {
+    pub n: u32,
+    pub is_fresh: bool,
+}
+
+/// Acquirable canonical slot Ns in lowest-N-first order.
 ///
-/// Acquire iterates this in order and tries the init mutex on each; the first mutex it
-/// successfully creates is its slot.
-///
-/// **Fresh vs recycled in over-provisioned pools.** Fresh creation is bounded by
-/// `0..max_slots` (never grow the pool past max_slots). Recycled-idle dirs at
-/// N >= max_slots can exist (max_slots was reduced after materialization) and
-/// are surfaced here as acquirable — reusing them eats down the surplus.
-pub fn acquirable_ns(
+/// **Fresh vs recycled in over-provisioned pools.** Fresh creation is bounded
+/// by `0..max_slots` (never grow the pool past max_slots). Recycled-idle dirs
+/// at N >= max_slots can exist (max_slots was reduced after materialization)
+/// and are surfaced here as acquirable — reusing them eats down the surplus.
+pub fn acquirable(
     pool_root: &Path,
     group: Option<&str>,
     max_slots: u32,
     entries: &[SlotEntry],
-) -> Result<Vec<u32>> {
-    let mut out: Vec<u32> = Vec::new();
+) -> Vec<Acquirable> {
+    let mut out: Vec<Acquirable> = Vec::new();
     for n in 0..max_slots {
         let id = canonical_id(group, n);
         let p = pool_root.join(&id);
         if !p.exists() {
-            out.push(n); // fresh — will `worktree add`
-            continue;
-        }
-        if !is_held_at(&p) {
-            out.push(n); // recycled idle — will `reset --hard`
+            out.push(Acquirable { n, is_fresh: true });
+        } else if !is_held_at(&p) {
+            out.push(Acquirable { n, is_fresh: false });
         }
     }
     for entry in entries {
@@ -79,11 +82,11 @@ pub fn acquirable_ns(
             && entry.n >= max_slots
             && !is_held_at(&entry.path)
         {
-            out.push(entry.n);
+            out.push(Acquirable { n: entry.n, is_fresh: false });
         }
     }
-    out.sort_unstable();
-    Ok(out)
+    out.sort_unstable_by_key(|a| a.n);
+    out
 }
 
 /// True iff the slot dir at `path` has a held marker at its gitdir.
@@ -97,15 +100,11 @@ pub fn is_held_at(path: &Path) -> bool {
 }
 
 /// Count held slots in `group` — canonical slots with a lock at their gitdir.
-pub fn count_held_in_group(
-    pool_root: &Path,
-    cfg: &PoolConfig,
-    group: Option<&str>,
-) -> Result<usize> {
-    Ok(enumerate(pool_root, cfg)?
-        .into_iter()
+pub fn count_held_in_group(entries: &[SlotEntry], group: Option<&str>) -> usize {
+    entries
+        .iter()
         .filter(|e| e.group.as_deref() == group && is_held_at(&e.path))
-        .count())
+        .count()
 }
 
 /// Look up a held slot by branch name. Scans canonical slots with locks,
@@ -234,26 +233,40 @@ mod tests {
     }
 
     #[test]
-    fn acquirable_ns_picks_fresh() {
+    fn acquirable_picks_fresh() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let v = acquirable_ns(tmp.path(), None, 3, &[]).unwrap();
-        assert_eq!(v, vec![0, 1, 2]);
+        let v = acquirable(tmp.path(), None, 3, &[]);
+        assert_eq!(v.iter().map(|a| (a.n, a.is_fresh)).collect::<Vec<_>>(),
+                   vec![(0, true), (1, true), (2, true)]);
     }
 
     #[test]
-    fn acquirable_ns_skips_held() {
-        // A slot dir with a placeholder gitdir + lock at fs_paths location.
+    fn acquirable_marks_recycled_not_fresh() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // slot-0 idle on disk (.git gitlink resolves but no lock at gitdir);
+        // slot-1 fresh (no dir).
+        let slot0 = tmp.path().join("slot-0");
+        std::fs::create_dir(&slot0).unwrap();
+        let gitdir = tmp.path().join("fake-gitdir");
+        std::fs::create_dir_all(gitdir.join("worktree-pool")).unwrap();
+        std::fs::write(slot0.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+        let v = acquirable(tmp.path(), None, 2, &[]);
+        assert_eq!(v.iter().map(|a| (a.n, a.is_fresh)).collect::<Vec<_>>(),
+                   vec![(0, false), (1, true)]);
+    }
+
+    #[test]
+    fn acquirable_skips_held() {
         let tmp = tempfile::TempDir::new().unwrap();
         let slot0 = tmp.path().join("slot-0");
         std::fs::create_dir(&slot0).unwrap();
-        // Plant a .git gitlink pointing at a fake gitdir we can write a lock under.
         let gitdir = tmp.path().join("fake-gitdir");
         std::fs::create_dir_all(&gitdir).unwrap();
         std::fs::write(slot0.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
         std::fs::create_dir_all(gitdir.join("worktree-pool")).unwrap();
         std::fs::write(gitdir.join("worktree-pool").join("lock"), "started_at: 2026-01-01T00:00:00Z\nfull_sha: 0000000000000000000000000000000000000000\n").unwrap();
 
-        let v = acquirable_ns(tmp.path(), None, 3, &[]).unwrap();
-        assert_eq!(v, vec![1, 2]); // slot-0 is held, skipped
+        let v = acquirable(tmp.path(), None, 3, &[]);
+        assert_eq!(v.iter().map(|a| a.n).collect::<Vec<_>>(), vec![1, 2]);
     }
 }

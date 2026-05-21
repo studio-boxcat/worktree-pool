@@ -24,6 +24,14 @@ pub fn pool_mutex(pool_root: &Path) -> PathBuf {
     pool_root.join(".meta/pool.lock")
 }
 
+/// Per-source mutex serializing top-level submodule.<name>.url writes that
+/// target the shared `<source>/.git/config`. Lives at
+/// `<source-gitdir>/worktree-pool-config.lock`, so parallel acquires across
+/// pools sharing the same source repo don't fight on the lockfile.
+pub fn source_config_mutex(source_gitdir: &Path) -> PathBuf {
+    source_gitdir.join("worktree-pool-config.lock")
+}
+
 /// Lock file inside the source repo's per-worktree gitdir.
 /// Caller passes `<source>/.git/worktrees/<id>/`.
 pub fn slot_lock(worktree_gitdir: &Path) -> PathBuf {

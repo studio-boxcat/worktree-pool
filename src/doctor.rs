@@ -26,6 +26,7 @@ pub fn run() -> Result<()> {
     check("git", check_git());
     check("pools dir", check_pools_dir());
     check("binary quarantine", check_quarantine());
+    check("pools", check_pools());
     check("stale index.lock", check_stale_index_locks());
 
     println!();
@@ -78,6 +79,44 @@ fn check_pools_dir() -> CheckResult {
     let mut count = 0u32;
     fs_paths::for_each_pool_dir(|_| count += 1);
     CheckResult::Ok(format!("{} ({} pool(s))", dir.display(), count))
+}
+
+/// Walk every initialized pool and validate: config parses (schema check is
+/// inside `config::load`); `source` path exists and is a readable git repo.
+/// Counts unhealthy pools; reports the first failure inline.
+fn check_pools() -> CheckResult {
+    let mut total = 0u32;
+    let mut bad: Vec<String> = Vec::new();
+    fs_paths::for_each_pool_dir(|pool_path| {
+        total += 1;
+        let key = pool_path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
+        let cfg = match config::load(&pool_path) {
+            Ok(c) => c,
+            Err(e) => {
+                bad.push(format!("{key}: config: {e:#}"));
+                return;
+            }
+        };
+        if !cfg.source.exists() {
+            bad.push(format!("{key}: source {} missing", cfg.source.display()));
+            return;
+        }
+        if git::source_gitdir(&cfg.source).is_err() {
+            bad.push(format!("{key}: source {} is not a git repo", cfg.source.display()));
+        }
+    });
+    if total == 0 {
+        return CheckResult::Ok("no pools initialized yet".into());
+    }
+    if bad.is_empty() {
+        return CheckResult::Ok(format!("{total} pool(s), all healthy"));
+    }
+    let mut detail = format!("{}/{total} unhealthy:", bad.len());
+    for line in &bad {
+        detail.push_str("\n      ");
+        detail.push_str(line);
+    }
+    CheckResult::Warn(detail)
 }
 
 /// Scan every initialized pool's slots for git's per-worktree `index.lock`

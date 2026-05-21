@@ -5,7 +5,7 @@
 //! staleness threshold — those concerns belong to the kernel.
 //!
 //! - **Init mutex** (per-slot): held across slot allocation + materialization
-//!   + submodule init. `try_acquire` returns `None` on contention; caller
+//!   and submodule init. `try_acquire` returns `None` on contention; caller
 //!   tries the next slot.
 //! - **Pool mutex**: serializes acquire/release critical sections. `acquire`
 //!   blocks via try-loop + sleep, bailing after `POOL_MAX_WAIT`.

@@ -15,7 +15,7 @@ use std::path::Path;
 
 use crate::cli::SubmoduleMirrorMode;
 use crate::config::PoolConfig;
-use crate::git;
+use crate::{fs_paths, git, mutex};
 
 #[derive(Debug, Clone)]
 pub struct SubmoduleEntry {
@@ -47,30 +47,35 @@ pub fn iter_keys(raw: &str) -> impl Iterator<Item = (&str, &str, &str)> {
     })
 }
 
+#[derive(Default)]
+struct ParseBuf {
+    path: Option<String>,
+    url: Option<String>,
+    tags: Vec<String>,
+}
+
 fn parse_gitmodules_text(raw: &str) -> Result<Vec<SubmoduleEntry>> {
-    let mut by_name: HashMap<String, (Option<String>, Option<String>, Vec<String>)> =
-        HashMap::new();
+    let mut by_name: HashMap<String, ParseBuf> = HashMap::new();
     for (sub_name, key, value) in iter_keys(raw) {
-        let entry = by_name.entry(sub_name.to_string()).or_default();
+        let buf = by_name.entry(sub_name.to_string()).or_default();
         match key {
-            "path" => entry.0 = Some(value.to_string()),
-            "url" => entry.1 = Some(value.to_string()),
-            "worktreepooltag" => entry.2.push(value.to_string()),
+            "path" => buf.path = Some(value.to_string()),
+            "url" => buf.url = Some(value.to_string()),
+            "worktreepooltag" => buf.tags.push(value.to_string()),
             _ => {}
         }
     }
-    let mut out = Vec::new();
-    for (name, (p, u, tags)) in by_name {
-        let (Some(path), Some(url)) = (p, u) else {
-            continue;
-        };
-        out.push(SubmoduleEntry {
-            name,
-            path,
-            url,
-            tags,
-        });
-    }
+    let mut out: Vec<SubmoduleEntry> = by_name
+        .into_iter()
+        .filter_map(|(name, buf)| {
+            Some(SubmoduleEntry {
+                name,
+                path: buf.path?,
+                url: buf.url?,
+                tags: buf.tags,
+            })
+        })
+        .collect();
     out.sort_by(|a, b| a.path.cmp(&b.path)); // deterministic output
     Ok(out)
 }
@@ -183,7 +188,20 @@ fn update_recursive(
     // refuses `file:` (incl. plain local path) submodule clones — required for our
     // bare-mirror and git-modules modes.
     if !included.is_empty() {
-        // Phase 1: sequential url registration.
+        // Phase 1: serialized url registration. Top-level writes target
+        // `<source>/.git/config`, which is shared across pools using the same
+        // source repo. The per-source mutex (anchored on the source's gitdir)
+        // prevents `O_EXCL` lockfile contention between parallel acquires.
+        // Nested levels write to `<source>/.git/modules/<top>/config` (per
+        // top-level), which siblings don't share — no mutex needed there.
+        let source_mu = if name_scope.is_empty() {
+            let source_gitdir = git::source_gitdir(&cfg.source)
+                .context("resolving source gitdir for per-source config mutex")?;
+            Some(mutex::PoolMutex::acquire(fs_paths::source_config_mutex(&source_gitdir))
+                .context("acquiring per-source config mutex")?)
+        } else {
+            None
+        };
         for e in &included {
             let effective_url = match rewrite_url(cfg, &e.name, &e.url, name_scope) {
                 Some(u) => u,
@@ -221,13 +239,14 @@ fn update_recursive(
                 )
             })?;
         }
+        drop(source_mu);
 
-        // Phase 2: parallel `submodule update` + branch attach. Each process
-        // reads-only from parent config and writes to its own admin dir / working
-        // tree, so they don't fight for the same lockfile. The follow-on
-        // `checkout_force_branch` writes only to the submodule's own gitdir
-        // (refs/heads/<n> + HEAD) — no contention with sibling threads.
-        // Inline-fallback on OS thread-create failure: see `parallel` module.
+        // Phase 2: parallel `submodule update` + branch attach + nested recursion.
+        // Each top-level worker handles its own subtree end-to-end so nested
+        // levels parallelize alongside top-level siblings. Per-submodule git
+        // processes write only to their own admin dir / working tree, so they
+        // don't fight for the same lockfile. Inline-fallback on OS thread-create
+        // failure: see `parallel` module.
         crate::parallel::try_for_each(&included, |e| {
             git::run_with_config(
                 dir,
@@ -245,7 +264,16 @@ fn update_recursive(
                     branch_name,
                     sub_path.display()
                 )
-            })
+            })?;
+            if sub_path.join(".gitmodules").exists() {
+                let child_scope = if name_scope.is_empty() {
+                    format!("{}/modules", e.name)
+                } else {
+                    format!("{name_scope}/{}/modules", e.name)
+                };
+                update_recursive(&sub_path, cfg, exclude_tags, branch_name, &child_scope)?;
+            }
+            Ok(())
         })?;
     }
 
@@ -259,19 +287,6 @@ fn update_recursive(
             eprintln!("warn: submodule deinit -f {} failed: {}", e.path, stderr);
         }
         let _ = std::fs::remove_dir_all(dir.join(&e.path));
-    }
-
-    // Recurse for nested .gitmodules. Always `dev`-equivalent (no tag filter) one level down.
-    for e in &included {
-        let child = dir.join(&e.path);
-        if child.join(".gitmodules").exists() {
-            let child_scope = if name_scope.is_empty() {
-                format!("{}/modules", e.name)
-            } else {
-                format!("{name_scope}/{}/modules", e.name)
-            };
-            update_recursive(&child, cfg, exclude_tags, branch_name, &child_scope)?;
-        }
     }
     Ok(())
 }

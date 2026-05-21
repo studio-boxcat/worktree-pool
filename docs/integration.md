@@ -43,6 +43,11 @@ Cuts that simplify the design:
 
 If you need GC-like behavior, write a 5-line script: `worktree-pool ls` → filter → `release <NAME>` per match. Keeps the binary lean.
 
+Retry-aware CI callers can branch on exit codes (see [[cli.md#exit-codes]]):
+**3 = contended** (transient; retry), **4 = capacity** (release something
+first), **5 = unique-sha conflict** (reuse holder's output). Everything else
+exits 1 — inspect stderr.
+
 ---
 
 ## Limits

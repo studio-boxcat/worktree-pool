@@ -6,6 +6,7 @@ mod cli;
 mod config;
 mod dashboard;
 mod doctor;
+mod exit;
 mod fs_paths;
 mod git;
 mod lock;
@@ -24,7 +25,11 @@ fn main() {
     if let Err(e) = run(cli) {
         // `{:#}` flattens the anyhow context chain; readable for CLI users.
         eprintln!("error: {e:#}");
-        std::process::exit(1);
+        let code = e
+            .chain()
+            .find_map(|c| c.downcast_ref::<exit::ExitKind>().copied())
+            .map_or(1, |k| k.code());
+        std::process::exit(code);
     }
 }
 

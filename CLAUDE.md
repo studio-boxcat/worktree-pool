@@ -31,6 +31,7 @@ $WORKTREE_ROOT/<key>/.meta/config.yaml                # pool config (written by 
 $WORKTREE_ROOT/<key>/.meta/init/<slot-id>.lock        # init mutex (per-slot, flock-held)
 $WORKTREE_ROOT/<key>/.meta/pool.lock                  # pool-wide mutex (acquire + release)
 $WORKTREE_ROOT/<key>/{group}-{N}/                      # slot (always canonical; held iff marker present)
+<source-gitdir>/worktree-pool-config.lock             # per-source mutex (top-level submodule URL writes)
 <source>/.git/worktrees/<git-id>/worktree-pool/lock   # held marker per slot
 ```
 
@@ -74,7 +75,7 @@ Per-host `init` runs once per pool key. Source path differs by host (build serve
 
 ## Build / development
 
-- Code lives in `src/`; one module per concern (`acquire`, `release`, `slot`, `lock`, `mutex`, `submodules`, `parallel`, `dashboard`, `admin`, `doctor`). `parallel` wraps `std::thread::scope` with inline-fallback on OS thread-create failure — `Scope::spawn` panics under thread starvation, and `panic = "abort"` would otherwise kill the process mid-release.
+- Code lives in `src/`; one module per concern (`acquire`, `release`, `slot`, `lock`, `mutex`, `submodules`, `parallel`, `dashboard`, `admin`, `doctor`, `exit`). `parallel` wraps `std::thread::scope` with inline-fallback on OS thread-create failure (`Scope::spawn` panics under thread starvation; `panic = "abort"` would otherwise kill the process mid-release). Exposes `for_each`, `try_for_each`, and `map` (order-preserving collector). `exit` defines distinct exit codes for retry-aware callers — see [[docs/cli.md#exit-codes]].
 - Hand-rolled YAML in `yaml.rs` — line-oriented scalars only. `serde_yaml` is unmaintained; ~30 LOC suffices.
 - `git` operations shell out via `git.rs`. Slot identity is the canonical path; the user-given name is just a branch ref. No rename, no `git worktree move`, no submodule admin self-heal.
 - Atomic writes via `tempfile::NamedTempFile::persist` (handles EXDEV across volumes).

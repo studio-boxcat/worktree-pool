@@ -56,7 +56,26 @@ file is currently locked by a live process. With OS-managed flocks
 (`std::fs::File::try_lock`, stable since Rust 1.89) the kernel
 auto-releases on process death, so there's nothing to force-clear.
 
-`doctor` is host-level (no `--pool`) and read-only. Checks: arch, `git --version`, `$WORKTREE_ROOT` + pool count, binary quarantine xattr, and stale `index.lock` files across every initialized pool. Stale-lock signature + reclamation path live in [[lifecycle.md#crash-recovery]].
+## Exit codes
+
+Generic failures exit `1`. The codes below tag specific conditions so
+retry-aware callers (CI build farms, supervisor scripts) can branch on
+them:
+
+| Code | Kind        | Meaning                                                          | Caller action          |
+|------|-------------|------------------------------------------------------------------|------------------------|
+| 0    | Success     | —                                                                | —                      |
+| 1    | Generic     | Any other error (I/O, config, git failure, …)                    | Inspect stderr         |
+| 2    | Usage       | Bad CLI shape (assigned by clap)                                  | Fix invocation         |
+| 3    | Contended   | Every candidate slot's init mutex is held by another live acquire | Transient — retry      |
+| 4    | Capacity    | Every slot in the requested group is held                         | `release` something    |
+| 5    | UniqueSha   | `--unique-sha` matched an already-held slot                       | Reuse / release holder |
+
+The contract is locked by `tests/smoke.rs::acquire_capacity_exhaustion` and
+`unique_sha_refuses_second_acquire`. New conditions get new codes; existing
+codes don't shift.
+
+`doctor` is host-level (no `--pool`) and read-only. Checks: arch, `git --version`, `$WORKTREE_ROOT` + pool count, binary quarantine xattr, per-pool config + source-path validation, and stale `index.lock` files across every initialized pool. Stale-lock signature + reclamation path live in [[lifecycle.md#crash-recovery]].
 
 ## Distribution
 

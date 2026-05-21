@@ -105,6 +105,19 @@ pub fn worktree_gitdir(slot: &Path) -> Result<PathBuf> {
     }
 }
 
+/// Resolve `source`'s own gitdir (the source repo's git directory; same as
+/// source for a bare repo, `<source>/.git` for a working clone). Used to
+/// anchor the per-source mutex serializing top-level submodule config writes.
+pub fn source_gitdir(source: &Path) -> Result<PathBuf> {
+    let gd = run(source, &["rev-parse", "--git-dir"])?;
+    let p = PathBuf::from(&gd);
+    if p.is_absolute() {
+        Ok(p)
+    } else {
+        Ok(source.join(p))
+    }
+}
+
 /// `git -C source worktree add --detach <slot> <commit>`.
 pub fn worktree_add(source: &Path, slot: &Path, commit: &str) -> Result<()> {
     run(
@@ -157,10 +170,11 @@ pub fn checkout_force_branch(slot: &Path, name: &str) -> Result<()> {
     .map(drop)
 }
 
-/// Detach HEAD (so we can delete the current branch) via plumbing — `rev-parse`
-/// + `update-ref --no-deref`. Pure ref manipulation: no index, no working-tree
-/// walk, so no contention with a crashed-git `<gitdir>/index.lock` (which
-/// previously blocked `git checkout --detach` and left dangling branch refs).
+/// Detach HEAD (so we can delete the current branch) via plumbing — rev-parse
+/// HEAD + `update-ref --no-deref HEAD <sha>`. Pure ref manipulation: no index
+/// touch, no working-tree walk, so no contention with a crashed-git
+/// `<gitdir>/index.lock` (which previously blocked `git checkout --detach`
+/// and left dangling branch refs).
 pub fn detach_head(slot: &Path) -> Result<(bool, String, String)> {
     let (ok, stdout, stderr) = run_lenient(slot, &["rev-parse", "HEAD"])?;
     if !ok {

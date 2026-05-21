@@ -97,6 +97,17 @@ fn init_pool(key: &str, bare: &Path) {
         .success();
 }
 
+fn init_pool_groupless(key: &str, bare: &Path) {
+    Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", key, "init"])
+        .arg("--source")
+        .arg(bare)
+        .args(["--max-slots", "4"])
+        .assert()
+        .success();
+}
+
 fn acquire_dev(key: &str, name: &str) -> std::process::Output {
     Command::cargo_bin("worktree-pool")
         .unwrap()
@@ -173,6 +184,52 @@ fn full_lifecycle() {
         .success();
 }
 
+/// Groupless pool: slots are named `slot-N` and `--group` is rejected.
+#[test]
+fn groupless_pool_full_lifecycle() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool_groupless(&key, &bare);
+
+    // Acquire (no --group) → slot-0.
+    let out = Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", &key, "acquire", "feat-x"])
+        .output()
+        .unwrap();
+    assert_ok(&out, "groupless acquire");
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(path.ends_with("/slot-0"), "expected slot-0, got: {path}");
+
+    // --group on a groupless pool is rejected.
+    let out = Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", &key, "acquire", "feat-y", "--group", "ios"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no groups configured"),
+        "expected group-refusal; got: {stderr}");
+
+    // Release by branch.
+    release(&key, "feat-x");
+    let gitdir_lock = bare.join("worktrees/slot-0/worktree-pool/lock");
+    assert!(!gitdir_lock.exists(), "lock should be gone after release");
+
+    // Recycle: re-acquire lands at the same slot-0.
+    let out = Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", &key, "acquire", "feat-z"])
+        .output()
+        .unwrap();
+    assert_ok(&out, "groupless re-acquire");
+    let path2 = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert_eq!(path, path2, "recycled slot must reuse the same canonical path");
+}
+
 #[test]
 fn unique_sha_refuses_second_acquire() {
     let key = pool_key();
@@ -199,6 +256,10 @@ fn unique_sha_refuses_second_acquire() {
         .output()
         .unwrap();
     assert!(!out.status.success());
+    // Exit 5 = ExitKind::UniqueSha — distinguishes the same-SHA conflict from
+    // capacity/contended for retry-aware callers.
+    assert_eq!(out.status.code(), Some(5),
+        "unique-sha conflict must exit 5; got {:?}", out.status.code());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("full_sha"));
     assert!(stderr.contains("build-1"));
@@ -380,6 +441,10 @@ fn acquire_capacity_exhaustion() {
     assert_ok(&acquire_dev(&key, "b"), "acquire b");
     let out = acquire_dev(&key, "c");
     assert!(!out.status.success());
+    // Exit 4 = ExitKind::Capacity — distinguishes "all slots held" from
+    // transient contention or unique-sha conflict for retry-aware callers.
+    assert_eq!(out.status.code(), Some(4),
+        "capacity exhaustion must exit 4; got {:?}", out.status.code());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("held") || stderr.contains("in use"),
@@ -518,6 +583,102 @@ fn make_fixture_with_submodule(dir: &Path) -> PathBuf {
     git_commit(&staging, "with submodule");
     run_git(&staging, &["push", "--quiet", "-u", "origin", "main"]);
     bare
+}
+
+/// Make a bare repo with two submodules; `editor_sub` is tagged
+/// `worktreePoolTag = editor` so `--exclude-submodule-tags editor` skips it.
+fn make_fixture_with_tagged_submodules(dir: &Path) -> PathBuf {
+    let mk_bare = |name: &str| -> PathBuf {
+        let sub_bare = dir.join(format!("{name}.git"));
+        run_git_root(&["init", "--quiet", "--bare", &sub_bare.display().to_string()]);
+        let sub_staging = dir.join(format!("{name}-staging"));
+        run_git_root(&[
+            "clone", "--quiet",
+            &sub_bare.display().to_string(),
+            &sub_staging.display().to_string(),
+        ]);
+        std::fs::write(sub_staging.join("FILE"), format!("{name}-content").as_bytes()).unwrap();
+        git_commit(&sub_staging, "init");
+        run_git(&sub_staging, &["push", "--quiet", "-u", "origin", "main"]);
+        sub_bare
+    };
+    let runtime_bare = mk_bare("runtime");
+    let editor_bare = mk_bare("editor");
+
+    let bare = dir.join("source.git");
+    run_git_root(&["init", "--quiet", "--bare", &bare.display().to_string()]);
+    let staging = dir.join("staging");
+    run_git_root(&[
+        "clone", "--quiet",
+        &bare.display().to_string(),
+        &staging.display().to_string(),
+    ]);
+    std::fs::write(staging.join("README"), b"hi").unwrap();
+    run_git(&staging, &["add", "README"]);
+    run_git(
+        &staging,
+        &[
+            "-c", "protocol.file.allow=always",
+            "submodule", "add", "--quiet",
+            &runtime_bare.display().to_string(),
+            "runtime_sub",
+        ],
+    );
+    run_git(
+        &staging,
+        &[
+            "-c", "protocol.file.allow=always",
+            "submodule", "add", "--quiet",
+            &editor_bare.display().to_string(),
+            "editor_sub",
+        ],
+    );
+    // Tag the editor submodule.
+    run_git(
+        &staging,
+        &[
+            "config", "-f", ".gitmodules",
+            "submodule.editor_sub.worktreePoolTag", "editor",
+        ],
+    );
+    git_commit(&staging, "with tagged submodules");
+    run_git(&staging, &["push", "--quiet", "-u", "origin", "main"]);
+    bare
+}
+
+/// `acquire --exclude-submodule-tags editor` skips the tagged submodule entirely:
+/// its working dir stays empty (deinit'd) while the untagged one materializes.
+#[test]
+fn exclude_submodule_tags_skips_tagged_submodule() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture_with_tagged_submodules(tmp.path());
+    init_pool(&key, &bare);
+
+    let out = Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args([
+            "--pool", &key, "acquire", "ci-1",
+            "--group", "ios",
+            "--exclude-submodule-tags", "editor",
+        ])
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .output()
+        .unwrap();
+    assert_ok(&out, "exclude-tagged acquire");
+    let slot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+
+    // Untagged submodule materialized.
+    let runtime_file = slot.join("runtime_sub/FILE");
+    assert!(runtime_file.exists(),
+        "runtime_sub should be present: {}", runtime_file.display());
+
+    // Tagged submodule's working dir is empty (deinit'd).
+    let editor_file = slot.join("editor_sub/FILE");
+    assert!(!editor_file.exists(),
+        "editor_sub should be absent post-exclude; {} present",
+        editor_file.display());
 }
 
 /// Acquire branches each submodule as `<slot-name>` (matches the parent slot's

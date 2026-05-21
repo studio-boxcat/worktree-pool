@@ -99,7 +99,7 @@ report_in_progress() {
     REVERT_HEAD)               hint="git -C $path revert --abort" ;;
     *)                         hint="finish or abort the in-progress operation in $path" ;;
   esac
-  echo "land: in-progress $marker in $path — $hint" >&2
+  land_warn "in-progress $marker in $path — $hint"
   return 1
 }
 
@@ -145,6 +145,42 @@ slot_path_for() {
   case "$gitdir" in /*) ;; *) gitdir="$path/$gitdir" ;; esac
   [ -f "$gitdir/worktree-pool/lock" ] || return 1
   printf '%s\n' "$path"
+}
+
+# `land`-prefixed stderr (non-fatal) and fatal helpers. Collapses repeated
+# `echo "land: ..." >&2 [; exit 1]` patterns scattered across cmd_land.
+land_warn() { printf 'land: %s\n' "$*" >&2; }
+land_die()  { printf 'land: %s\n' "$*" >&2; exit 1; }
+
+# `git_no_hooks`: suppress user-repo merge/post-checkout
+# hooks during land's mechanical fast-forwards. `wt_post_land` is the
+# documented hook extension point.
+git_no_hooks() { git -c core.hooksPath=/dev/null "$@"; }
+
+# If SUB_PATH's HEAD is detached, attach it to the first branch from the
+# remaining args that exists. Used by `wt land`'s submodule fetch+attach+ff
+# blocks — different attach priorities per direction, but identical loop.
+# Exit codes (distinct so callers can disambiguate):
+#   0 — HEAD was already attached, or successfully checked out a candidate
+#   1 — no candidate branch exists; HEAD left detached (caller decides
+#       whether that's an error or a silent fall-through)
+#   2 — candidate matched but `checkout` failed (typically untracked
+#       collision); caller surfaces an actionable error
+_land_attach_first() {
+  local sub_path=$1; shift
+  if git -C "$sub_path" symbolic-ref -q HEAD >/dev/null; then return 0; fi
+  local branch
+  for branch in "$@"; do
+    [ -n "$branch" ] || continue
+    if git -C "$sub_path" show-ref --verify --quiet "refs/heads/$branch"; then
+      if git -C "$sub_path" checkout --quiet "$branch"; then
+        return 0
+      else
+        return 2
+      fi
+    fi
+  done
+  return 1
 }
 
 # True iff cwd is somewhere under $1 (after symlink resolution on both sides).
@@ -206,18 +242,18 @@ land_lock_acquire() {
     fi
     holder_pid=$(awk 'NR==1{print; exit}' "$lockfile" 2>/dev/null)
     if [ -n "$holder_pid" ] && ! kill -0 "$holder_pid" 2>/dev/null; then
-      echo "land: reclaiming land.lock (holder pid $holder_pid no longer running)" >&2
+      land_warn "reclaiming land.lock (holder pid $holder_pid no longer running)"
       rm -f "$lockfile"
       continue
     fi
     age=$(_land_lock_age_secs "$lockfile")
     if [ -n "$age" ] && [ "$age" -ge "$LAND_LOCK_STALE_SECS" ]; then
-      echo "land: reclaiming stale land.lock (age ${age}s ≥ ${LAND_LOCK_STALE_SECS}s)" >&2
+      land_warn "reclaiming stale land.lock (age ${age}s ≥ ${LAND_LOCK_STALE_SECS}s)"
       rm -f "$lockfile"
       continue
     fi
     if [ "$waited" -ge "$LAND_LOCK_MAX_WAIT_S" ]; then
-      die "land: land.lock held by pid ${holder_pid:-?} at $lockfile for >${LAND_LOCK_MAX_WAIT_S}s — another land in progress"
+      land_die "land.lock held by pid ${holder_pid:-?} at $lockfile for >${LAND_LOCK_MAX_WAIT_S}s — another land in progress"
     fi
     sleep 1
     waited=$((waited + 1))
@@ -548,13 +584,13 @@ cmd_land() {
   local branch
   branch=$(git rev-parse --abbrev-ref HEAD)
   if [ "$branch" = "main" ] || [ "$branch" = "HEAD" ]; then
-    die "land: must run from a non-main branch (current: $branch)"
+    land_die "must run from a non-main branch (current: $branch)"
   fi
 
   local marker
   marker=$(in_progress_marker .)
   if [ -n "$marker" ]; then
-    echo "land: in-progress $marker — finish or abort first." >&2
+    land_warn "in-progress $marker — finish or abort first."
     echo "After finishing the merge commit, re-run land." >&2
     exit 1
   fi
@@ -576,14 +612,14 @@ cmd_land() {
   local untracked
   untracked=$(git ls-files --others --exclude-standard)
   if [ -n "$untracked" ]; then
-    echo "land: untracked files — add, ignore, or remove first:" >&2
+    land_warn "untracked files — add, ignore, or remove first:"
     printf '%s\n' "$untracked" | sed 's/^/  /' >&2
     exit 1
   fi
 
   local main_path slot_path
   main_path=$(find_main_path)
-  [ -n "$main_path" ] || die "land: main is not checked out in any worktree"
+  [ -n "$main_path" ] || land_die "main is not checked out in any worktree"
   slot_path=$(git rev-parse --show-toplevel)
 
   # Acquire per-source land.lock before any check that reads main_path's state
@@ -611,11 +647,15 @@ cmd_land() {
 
   # `merge --ff-only` refuses if untracked files would be overwritten, so
   # untracked content in main is preserved; ignore `??` here when checking
-  # for tracked-uncommitted state.
+  # for tracked-uncommitted state. `--ignore-submodules=untracked` keeps the
+  # submodule-internal `M sub` (untracked content inside a submodule) from
+  # blocking land — the ff-only safety net already protects against actual
+  # collision, and operators consistently want to land alongside dirty/
+  # untracked sub-content rather than silence per-submodule via gitconfig.
   local main_dirty
-  main_dirty=$(git -C "$main_path" status --porcelain | awk '!/^\?\?/')
+  main_dirty=$(git -C "$main_path" status --porcelain --ignore-submodules=untracked | awk '!/^\?\?/')
   if [ -n "$main_dirty" ]; then
-    echo "land: main worktree ($main_path) has uncommitted tracked changes:" >&2
+    land_warn "main worktree ($main_path) has uncommitted tracked changes:"
     printf '%s\n' "$main_dirty" | sed 's/^/  /' >&2
     exit 1
   fi
@@ -659,16 +699,16 @@ cmd_land() {
           continue
         fi
         if git -C "$sub_full" merge-base --is-ancestor "$sub_head_sha" "$sub_index_sha" 2>/dev/null; then
-          echo "land: submodule '$sub_path' working dir ${sub_head_sha:0:7} is behind recorded gitlink ${sub_index_sha:0:7} (post-merge without --recurse-submodules) — running submodule update" >&2
+          land_warn "submodule '$sub_path' working dir ${sub_head_sha:0:7} is behind recorded gitlink ${sub_index_sha:0:7} (post-merge without --recurse-submodules) — running submodule update"
           if ! git -C "$slot_path" -c protocol.file.allow=always \
                submodule update --quiet -- "$sub_path"; then
-            echo "land: submodule update failed for '$sub_path' — fix manually and retry:" >&2
+            land_warn "submodule update failed for '$sub_path' — fix manually and retry:"
             echo "  git -c protocol.file.allow=always submodule update -- $sub_path" >&2
             sub_sync_failed=1
           fi
           continue
         fi
-        echo "land: submodule '$sub_path' diverged from recorded gitlink (working ${sub_head_sha:0:7} vs index ${sub_index_sha:0:7} share no ancestor) — refusing to auto-commit a regression." >&2
+        land_warn "submodule '$sub_path' diverged from recorded gitlink (working ${sub_head_sha:0:7} vs index ${sub_index_sha:0:7} share no ancestor) — refusing to auto-commit a regression."
         echo "  Resolve manually (e.g. git -c protocol.file.allow=always submodule update -- $sub_path), then re-run land." >&2
         sub_sync_failed=1
       done < <(submodule_paths "$slot_path")
@@ -678,7 +718,7 @@ cmd_land() {
     # Re-check dirty state — submodule sync above may have made the tree clean.
     if ! git diff --quiet || ! git diff --cached --quiet; then
       if [ -z "$msg" ]; then
-        echo "land: dirty tracked work needs a commit message:" >&2
+        land_warn "dirty tracked work needs a commit message:"
         git status --short >&2
         echo >&2
         echo "  wt land \"feat: <what you did>\"" >&2
@@ -705,7 +745,7 @@ cmd_land() {
   # 3-way merge (with potential conflicts; resume = re-run after manual commit).
   if ! git merge -m "Merge main into $branch" main; then
     echo >&2
-    echo "land: merge halted with conflicts. Resolve and either:" >&2
+    land_warn "merge halted with conflicts. Resolve and either:"
     echo "  • finish: 'git add' the files, 'git commit', then re-run land" >&2
     echo "  • back out: 'git merge --abort'" >&2
     exit 1
@@ -715,7 +755,7 @@ cmd_land() {
   # conflict resolution — `merge --ff-only` below would also catch this, but
   # this gives the operator a precise message.
   if ! git merge-base --is-ancestor main HEAD; then
-    echo "land: main has moved past your merge base (parallel slot landed first)." >&2
+    land_warn "main has moved past your merge base (parallel slot landed first)."
     echo "  Re-merge with 'git merge main', resolve, commit, then re-run." >&2
     exit 1
   fi
@@ -756,10 +796,10 @@ cmd_land() {
                   GIT_COMMITTER_DATE="$orig_committer_date" \
                   git commit-tree "$(git rev-parse HEAD^{tree})" \
                     -p "$main_now" -p "$slot_head_pre_merge" -m "$orig_msg") \
-        || die "land: commit-tree failed while reordering merge parents"
+        || land_die "commit-tree failed while reordering merge parents"
       git update-ref -m "wt land: reorder merge parents" \
         "refs/heads/$branch" "$new_merge" "$post_merge_head" \
-        || die "land: update-ref failed while reordering merge parents (raced?)"
+        || land_die "update-ref failed while reordering merge parents (raced?)"
       echo "land: normalized merge parents (main first-parent stays on mainline)"
     fi
   fi
@@ -793,7 +833,7 @@ cmd_land() {
       git -C "$main_path/$sub" fetch --quiet "$slot_path/$sub" "$branch" 2>/dev/null || true
       main_sub_tip=$(git -C "$main_path/$sub" rev-parse HEAD 2>/dev/null) || continue
       if ! git -C "$main_path/$sub" merge-base --is-ancestor "$main_sub_tip" "$slot_sub_tip" 2>/dev/null; then
-        echo "land: submodule '$sub' diverged — main's clone HEAD ${main_sub_tip:0:7} is not an ancestor of slot tip ${slot_sub_tip:0:7}" >&2
+        land_warn "submodule '$sub' diverged — main's clone HEAD ${main_sub_tip:0:7} is not an ancestor of slot tip ${slot_sub_tip:0:7}"
         echo "  step 12 will need to ff $main_path/$sub to ${slot_sub_tip:0:7}, but main's clone has commits not in that history." >&2
         echo "  recovery (pick one): " >&2
         echo "    discard main-side: git -C $main_path/$sub reset --hard ${slot_sub_tip:0:7}   # loses ${main_sub_tip:0:7}" >&2
@@ -802,7 +842,7 @@ cmd_land() {
       fi
     done <<< "$moved_preflight"
     if [ "$preflight_failed" != 0 ]; then
-      echo "land: submodule preflight failed — main NOT advanced. Resolve and re-run." >&2
+      land_warn "submodule preflight failed — main NOT advanced. Resolve and re-run."
       exit 1
     fi
   fi
@@ -823,44 +863,51 @@ cmd_land() {
   local moved
   moved=$(git diff --raw "$main_before" "$slot_head" | awk '$2=="160000" {print $6}')
   if [ -n "$moved" ]; then
+    # Per-subshell output buffering: each parallel sub writes to its own
+    # `.out` / `.err` files, replayed in input order after all complete.
+    # Without this, multi-submodule output interleaves unreadably.
     local pids=() pid sub_failed=0
+    local outdir; outdir=$(mktemp -d "${TMPDIR:-/tmp}/wt-land.XXXXXX")
+    local sub_logs=()
     while IFS= read -r sub; do
       [ -n "$sub" ] || continue
       # Slot's submodule absent (tag-excluded at acquire) — nothing to propagate.
       [ -e "$slot_path/$sub/.git" ] || continue
       [ -e "$main_path/$sub/.git" ] \
-        || die "land: main worktree's submodule clone missing at $main_path/$sub"
+        || land_die "main worktree's submodule clone missing at $main_path/$sub"
+      local logbase="$outdir/m2s-${#sub_logs[@]}"
+      sub_logs+=("$logbase")
       (
         new_sha=$(git -C "$slot_path/$sub" rev-parse HEAD)
         git -C "$main_path/$sub" fetch --quiet "$slot_path/$sub" "$branch"
         # Attach detached HEAD before ff-merge so the branch ref tracks the
         # gitlink (post-`git submodule update` is detached → ff-only on
         # detached only moves HEAD). `.gitmodules` lookup assumes name == path
-        # (the `git submodule add` default).
-        if ! git -C "$main_path/$sub" symbolic-ref -q HEAD >/dev/null; then
-          local sub_branch="" attach_target=""
-          sub_branch=$(git -C "$slot_path" config -f .gitmodules \
-            --get "submodule.$sub.branch" 2>/dev/null || true)
-          if [ -n "$sub_branch" ] \
-              && git -C "$main_path/$sub" show-ref --verify --quiet "refs/heads/$sub_branch"; then
-            attach_target="$sub_branch"
-          elif git -C "$main_path/$sub" show-ref --verify --quiet refs/heads/main; then
-            attach_target="main"
-          fi
-          if [ -n "$attach_target" ]; then
-            git -C "$main_path/$sub" checkout --quiet "$attach_target" \
-              || die "land: checkout $attach_target failed in $main_path/$sub (untracked collision?)"
-          fi
-        fi
-        git -c core.hooksPath=/dev/null -C "$main_path/$sub" \
+        # (the `git submodule add` default). Priority: gitmodules branch → main.
+        # If neither exists, leave HEAD detached and let ff-only proceed —
+        # original lenient behavior, dying only on actual checkout failure.
+        local sub_branch=""
+        sub_branch=$(git -C "$slot_path" config -f .gitmodules \
+          --get "submodule.$sub.branch" 2>/dev/null || true)
+        _land_attach_first "$main_path/$sub" "$sub_branch" main
+        case $? in
+          0|1) ;;
+          2) land_die "checkout failed in $main_path/$sub (untracked collision?)" ;;
+        esac
+        git_no_hooks -C "$main_path/$sub" \
           merge --ff-only --quiet "$new_sha"
         echo "land: submodule $sub → ${new_sha:0:7}"
-      ) &
+      ) >"$logbase.out" 2>"$logbase.err" &
       pids+=($!)
     done <<< "$moved"
     for pid in "${pids[@]}"; do wait "$pid" || sub_failed=1; done
+    for logbase in "${sub_logs[@]}"; do
+      [ -s "$logbase.out" ] && cat "$logbase.out"
+      [ -s "$logbase.err" ] && cat "$logbase.err" >&2
+    done
+    rm -rf "$outdir"
     [ "$sub_failed" = 0 ] \
-      || die "land: submodule propagation failed (see above); main NOT advanced — fix and re-run land"
+      || land_die "submodule propagation failed (see above); main NOT advanced — fix and re-run land"
   fi
 
   # Skip the no-op so re-runs are idempotent (e.g. after manual conflict resolution).
@@ -870,11 +917,11 @@ cmd_land() {
     local main_ref
     main_ref=$(git -C "$main_path" symbolic-ref HEAD 2>/dev/null || true)
     [ "$main_ref" = "refs/heads/main" ] \
-      || die "land: $main_path has $main_ref checked out, expected refs/heads/main"
+      || land_die "$main_path has $main_ref checked out, expected refs/heads/main"
     # core.hooksPath=/dev/null: don't fire user repos' post-merge —
     # wt_post_land is the documented hook surface.
-    git -c core.hooksPath=/dev/null -C "$main_path" merge --ff-only --quiet "$slot_head" \
-      || die "land: fast-forward refused in $main_path — likely an untracked file at a path the slot adds; move/remove it and re-run"
+    git_no_hooks -C "$main_path" merge --ff-only --quiet "$slot_head" \
+      || land_die "fast-forward refused in $main_path — likely an untracked file at a path the slot adds; move/remove it and re-run"
   fi
   local main_after
   main_after=$(git rev-parse main)
@@ -899,7 +946,10 @@ cmd_land() {
   local main_brought
   main_brought=$(git diff --raw "$slot_head_pre_merge" HEAD | awk '$2=="160000" {print $6}')
   if [ -n "$main_brought" ]; then
+    # Per-subshell output buffering (see slot→main block above).
     local sub_pids=()
+    local outdir; outdir=$(mktemp -d "${TMPDIR:-/tmp}/wt-land.XXXXXX")
+    local sub_logs=()
     while IFS= read -r sub; do
       [ -n "$sub" ] || continue
       # Slot's submodule absent (tag-excluded at acquire, or new in main) —
@@ -907,49 +957,45 @@ cmd_land() {
       # `git status`; that's a separate, pre-existing limitation.
       [ -e "$slot_path/$sub/.git" ] || continue
       [ -e "$main_path/$sub/.git" ] || {
-        echo "land: WARN: $sub: main worktree's submodule clone missing — slot working tree not refreshed" >&2
+        land_warn "WARN: $sub: main worktree's submodule clone missing — slot working tree not refreshed"
         continue
       }
+      local logbase="$outdir/s2m-${#sub_logs[@]}"
+      sub_logs+=("$logbase")
       (
-        local expected_sha sub_branch attach=""
+        local expected_sha sub_branch
         expected_sha=$(git -C "$slot_path" ls-tree HEAD "$sub" | awk '{print $3}')
-        [ -n "$expected_sha" ] || { echo "land: WARN: $sub: gitlink missing in slot tree — skipped" >&2; exit 0; }
+        [ -n "$expected_sha" ] || { echo "WARN: $sub: gitlink missing in slot tree — skipped" >&2; exit 0; }
         sub_branch=$(git -C "$slot_path" config -f .gitmodules \
           --get "submodule.$sub.branch" 2>/dev/null || echo main)
         # Failure here is non-fatal — the ff below will refuse if the SHA
         # isn't reachable, and we warn there too.
         git -C "$slot_path/$sub" fetch --quiet "$main_path/$sub" "$sub_branch" 2>/dev/null \
-          || echo "land: WARN: $sub: fetch from $main_path/$sub $sub_branch failed — slot may stay stale" >&2
-        # Attach detached HEAD before ff so the slot's branch ref tracks the
-        # gitlink (post-`submodule update` is detached → ff-only on detached
-        # only moves HEAD). Priority: slot-name branch (acquire convention)
-        # → .gitmodules branch → main.
-        if ! git -C "$slot_path/$sub" symbolic-ref -q HEAD >/dev/null; then
-          if git -C "$slot_path/$sub" show-ref --verify --quiet "refs/heads/$branch"; then
-            attach="$branch"
-          elif [ -n "$sub_branch" ] && git -C "$slot_path/$sub" show-ref --verify --quiet "refs/heads/$sub_branch"; then
-            attach="$sub_branch"
-          elif git -C "$slot_path/$sub" show-ref --verify --quiet refs/heads/main; then
-            attach="main"
-          fi
-          if [ -n "$attach" ]; then
-            git -C "$slot_path/$sub" checkout --quiet "$attach" \
-              || { echo "land: WARN: $sub: checkout $attach failed (untracked collision?) — slot not refreshed" >&2; exit 0; }
-          else
-            echo "land: WARN: $sub: no branch to attach to — slot not refreshed" >&2
-            exit 0
-          fi
-        fi
-        if git -c core.hooksPath=/dev/null -C "$slot_path/$sub" \
+          || land_warn "WARN: $sub: fetch from $main_path/$sub $sub_branch failed — slot may stay stale"
+        # Attach detached HEAD before ff. Priority: slot-name (acquire
+        # convention) → .gitmodules branch → main. Both miss-cases warn and
+        # bail the subshell (best-effort path).
+        _land_attach_first "$slot_path/$sub" "$branch" "$sub_branch" main
+        case $? in
+          0) ;;
+          1) land_warn "WARN: $sub: no attach target in slot — slot not refreshed"; exit 0 ;;
+          2) land_warn "WARN: $sub: checkout failed (untracked collision?) — slot not refreshed"; exit 0 ;;
+        esac
+        if git_no_hooks -C "$slot_path/$sub" \
            merge --ff-only --quiet "$expected_sha" 2>/dev/null; then
           echo "land: slot submodule $sub → ${expected_sha:0:7}"
         else
-          echo "land: WARN: $sub: ff-only to ${expected_sha:0:7} refused — slot may stay stale (manual: git -C $slot_path/$sub merge --ff-only $expected_sha)" >&2
+          land_warn "WARN: $sub: ff-only to ${expected_sha:0:7} refused — slot may stay stale (manual: git -C $slot_path/$sub merge --ff-only $expected_sha)"
         fi
-      ) &
+      ) >"$logbase.out" 2>"$logbase.err" &
       sub_pids+=($!)
     done <<< "$main_brought"
     for pid in "${sub_pids[@]}"; do wait "$pid" || true; done
+    for logbase in "${sub_logs[@]}"; do
+      [ -s "$logbase.out" ] && cat "$logbase.out"
+      [ -s "$logbase.err" ] && cat "$logbase.err" >&2
+    done
+    rm -rf "$outdir"
   fi
 
   echo "land: $branch landed; main at $(git rev-parse --short HEAD)"

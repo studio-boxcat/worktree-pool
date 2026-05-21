@@ -21,6 +21,17 @@ where
     for_each_with(items, f, Builder::new);
 }
 
+/// Parallel map: collect `f(&item)` for each item, preserving input order.
+/// Inline-fallback on `pthread_create` failure (same rationale as `for_each`).
+pub fn map<T, R, F>(items: &[T], f: F) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync,
+{
+    map_with(items, f, Builder::new)
+}
+
 /// Parallel `Result<()>` fan-out. First `Err` wins; later errors are
 /// `eprintln!`-ed (matches the prior in-place collector's behavior).
 pub fn try_for_each<T, F>(items: &[T], f: F) -> Result<(), Error>
@@ -47,20 +58,21 @@ where
     });
 }
 
-enum Pending<'scope> {
-    Spawned(ScopedJoinHandle<'scope, Result<(), Error>>),
-    Inline(Result<(), Error>),
+enum Pending<'scope, R> {
+    Spawned(ScopedJoinHandle<'scope, R>),
+    Inline(R),
 }
 
-fn try_for_each_with<T, F, B>(items: &[T], f: F, mut builder: B) -> Result<(), Error>
+fn map_with<T, R, F, B>(items: &[T], f: F, mut builder: B) -> Vec<R>
 where
     T: Sync,
-    F: Fn(&T) -> Result<(), Error> + Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync,
     B: FnMut() -> Builder,
 {
     let f = &f;
-    let results: Vec<Result<(), Error>> = std::thread::scope(|scope| {
-        let mut pending: Vec<Pending<'_>> = Vec::with_capacity(items.len());
+    std::thread::scope(|scope| {
+        let mut pending: Vec<Pending<'_, R>> = Vec::with_capacity(items.len());
         for item in items {
             let entry = match builder().spawn_scoped(scope, move || f(item)) {
                 Ok(h) => Pending::Spawned(h),
@@ -71,17 +83,22 @@ where
         pending
             .into_iter()
             .map(|p| match p {
-                // `panic = "abort"` aborts the process before `join` could see
-                // an Err, so the Err arm is unreachable. `expect` documents the
-                // invariant; if the profile ever changes, this becomes a normal
-                // unwrap failure instead of silent UB.
                 Pending::Spawned(h) => h
                     .join()
                     .expect("worker thread panicked — unreachable under panic=abort"),
                 Pending::Inline(r) => r,
             })
             .collect()
-    });
+    })
+}
+
+fn try_for_each_with<T, F, B>(items: &[T], f: F, builder: B) -> Result<(), Error>
+where
+    T: Sync,
+    F: Fn(&T) -> Result<(), Error> + Sync,
+    B: FnMut() -> Builder,
+{
+    let results = map_with(items, f, builder);
 
     let mut first_err: Option<Error> = None;
     for r in results {
@@ -158,6 +175,18 @@ mod tests {
         );
         let err = r.unwrap_err();
         assert!(err.to_string().contains("boom 2"), "got: {err:#}");
+    }
+
+    #[test]
+    fn map_preserves_input_order() {
+        let v = map(&[1u32, 2, 3, 4], |x| *x * 10);
+        assert_eq!(v, vec![10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn map_preserves_input_order_when_all_spawns_fail() {
+        let v = map_with(&[1u32, 2, 3, 4], |x| *x * 10, always_fails);
+        assert_eq!(v, vec![10, 20, 30, 40]);
     }
 
     #[test]

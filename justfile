@@ -18,9 +18,11 @@ lint:
 bench:
     cargo bench
 
-# End-to-end CLI timing via hyperfine. Measures acquire+release wall-clock against a tmp bare-repo
-# fixture. Prereq: hyperfine (brew install hyperfine).
-bench-cli:
+# End-to-end CLI timing via hyperfine. Measures acquire+release wall-clock
+# against a tmp bare-repo fixture. Prereq: hyperfine (brew install hyperfine).
+# `N=<count>` env var picks the fixture's submodule count (default 0 →
+# trivial fixture; 6 exercises the parallel-submodule path).
+bench-cli n="0":
     #!/usr/bin/env bash
     set -euo pipefail
     cargo build --release
@@ -29,7 +31,7 @@ bench-cli:
     KEY="bench-$(date +%s)"
     POOL="$WORKTREE_ROOT/$KEY"
     trap "rm -rf '$TMP' '$POOL'" EXIT
-    BARE=$(scripts/bench-fixture.sh "$TMP")
+    BARE=$(scripts/bench-fixture.sh "$TMP" "{{n}}")
     "$BIN" --pool "$KEY" init --source "$BARE" --max-slots 4 --groups ios
     echo
     echo "==> acquire (cold + warm)"
@@ -52,7 +54,7 @@ bench-cli:
 
 # Capture an acquire+release sampling profile via samply. Opens in Firefox profiler UI.
 # Prereq: samply (cargo install samply).
-profile:
+profile n="0":
     #!/usr/bin/env bash
     set -euo pipefail
     cargo build --release
@@ -61,7 +63,7 @@ profile:
     KEY="profile-$(date +%s)"
     POOL="$WORKTREE_ROOT/$KEY"
     trap "rm -rf '$TMP' '$POOL'" EXIT
-    BARE=$(scripts/bench-fixture.sh "$TMP")
+    BARE=$(scripts/bench-fixture.sh "$TMP" "{{n}}")
     "$BIN" --pool "$KEY" init --source "$BARE" --max-slots 4 --groups ios
     echo "==> profiling acquire (cold)"
     samply record -- "$BIN" --pool "$KEY" acquire foo --commit main --group ios

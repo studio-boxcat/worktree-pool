@@ -19,7 +19,9 @@ pub enum Command {
     /// Initialize a new pool. Writes `<pool>/.meta/config.yaml`.
     Init(InitArgs),
 
-    /// Acquire a slot. Prints worktree path on stdout (last line); logs on stderr.
+    /// Acquire a slot. **Stdout: exactly one line, the canonical slot path.**
+    /// All logs/warnings/errors go to stderr. Callers can read stdout directly
+    /// — `tail -1` is defensive but redundant.
     Acquire(AcquireArgs),
 
     /// Release a held slot back to idle. Idempotent.
