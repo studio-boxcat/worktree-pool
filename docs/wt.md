@@ -11,7 +11,7 @@ wt [--pool <key>] go      <name> [--from <commit-ish>] [pool-acquire-flags...]
 wt [--pool <key>] release <name> [--force]   # safety-checked release; --force discards dirty/unmerged
 wt [--pool <key>] cleanup <name>     # 🟢/🟡/🔴 exit-trap classifier
 wt [--pool <key>] sweep              # run cleanup over every held slot in the pool
-wt [--pool <key>] ls      [--bare]   # held slots + git status (BRANCH/DIRTY/UNTRK/AHEAD); --bare skips git calls
+wt [--pool <key>] ls      [--bare]   # held slots + git status (DIRTY/UNTRK/AHEAD); --bare skips git calls
 wt [--pool <key>] info    <name>
 wt land   [message]                  # ff slot's commits onto local main (local-only; no push, no PR)
 wt whoami                            # cwd context: worktree|source|none + path
@@ -40,7 +40,7 @@ Acquire (and therefore `go`/resume) implicitly sweeps stale `git index.lock` fil
 
 `path` is the predicate query — resolves NAME to a canonical slot path (`{group}-{N}` / `slot-{N}`). Resolution order: first the held-slot branch lookup (`worktree-pool path NAME`, which scans held slots for branch == NAME), then a literal canonical-id fallback (`$WORKTREE_ROOT/<key>/NAME` if NAME happens to be a slot id like `ios-0`). Exits 0 if found, 1 if not, 2 on usage / pool-not-initialized. Lets consumer scripts branch on resume vs. fresh acquire (`if wt path … >/dev/null; then …`). Pattern matches `git rev-parse --git-dir`, `brew --prefix`, `pyenv prefix`.
 
-`ls` filters `worktree-pool ls` to held slots only — operators almost always want "what's active right now," not idle capacity. `--git-status` is **on by default** (BRANCH/DIRTY/UNTRK/AHEAD columns) — the dev-session wrapper is almost always asked "what state are my slots in?", and one `git status --porcelain` per held slot is cheap. `--bare` opts out for cold caches or very large slot dirs. The `BRANCH` column reads `(detached)` when HEAD isn't on a branch (operator ran `git checkout <sha>` or hand-deleted the slot's branch); detached slots still recycle on cleanup but the column flags the anomaly without `wt info`. Use `worktree-pool ls` directly for the full table including idle rows. `info` is a pass-through to `worktree-pool inspect <name>` with the inferred pool key prefilled.
+`ls` filters `worktree-pool ls` to held slots only — operators almost always want "what's active right now," not idle capacity. `--git-status` is **on by default** (DIRTY/UNTRK/AHEAD columns) — the dev-session wrapper is almost always asked "what state are my slots in?", and one `git status --porcelain` per held slot is cheap. `--bare` opts out for cold caches or very large slot dirs. The `NAME` column reads `(detached)` when HEAD isn't on a branch (operator ran `git checkout <sha>` or hand-deleted the slot's branch); detached slots still recycle on cleanup but the column flags the anomaly without `wt info`. Use `worktree-pool ls` directly for the full table including idle rows. `info` is a pass-through to `worktree-pool inspect <name>` with the inferred pool key prefilled.
 
 `sweep` runs `cleanup` over every held slot in the pool — same classifier semantics, applied in a loop, with a final tally. Operator-driven (not automatic). Catches orphans whose EXIT trap never fired: a killed shell, a slot whose branch was hand-deleted (now detached HEAD with 0 ahead → 🟢 recycle), or a manual `git worktree add` that bypassed `wt go`. Always exits 0 — same trap-friendly contract as `cleanup` itself.
 
