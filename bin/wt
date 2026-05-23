@@ -1265,10 +1265,11 @@ cmd_orient() {
 }
 
 cmd_ls() {
-  # Show only held slots; drop STATE (constant after filter) and drop GROUP
-  # when uniform across held rows. Keep ID (canonical slot id) and NAME
-  # (branch ref — the operator's chosen identity, different from ID).
-  # Use `worktree-pool ls` for the full table including idle/fresh rows.
+  # Show only held slots; drop ID (canonical slot-N is meaningless to
+  # operators — the branch NAME is the real identity), drop STATE
+  # (constant after filter), and drop GROUP when uniform across held rows.
+  # Use `worktree-pool ls` for the full table including idle/fresh rows
+  # (where the ID column matters because there's no branch yet).
   #
   # Defaults `--git-status` on (DIRTY/UNTRK/AHEAD): the dev-session wrapper
   # is almost always asked "what state are my slots in?", and one
@@ -1296,7 +1297,7 @@ cmd_ls() {
   {
     printf '%s\n' "$out" | awk 'NR<=2'
     printf '%s\n' "$held"
-  } | awk -v dg="$drop_group" '{$2=""; if (dg) $4=""; print}' | column -t
+  } | awk -v dg="$drop_group" '{$1=""; $2=""; if (dg) $4=""; print}' | column -t
 }
 
 # Initialize a pool, inferring --source from cwd's git toplevel and --pool from
