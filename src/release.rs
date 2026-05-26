@@ -1,11 +1,10 @@
-//! `release` orchestration. Drops the held marker, deletes the branch.
+//! `release` orchestration. Detaches HEAD (held → idle), deletes the branch.
 //! Slot dir stays at its canonical path; no rename.
 //! See CLAUDE.md §Lifecycle for the spec.
 //!
-//! **Crash-safety invariant:** the lock file is removed LAST. All earlier
-//! steps (detach, branch deletes, push delete, submodule deletes) leave the
-//! slot semantically "held" — re-running release converges because every step
-//! is idempotent.
+//! Under the pool mutex, detach HEAD flips held → idle. Subsequent branch
+//! deletes are best-effort cleanup of refs that no longer affect slot state.
+//! Re-running release is safe — each step is idempotent.
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::time::Duration;
@@ -28,16 +27,12 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: ReleaseArgs) -> Result<()> 
     }
 
     // Lookup order: branch name (normal), then canonical slot id (operator
-    // recovering a detached-HEAD slot whose branch was hand-deleted, or any
-    // held slot the operator addresses by its on-disk id).
+    // addressing a held slot by its on-disk id).
     if let Some(entry) = slot::find_by_name(pool_root, cfg, &args.name)? {
         return release_tail(&entry.path, &args.name);
     }
     let path = pool_root.join(&args.name);
-    if path.is_dir()
-        && let Ok(gitdir) = git::worktree_gitdir(&path)
-        && fs_paths::slot_lock(&gitdir).exists()
-    {
+    if path.is_dir() && slot::is_held_at(&path) {
         let name = git::current_branch(&path).unwrap_or_else(|| args.name.clone());
         return release_tail(&path, &name);
     }
@@ -46,13 +41,10 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: ReleaseArgs) -> Result<()> 
 }
 
 /// The release body without the pool mutex or the find-by-name lookup.
-/// Idempotent — see crash-safety invariant in the module header.
+/// Idempotent — each step is a no-op if already done.
 fn release_tail(slot_path: &Path, name: &str) -> Result<()> {
-    let gitdir = git::worktree_gitdir(slot_path)?;
-    let lock_path = fs_paths::slot_lock(&gitdir);
-
-    // Best-effort branch cleanup: detach, delete local branch, delete remote.
-    // Order matters: can't delete the branch we're on; detach first.
+    // Detach HEAD — this flips held → idle. Can't delete the branch we're on,
+    // so detach first. Pool mutex is held, so no race with concurrent acquires.
     let (detach_ok, _, detach_err) = git::detach_head(slot_path)?;
     if !detach_ok {
         eprintln!(
@@ -68,16 +60,6 @@ fn release_tail(slot_path: &Path, name: &str) -> Result<()> {
     // Mirror parent cleanup into every submodule (incl. nested) — acquire created
     // a `<name>` branch in each so commits have a push-ready label; release un-creates.
     submodules::delete_branch_recursive(slot_path, name);
-
-    // Lock removal LAST — the only step that flips held → idle on disk.
-    match std::fs::remove_file(&lock_path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(anyhow::Error::new(e))
-                .with_context(|| format!("removing lock {}", lock_path.display()));
-        }
-    }
 
     eprintln!("released '{}'", name);
     Ok(())

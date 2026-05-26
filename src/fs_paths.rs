@@ -32,12 +32,6 @@ pub fn source_config_mutex(source_gitdir: &Path) -> PathBuf {
     source_gitdir.join("worktree-pool-config.lock")
 }
 
-/// Lock file inside the source repo's per-worktree gitdir.
-/// Caller passes `<source>/.git/worktrees/<id>/`.
-pub fn slot_lock(worktree_gitdir: &Path) -> PathBuf {
-    worktree_gitdir.join("worktree-pool/lock")
-}
-
 /// Git's per-worktree index lock at `<worktree_gitdir>/index.lock`. Foreign to
 /// worktree-pool — git owns the lifecycle — but the file can leak when a git
 /// process dies between `open(O_CREAT|O_EXCL)` and a write (signal, panic,

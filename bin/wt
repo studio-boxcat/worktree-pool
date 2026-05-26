@@ -130,20 +130,19 @@ slot_repo_ok() {
 # Echoes the path on stdout (exit 0) when held; nothing + exit 1 when not.
 #
 # Two-step resolution lets operators use either identity: branch name from
-# their workflow (`wt release feat-x`) or slot id (`wt release ios-0` — useful
-# when HEAD is detached from a crashed mid-acquire). The fallback requires lock
-# presence so `wt go ios-0` against an idle canonical dir doesn't mis-resume.
+# their workflow (`wt release feat-x`) or slot id (`wt release ios-0`).
+# The fallback requires HEAD to be on a branch (held) so `wt go ios-0`
+# against an idle canonical dir doesn't mis-resume.
 slot_path_for() {
-  local name=$1 path gitdir
+  local name=$1 path
   if path=$(worktree-pool --pool "$POOL_KEY" path "$name" 2>/dev/null) && [ -n "$path" ]; then
     printf '%s\n' "$path"
     return 0
   fi
   path="$POOL_ROOT/$name"
   [ -d "$path" ] || return 1
-  gitdir=$(git -C "$path" rev-parse --git-dir 2>/dev/null) || return 1
-  case "$gitdir" in /*) ;; *) gitdir="$path/$gitdir" ;; esac
-  [ -f "$gitdir/worktree-pool/lock" ] || return 1
+  # Held = HEAD is on a branch (symbolic-ref succeeds).
+  git -C "$path" symbolic-ref --quiet HEAD >/dev/null 2>&1 || return 1
   printf '%s\n' "$path"
 }
 
@@ -498,9 +497,9 @@ WT_GO_ALLOW_NOTTY=1."
   # or dangling (ghost slot — partial cleanup debris) is NOT resumable; we
   # refuse loudly so the operator can decide between recovery and rm -rf.
   # Broken-dir guard: a canonical dir whose `.git` gitlink is missing or
-  # dangling. `slot_path_for` (which requires a lock) would skip these and
-  # fall through to fresh-acquire, silently masking the operator's debris.
-  # Surface it loudly here before deciding resume vs fresh.
+  # dangling. `slot_path_for` (which requires HEAD on a branch) would skip
+  # these and fall through to fresh-acquire, silently masking the operator's
+  # debris. Surface it loudly here before deciding resume vs fresh.
   local literal_path="$POOL_ROOT/$name"
   if [ -d "$literal_path" ] && ! slot_repo_ok "$literal_path"; then
     die "slot '$name' at $literal_path is broken (no valid .git — likely partial-cleanup debris). \
@@ -641,9 +640,9 @@ cmd_land() {
   fi
 
   # No-op early exit: slot already landed (HEAD ≡ main) and tree is clean. Skip
-  # the lock acquisition, marker scans, and submodule preflight entirely —
-  # operators verifying "did I land?" shouldn't trip refusals from unrelated
-  # in-progress state in main_path or its submodules.
+  # the land.lock acquisition and submodule preflight entirely — operators
+  # verifying "did I land?" shouldn't trip refusals from unrelated in-progress
+  # state in main_path or its submodules.
   if [ -z "$msg" ] && git diff --quiet && git diff --cached --quiet \
       && [ -z "$(git ls-files --others --exclude-standard)" ]; then
     local main_sha
@@ -1027,7 +1026,7 @@ cmd_cleanup() {
   fi
 
   # Ghost-dir guard FIRST — broken canonical dirs would otherwise look "already
-  # recycled" since slot_path_for skips them (no lock).
+  # recycled" since slot_path_for skips them (no branch = not held).
   local literal_path="$POOL_ROOT/$name"
   if [ -d "$literal_path" ] && ! slot_repo_ok "$literal_path"; then
     printf '%s🔴 BROKEN: %s — slot dir has no valid .git (partial-cleanup debris). NOT recycling.%s\n' \
@@ -1385,7 +1384,7 @@ EOF
 wt [--pool <key>] cleanup <name>
 
 EXIT-trap classifier (always exits 0). Markers:
-  🟢 clean + 0 ahead local main → delete branch + drop held marker (recycle)
+  🟢 clean + 0 ahead local main → detach HEAD + delete branch (recycle)
   🟡 dirty / untracked          → leave personalized; resume with `wt go`
   🔴 UNMERGED                    → operator resolves before recycling
   🔴 BROKEN                      → slot dir has no valid .git; rm -rf to recover
@@ -1406,8 +1405,8 @@ EOF
 wt [--pool <key>] ls [--bare]
 
 Show held slots only (use `worktree-pool ls` for full table including idle).
-By default includes git status columns: BRANCH, DIRTY, UNTRK, AHEAD —
-`(detached)` or a non-name branch in BRANCH flags slots that won't recycle
+By default includes git status columns: NAME, DIRTY, UNTRK, AHEAD —
+`(detached)` or a non-name branch in NAME flags slots that won't recycle
 on cleanup, AHEAD>0 flags unmerged.
   --bare        skip the per-slot git status calls (faster)
 EOF
@@ -1417,7 +1416,7 @@ EOF
 wt [--pool <key>] info <name>
 
 Pass-through to `worktree-pool inspect <name>` with the inferred pool
-key prefilled. Prints lock state + git status -sb + recent log.
+key prefilled. Prints slot state + git status -sb + recent log.
 EOF
       ;;
     land)
@@ -1460,8 +1459,8 @@ Pool lifecycle:
 
 Inspection:
   path     print absolute slot path; exit code = exists predicate
-  ls       held slots + git status (BRANCH/DIRTY/UNTRK/AHEAD)
-  info     full slot inspection (lock + status + log)
+  ls       held slots + git status (NAME/DIRTY/UNTRK/AHEAD)
+  info     full slot inspection (state + status + log)
 
 Workflow:
   land     ff slot's commits onto local main (no push, no PR)

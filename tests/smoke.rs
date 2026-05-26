@@ -170,8 +170,7 @@ fn full_lifecycle() {
         .output()
         .unwrap();
     let inspect_text = String::from_utf8_lossy(&inspect.stdout);
-    assert!(inspect_text.contains("started_at"));
-    assert!(inspect_text.contains("full_sha"));
+    assert!(inspect_text.contains("sha:"), "inspect should show sha");
     assert!(inspect_text.contains("group: ios"));
 
     release(&key, "feat-x");
@@ -272,8 +271,6 @@ fn groupless_pool_full_lifecycle() {
 
     // Release by branch.
     release(&key, "feat-x");
-    let gitdir_lock = bare.join("worktrees/slot-0/worktree-pool/lock");
-    assert!(!gitdir_lock.exists(), "lock should be gone after release");
 
     // Recycle: re-acquire lands at the same slot-0.
     let out = Command::cargo_bin("worktree-pool")
@@ -558,7 +555,7 @@ fn parallel_releases_different_names() {
 }
 
 /// `--unique-sha` coverage: sequential acquires (pool_mutex serializes anyway;
-/// the second acquire's lock-walk sees the first holder's lock and refuses).
+/// the second acquire's SHA scan sees the first holder's branch and refuses).
 #[test]
 fn parallel_unique_sha_at_most_one_succeeds() {
     let key = pool_key();
@@ -1233,8 +1230,8 @@ fn session_release_force_discards_dirty() {
 
     let out = session_cmd(&key, &["release", &slot_id, "--force"]).output().unwrap();
     assert_ok(&out, "release --force should succeed on dirty slot");
-    // Canonical slot dir persists (it's the warm-cache home); the lock file
-    // is what flips from held → idle. Assert the slot is now idle.
+    // Canonical slot dir persists (it's the warm-cache home). Assert the
+    // slot is now idle (HEAD detached).
     assert!(path.exists(), "canonical slot dir should remain (warm cache)");
 }
 
@@ -1311,10 +1308,12 @@ fn release_succeeds_despite_stale_index_lock() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!stderr.contains("may persist as a dangling ref"),
         "release should not hit detach-failure warn (the bug being fixed): {stderr}");
-    // Canonical slot dir persists; held → idle is signaled by lock removal.
-    let gitdir = slot_gitdir_path(&slot);
-    assert!(!gitdir.join("worktree-pool/lock").exists(),
-        "slot lock should be gone after release");
+    // Slot is now idle (detached HEAD).
+    let head_after = StdCommand::new("git")
+        .args(["symbolic-ref", "--quiet", "HEAD"])
+        .current_dir(&slot)
+        .output().unwrap();
+    assert!(!head_after.status.success(), "HEAD should be detached after release");
 
     // Branch should be gone — confirms the detach actually freed the ref for
     // the subsequent `branch -D`. (If detach silently no-op'd, `branch -D`
@@ -2254,10 +2253,7 @@ fn session_land_refuses_when_main_worktree_on_other_branch() {
 }
 
 
-// ---------- crash-recovery tests (release reorder + reclaim_stale) ----------
-//
-// We compose each post-crash on-disk shape directly via fs ops, then verify
-// the next acquire/release converges to a clean state.
+// ---------- release convergence + reclaim_stale ----------
 
 fn slot_gitdir_path(slot: &Path) -> PathBuf {
     let text = std::fs::read_to_string(slot.join(".git")).unwrap();
@@ -2273,7 +2269,9 @@ fn run_git_capture(cwd: &Path, args: &[&str]) -> String {
 }
 
 #[test]
-fn release_replay_completes_after_slow_ops_crash() {
+fn release_converges_and_slot_recycles() {
+    // Release detaches HEAD + deletes the branch, flipping held → idle.
+    // Verify the full release-then-reacquire cycle converges.
     let key = pool_key();
     let _c = Cleanup(key.clone());
     let tmp = tempfile::TempDir::new().unwrap();
@@ -2283,21 +2281,23 @@ fn release_replay_completes_after_slow_ops_crash() {
     let out = acquire_dev(&key, "feat-half");
     assert_ok(&out, "");
     let slot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
-    let slot_id = slot_id_from_output(&out);
-    run_git(&slot, &["checkout", "--quiet", "--detach"]);
-    run_git(&slot, &["branch", "-D", "feat-half"]);
-    let gitdir = slot_gitdir_path(&slot);
-    assert!(gitdir.join("worktree-pool/lock").exists(),
-        "lock still present (new-ordering crash invariant)");
 
-    // Branch is gone, so release by branch name finds nothing. Operator
-    // recovers by passing the canonical slot id instead — release's
-    // find_by_name → canonical-path fallback path.
-    release(&key, &slot_id);
+    // Slot is held (on branch feat-half).
+    let head = run_git_capture(&slot, &["symbolic-ref", "--short", "HEAD"]);
+    assert_eq!(head.trim(), "feat-half");
 
-    // Canonical slot dir persists; held → idle is signaled by lock removal.
-    assert!(!gitdir.join("worktree-pool/lock").exists(),
-        "lock should be gone after release by canonical slot id");
+    // Release converges.
+    release(&key, "feat-half");
+
+    // Slot is now idle (detached HEAD). Branch is deleted.
+    let head_after = StdCommand::new("git")
+        .args(["symbolic-ref", "--quiet", "HEAD"])
+        .current_dir(&slot)
+        .output().unwrap();
+    assert!(!head_after.status.success(), "HEAD should be detached after release");
+    let branches = run_git_capture(&bare, &["branch", "--list", "feat-half"]);
+    assert!(branches.trim().is_empty(), "'feat-half' branch should be deleted");
+
     let out = acquire_dev(&key, "feat-after");
     assert_ok(&out, "");
 }
@@ -2313,23 +2313,17 @@ fn reclaim_does_not_disturb_live_held_slot() {
     let out = acquire_dev(&key, "live-1");
     assert_ok(&out, "");
     let live_slot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
-    let live_gitdir = slot_gitdir_path(&live_slot);
-    let live_lock_before = std::fs::read(live_gitdir.join("worktree-pool/lock")).unwrap();
 
     let out = acquire_dev(&key, "live-2");
     assert_ok(&out, "");
 
     assert!(live_slot.exists(), "live held slot dir must remain");
-    let live_lock_after = std::fs::read(live_gitdir.join("worktree-pool/lock")).unwrap();
-    assert_eq!(live_lock_before, live_lock_after, "live lock must not be touched");
     let head = run_git_capture(&live_slot, &["symbolic-ref", "--short", "HEAD"]);
     assert_eq!(head.trim(), "live-1", "live slot's HEAD must still be on its branch");
 }
 
-/// The user's actual pspec crash was in a submodule-bearing pool — release's
-/// `submodules::delete_branch_recursive` (the slowest step in the new ordering)
-/// is exactly the SIGINT-prone window. Verify replay completes the submodule
-/// branch deletes cleanly when the slot is half-released.
+/// Release cleans up submodule branches — acquire creates a `<name>` branch in
+/// each submodule, and release's `delete_branch_recursive` removes them.
 #[test]
 fn release_replay_completes_with_submodules() {
     let key = pool_key();
@@ -2349,17 +2343,19 @@ fn release_replay_completes_with_submodules() {
     assert!(sub_branches_before.contains("feat-sub"),
         "submodule should have feat-sub branch: {sub_branches_before:?}");
 
-    // Compose pre-release crash: lock still present, branch still on HEAD —
-    // models crash AFTER acquire wrote the lock but BEFORE any release ran.
-    // reclaim_stale should read the branch name from HEAD and complete the
-    // recursive submodule branch_delete + lock removal.
-    let gitdir = slot_gitdir_path(&slot);
-    assert!(gitdir.join("worktree-pool/lock").exists());
+    // Slot is held (on branch feat-sub).
+    let head = run_git_capture(&slot, &["symbolic-ref", "--short", "HEAD"]);
+    assert_eq!(head.trim(), "feat-sub");
 
-    // Replay completes the submodule branch cleanup + lock removal.
+    // Release detaches HEAD + cleans up branches in parent and submodules.
     release(&key, "feat-sub");
-    assert!(!gitdir.join("worktree-pool/lock").exists(),
-        "lock should be gone after release replay");
+
+    // Slot is now idle (detached HEAD).
+    let head_after = StdCommand::new("git")
+        .args(["symbolic-ref", "--quiet", "HEAD"])
+        .current_dir(&slot)
+        .output().unwrap();
+    assert!(!head_after.status.success(), "HEAD should be detached after release");
 
     // Submodule's per-slot branch should be gone too.
     let sub_branches_after = run_git_capture(&sub, &["branch", "--list", "feat-sub"]);

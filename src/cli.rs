@@ -30,7 +30,7 @@ pub enum Command {
     /// List slots in this pool.
     Ls(LsArgs),
 
-    /// Dump lock + git state for a held slot.
+    /// Dump git state for a held slot.
     Inspect(InspectArgs),
 
     /// Print the canonical filesystem path of the slot whose branch matches

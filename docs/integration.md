@@ -38,7 +38,7 @@ Cuts that simplify the design:
 - **No GC.** All cleanup is operator-explicit. Capacity-bound errors list the table; operator picks a slot to release.
 - **No registry.** Pool key → path mapping is convention-based (`$WORKTREE_ROOT/<key>/`). No `~/.config/...`-tracked file.
 - **No cross-host coordination.** Pools are host-local. Network-mounted shared pools are not supported (no `host`/`pid` liveness checks).
-- **No reclaim on holder death.** A SIGKILL'd holder leaves a held marker; operator notices via `ls` and runs `release`. (Distinct from protocol-crash recovery, which IS automatic — see [[lifecycle.md#crash-recovery]].)
+- **No reclaim on holder death.** A SIGKILL'd holder leaves the slot on its branch (held); operator notices via `ls` and runs `release`. (Distinct from protocol-crash recovery, which IS automatic — see [[lifecycle.md#crash-recovery]].)
 - **No `--fresh` / `--volatile` flags.** Caller wipes warmth itself if needed; release is the only "give back" verb.
 
 If you need GC-like behavior, write a 5-line script: `worktree-pool ls` → filter → `release <NAME>` per match. Keeps the binary lean.
@@ -54,4 +54,4 @@ exits 1 — inspect stderr.
 
 - Branch refs accumulate in the source repo for SIGKILL'd builds and GC-style abandoned dev sessions (the latter intentional — work-recovery via `git branch | grep`). For high-volume CI, periodic `git for-each-ref --format='%(refname:short)' refs/heads/ | xargs -I X sh -c 'git merge-base --is-ancestor X origin/main && git branch -D X'` cleanup is the consumer's responsibility.
 - Same-SHA exclusion is per-pool. Two pools sharing a source repo do not coordinate.
-- `git status --porcelain` performance on huge worktrees (50k+ files) is the bottleneck for `ls --git-status`; plain `ls` is cheap (lock-mtime only).
+- `git status --porcelain` performance on huge worktrees (50k+ files) is the bottleneck for `ls --git-status`; plain `ls` is cheap (gitdir HEAD read only).

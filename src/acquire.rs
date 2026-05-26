@@ -1,5 +1,5 @@
 //! `acquire` orchestration. Picks an idle canonical slot, pins HEAD to the
-//! requested commit, writes the held-marker, creates a branch.
+//! requested commit, creates a branch (which flips idle → held).
 //! See CLAUDE.md §Lifecycle for the spec.
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -8,7 +8,7 @@ use crate::bail_exit;
 use crate::cli::AcquireArgs;
 use crate::config::PoolConfig;
 use crate::exit::ExitKind;
-use crate::{fs_paths, git, lock::Lock, mutex, parallel, release, slot, submodules};
+use crate::{fs_paths, git, mutex, parallel, release, slot, submodules};
 
 pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> {
     let group = slot::resolve_group(cfg, args.group.as_deref())?;
@@ -18,8 +18,8 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> 
         .unwrap_or(cfg.default_commit.as_str());
     let full_sha = git::resolve_full_sha(&cfg.source, commitish)?;
 
-    // Pool-wide mutex covers slot allocation + lock-write. See module-level
-    // serialization rationale (race classes a/b) in earlier history.
+    // Pool-wide mutex covers slot allocation + branch creation (the idle→held
+    // transition). See module-level serialization rationale in earlier history.
     let pool_mu = mutex::PoolMutex::acquire(fs_paths::pool_mutex(pool_root))
         .context("acquiring pool-wide mutex for slot allocation")?;
 
@@ -35,12 +35,11 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> 
     {
         bail_exit!(
             ExitKind::UniqueSha,
-            "acquire --unique-sha failed: full_sha {} already held by slot '{}' (branch '{}', held since {}).\n\
+            "acquire --unique-sha failed: full_sha {} already held by slot '{}' (branch '{}').\n\
              Wait for it, reuse its output, or run: worktree-pool --pool <key> release {}",
             &full_sha[..8],
             holder.slot_id,
             holder.branch,
-            holder.lock.started_at,
             holder.branch
         );
     }
@@ -89,16 +88,9 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> 
         git::reset_hard(&canonical_path, &full_sha)?;
     }
 
-    let gitdir = git::worktree_gitdir(&canonical_path)?;
-    let lock_path = fs_paths::slot_lock(&gitdir);
-
-    // Lock written BEFORE branch checkout. If we crash between, the slot is
-    // left held with detached HEAD; operator recovers via `release <slot-id>`
-    // (canonical-id fallback path in release::run).
-    let lock = Lock::new(full_sha.clone(), group.map(String::from));
-    lock.write(&lock_path)
-        .with_context(|| format!("writing lock {}", lock_path.display()))?;
-
+    // Branch creation flips idle → held. If we crash between worktree-add/
+    // reset and here, the slot stays detached (idle) — next acquire can safely
+    // reclaim it. Pool mutex is still held, so no race.
     git::checkout_force_branch(&canonical_path, &args.name)?;
 
     // Slot is now visibly held; further state is per-slot only. Drop pool mutex
@@ -120,28 +112,22 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> 
 struct Holder {
     slot_id: String,
     branch: String,
-    lock: Lock,
 }
 
 fn find_same_sha_holder(entries: &[slot::SlotEntry], full_sha: &str) -> Option<Holder> {
-    // Parallel read: each entry needs a gitdir resolve + lock file read +
-    // current_branch git spawn. Under the pool mutex, doing this serially
-    // blocks all other acquires; the parallel version cuts ~5x on 8-slot pools.
+    // Parallel read: each entry needs a current_branch + rev-parse spawn.
+    // Under the pool mutex, doing this serially blocks all other acquires;
+    // the parallel version cuts ~5x on 8-slot pools.
     parallel::map(entries, |entry| {
-        let gitdir = git::worktree_gitdir(&entry.path).ok()?;
-        let lock_path = fs_paths::slot_lock(&gitdir);
-        if !lock_path.exists() {
+        if !slot::is_held_at(&entry.path) { return None; }
+        let branch = git::current_branch(&entry.path)?;
+        let sha = git::run(&entry.path, &["rev-parse", "HEAD"]).ok()?;
+        if sha != full_sha {
             return None;
         }
-        let lock = Lock::read(&lock_path).ok()?;
-        if lock.full_sha != full_sha {
-            return None;
-        }
-        let branch = git::current_branch(&entry.path).unwrap_or_else(|| "(detached)".into());
         Some(Holder {
             slot_id: entry.id.clone(),
             branch,
-            lock,
         })
     })
     .into_iter()

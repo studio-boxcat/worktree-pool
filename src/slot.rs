@@ -1,14 +1,14 @@
 //! Slot identity, enumeration, and idle-slot picking.
 //!
 //! A slot is **always** at its canonical path `<pool>/{group}-{N}` (or
-//! `<pool>/slot-{N}` for groupless pools). It's **held** iff the lock file at
-//! its gitdir exists; **idle** otherwise. The user-given name lives in the
-//! branch ref inside the slot, not on disk — see [[../docs/lifecycle.md]].
+//! `<pool>/slot-{N}` for groupless pools). It's **held** iff HEAD is on a
+//! branch; **idle** when HEAD is detached. The user-given name lives in the
+//! branch ref inside the slot — see [[../docs/lifecycle.md]].
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
 use crate::config::PoolConfig;
-use crate::{fs_paths, git};
+use crate::git;
 
 /// Canonical idle slot id: `{group}-{N}` when grouped, else `slot-{N}`.
 pub fn canonical_id(group: Option<&str>, n: u32) -> String {
@@ -46,8 +46,8 @@ pub fn resolve_group<'a>(cfg: &'a PoolConfig, requested: Option<&str>) -> Result
 }
 
 /// A canonical slot N that's currently acquirable — either fresh (no dir on
-/// disk) or recycled-idle (dir exists, no lock at gitdir). Acquire iterates
-/// these in order, tries the init mutex on each, and uses `is_fresh` to pick
+/// disk) or recycled-idle (dir exists, HEAD detached). Acquire iterates these
+/// in order, tries the init mutex on each, and uses `is_fresh` to pick
 /// between `worktree add` (fresh) and `reset --hard` (recycled).
 #[derive(Debug, Clone, Copy)]
 pub struct Acquirable {
@@ -89,17 +89,22 @@ pub fn acquirable(
     out
 }
 
-/// True iff the slot dir at `path` has a held marker at its gitdir.
-/// Returns `true` on gitdir resolution failure — refuses to stomp on a dir
-/// whose state we can't read. False on missing lock.
+/// True iff the slot at `path` has HEAD on a branch (held).
+/// Reads the gitdir's `HEAD` file directly (no subprocess). Returns `true`
+/// on resolution or read failure — refuses to stomp on a dir whose state
+/// we can't determine.
 pub fn is_held_at(path: &Path) -> bool {
-    match git::worktree_gitdir(path) {
-        Ok(gd) => fs_paths::slot_lock(&gd).exists(),
+    let gitdir = match git::worktree_gitdir(path) {
+        Ok(gd) => gd,
+        Err(_) => return true,
+    };
+    match std::fs::read_to_string(gitdir.join("HEAD")) {
+        Ok(content) => content.is_empty() || content.starts_with("ref:"),
         Err(_) => true,
     }
 }
 
-/// Count held slots in `group` — canonical slots with a lock at their gitdir.
+/// Count held slots in `group` — canonical slots whose HEAD is on a branch.
 pub fn count_held_in_group(entries: &[SlotEntry], group: Option<&str>) -> usize {
     entries
         .iter()
@@ -107,9 +112,9 @@ pub fn count_held_in_group(entries: &[SlotEntry], group: Option<&str>) -> usize 
         .count()
 }
 
-/// Look up a held slot by branch name. Scans canonical slots with locks,
-/// matches by `git symbolic-ref --short HEAD`. None if no held slot has
-/// branch `name` (already released, never acquired, or HEAD detached).
+/// Look up a held slot by branch name. Scans canonical slots, matches by
+/// `git symbolic-ref --short HEAD`. None if no held slot has branch `name`
+/// (already released, never acquired, or HEAD detached).
 pub fn find_by_name(
     pool_root: &Path,
     cfg: &PoolConfig,
@@ -243,12 +248,13 @@ mod tests {
     #[test]
     fn acquirable_marks_recycled_not_fresh() {
         let tmp = tempfile::TempDir::new().unwrap();
-        // slot-0 idle on disk (.git gitlink resolves but no lock at gitdir);
+        // slot-0 idle on disk (.git gitlink resolves, HEAD detached);
         // slot-1 fresh (no dir).
         let slot0 = tmp.path().join("slot-0");
         std::fs::create_dir(&slot0).unwrap();
         let gitdir = tmp.path().join("fake-gitdir");
-        std::fs::create_dir_all(gitdir.join("worktree-pool")).unwrap();
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(gitdir.join("HEAD"), "0000000000000000000000000000000000000000\n").unwrap();
         std::fs::write(slot0.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
         let v = acquirable(tmp.path(), None, 2, &[]);
         assert_eq!(v.iter().map(|a| (a.n, a.is_fresh)).collect::<Vec<_>>(),
@@ -263,10 +269,23 @@ mod tests {
         let gitdir = tmp.path().join("fake-gitdir");
         std::fs::create_dir_all(&gitdir).unwrap();
         std::fs::write(slot0.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
-        std::fs::create_dir_all(gitdir.join("worktree-pool")).unwrap();
-        std::fs::write(gitdir.join("worktree-pool").join("lock"), "started_at: 2026-01-01T00:00:00Z\nfull_sha: 0000000000000000000000000000000000000000\n").unwrap();
+        // HEAD on a branch = held.
+        std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/my-feature\n").unwrap();
 
         let v = acquirable(tmp.path(), None, 3, &[]);
         assert_eq!(v.iter().map(|a| a.n).collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    #[test]
+    fn is_held_treats_empty_head_as_held() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let slot = tmp.path().join("slot-0");
+        std::fs::create_dir(&slot).unwrap();
+        let gitdir = tmp.path().join("fake-gitdir");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(slot.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+        // Empty HEAD = corruption → conservative held (don't stomp).
+        std::fs::write(gitdir.join("HEAD"), "").unwrap();
+        assert!(is_held_at(&slot));
     }
 }
