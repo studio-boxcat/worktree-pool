@@ -7,24 +7,14 @@
 //! Re-running release is safe — each step is idempotent.
 use anyhow::{Context, Result};
 use std::path::Path;
-use std::time::Duration;
 
 use crate::cli::ReleaseArgs;
 use crate::config::PoolConfig;
 use crate::{fs_paths, git, mutex, slot, submodules};
 
-/// Minimum age before a 0-byte `index.lock` is treated as a crashed-git leftover.
-/// A live `git status` / `git commit` from inside a held slot momentarily owns
-/// this file; 60s is well past any realistic git completion time.
-const STALE_INDEX_LOCK_AFTER: Duration = Duration::from_secs(60);
-
 pub fn run(pool_root: &Path, cfg: &PoolConfig, args: ReleaseArgs) -> Result<()> {
-    let _pool_mu = mutex::PoolMutex::acquire(fs_paths::pool_mutex(pool_root))
+    let _pool_mu = mutex::FileLock::acquire(fs_paths::pool_mutex(pool_root))
         .context("acquiring pool mutex for release")?;
-
-    if let Err(e) = reclaim_stale(pool_root, cfg) {
-        eprintln!("warn: reclaim_stale during release: {e:#}");
-    }
 
     // Lookup order: branch name (normal), then canonical slot id (operator
     // addressing a held slot by its on-disk id).
@@ -63,58 +53,5 @@ fn release_tail(slot_path: &Path, name: &str) -> Result<()> {
 
     eprintln!("released '{}'", name);
     Ok(())
-}
-
-/// Recovery sweep: clears foreign git artifacts (`index.lock`) left over from
-/// SIGKILL'd git processes inside slot worktrees. Runs under the pool mutex at
-/// the start of every acquire/release.
-///
-/// **Does NOT auto-replay crashed acquire/release.** Without a per-slot
-/// "in-flight" signal that survives normal process exit (init-mutex flock is
-/// auto-released on any exit, so it can't disambiguate completed from
-/// crashed), we can't safely tell "crashed mid-flight" from "completed and
-/// exited". Operators release stuck slots manually: `release NAME` (by
-/// branch) or `release <slot-id>` (canonical-id fallback for detached-HEAD
-/// slots from a crashed mid-acquire). Release is idempotent so re-running is
-/// safe.
-pub fn reclaim_stale(pool_root: &Path, cfg: &PoolConfig) -> Result<()> {
-    for entry in slot::enumerate(pool_root, cfg)? {
-        let Ok(gitdir) = git::worktree_gitdir(&entry.path) else {
-            continue;
-        };
-        if clear_stale_index_lock(&gitdir) {
-            eprintln!("reclaim_stale: cleared stale index.lock in '{}'", entry.id);
-        }
-    }
-    Ok(())
-}
-
-/// True iff `<gitdir>/index.lock` matches the crashed-git-leftover signature
-/// (0-byte file, mtime older than `STALE_INDEX_LOCK_AFTER`, not symlink/dir).
-pub(crate) fn is_stale_index_lock(gitdir: &Path) -> bool {
-    let Ok(md) = std::fs::symlink_metadata(fs_paths::worktree_index_lock(gitdir)) else {
-        return false;
-    };
-    if !md.is_file() || md.len() != 0 {
-        return false;
-    }
-    let Ok(mtime) = md.modified() else { return false };
-    let Ok(age) = mtime.elapsed() else { return false };
-    age >= STALE_INDEX_LOCK_AFTER
-}
-
-fn clear_stale_index_lock(gitdir: &Path) -> bool {
-    if !is_stale_index_lock(gitdir) {
-        return false;
-    }
-    let lock_path = fs_paths::worktree_index_lock(gitdir);
-    match std::fs::remove_file(&lock_path) {
-        Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => {
-            eprintln!("warn: removing stale {}: {e:#}", lock_path.display());
-            false
-        }
-    }
 }
 

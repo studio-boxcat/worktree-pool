@@ -639,19 +639,6 @@ cmd_land() {
     exit 1
   fi
 
-  # lazygit (and other TUIs) frequently leave a stale index.lock behind after
-  # exit/crash, which blocks land's auto-commit with a generic git error. Clear
-  # it with a loud warning. Targets index.lock only — HEAD.lock/config.lock and
-  # friends are held by genuinely in-flight git operations and unsafe to remove.
-  # WARNING: if a git process is actively writing the index right now, this
-  # races it; we trade that (rare in a dev-session slot) for unattended lands.
-  local index_lock
-  index_lock=$(git rev-parse --git-path index.lock)
-  if [ -e "$index_lock" ]; then
-    land_warn "removing stale git index.lock ($index_lock) — ensure no git/lazygit process is mid-write in this slot"
-    rm -f "$index_lock"
-  fi
-
   # No-op early exit: slot already landed (HEAD ≡ main) and tree is clean. Skip
   # the land.lock acquisition and submodule preflight entirely — operators
   # verifying "did I land?" shouldn't trip refusals from unrelated in-progress
@@ -664,6 +651,20 @@ cmd_land() {
       echo "land: $branch already landed; main at $(git rev-parse --short HEAD)"
       exit 0
     fi
+  fi
+
+  # Clear a leftover git index.lock before the auto-commit below — a crashed
+  # lazygit/git can leave one, which would fail `git add`/`commit` with a generic
+  # error. Unconditional remove (no staleness check). Placed AFTER the no-op
+  # early-exit so a read-only "did I land?" run never deletes a lock a live git
+  # may hold; only the commit path needs the index writable.
+  # WARNING: if a git process is actively writing the index right now (e.g. a
+  # running lazygit), this races it — accepted for unattended lands.
+  local index_lock
+  index_lock=$(git rev-parse --git-path index.lock)
+  if [ -e "$index_lock" ]; then
+    land_warn "removing leftover git index.lock ($index_lock) — ensure no git/lazygit is mid-write in this slot"
+    rm -f "$index_lock"
   fi
 
   local untracked

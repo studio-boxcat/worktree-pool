@@ -35,9 +35,10 @@ pub fn source_config_mutex(source_gitdir: &Path) -> PathBuf {
 /// Git's per-worktree index lock at `<worktree_gitdir>/index.lock`. Foreign to
 /// worktree-pool — git owns the lifecycle — but the file can leak when a git
 /// process dies between `open(O_CREAT|O_EXCL)` and a write (signal, panic,
-/// untracked-cache writeback aborted mid-flight). `reclaim_stale` sweeps the
-/// 0-byte + aged-out case via `release::clear_stale_index_lock`.
-pub fn worktree_index_lock(worktree_gitdir: &Path) -> PathBuf {
+/// untracked-cache writeback aborted mid-flight). `acquire` removes it before
+/// recycling a slot (the slot is idle under the pool mutex, so the remove is
+/// race-free) — otherwise the recycled `reset --hard` would fail with EEXIST.
+pub(crate) fn worktree_index_lock(worktree_gitdir: &Path) -> PathBuf {
     worktree_gitdir.join("index.lock")
 }
 

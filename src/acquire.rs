@@ -8,7 +8,7 @@ use crate::bail_exit;
 use crate::cli::AcquireArgs;
 use crate::config::PoolConfig;
 use crate::exit::ExitKind;
-use crate::{fs_paths, git, mutex, parallel, release, slot, submodules};
+use crate::{fs_paths, git, mutex, parallel, slot, submodules};
 
 pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> {
     let group = slot::resolve_group(cfg, args.group.as_deref())?;
@@ -20,12 +20,8 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> 
 
     // Pool-wide mutex covers slot allocation + branch creation (the idle→held
     // transition). See module-level serialization rationale in earlier history.
-    let pool_mu = mutex::PoolMutex::acquire(fs_paths::pool_mutex(pool_root))
+    let pool_mu = mutex::FileLock::acquire(fs_paths::pool_mutex(pool_root))
         .context("acquiring pool-wide mutex for slot allocation")?;
-
-    if let Err(e) = release::reclaim_stale(pool_root, cfg) {
-        eprintln!("warn: reclaim_stale during acquire: {e:#}");
-    }
 
     // One enumeration feeds same-SHA scan, capacity check, and slot-pick.
     let entries = slot::enumerate(pool_root, cfg)?;
@@ -57,11 +53,11 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> 
 
     let candidates = slot::acquirable(pool_root, group, cfg.max_slots, &entries);
 
-    let mut acquired: Option<(slot::Acquirable, String, mutex::InitMutex)> = None;
+    let mut acquired: Option<(slot::Acquirable, String, mutex::FileLock)> = None;
     for cand in candidates {
         let id = slot::canonical_id(group, cand.n);
         let mutex_path = fs_paths::init_mutex(pool_root, &id);
-        if let Some(m) = mutex::InitMutex::try_acquire(mutex_path)? {
+        if let Some(m) = mutex::FileLock::try_acquire(mutex_path)? {
             acquired = Some((cand, id, m));
             break;
         }
@@ -82,6 +78,23 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> 
             return Err(e);
         }
     } else {
+        // Clear any leftover `index.lock` before `reset --hard`, which writes the
+        // index and would fail with EEXIST on a stale lock (e.g. a crashed lazygit
+        // in a prior session). The slot is idle (detached HEAD) and we hold the
+        // pool + this slot's init mutex, so no legitimate git process is writing
+        // the index — unconditional remove is race-free, and catches partial
+        // non-zero locks a staleness heuristic would skip. git owns the lock's
+        // lifecycle; we only sweep what a dead process left behind.
+        if let Ok(gitdir) = git::worktree_gitdir(&canonical_path) {
+            let lock = fs_paths::worktree_index_lock(&gitdir);
+            match std::fs::remove_file(&lock) {
+                Ok(()) => eprintln!("cleared leftover index.lock in '{slot_id}' before recycle"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // Don't swallow a real failure: the next reset --hard would hit
+                // EEXIST with a generic git error, so surface the cause here.
+                Err(e) => eprintln!("warn: removing {}: {e:#}", lock.display()),
+            }
+        }
         // Recycled slot: just `reset --hard`. Don't `git clean` — untracked files
         // (Unity Library/, node_modules/, build outputs) are caller warmth the pool
         // exists to preserve. The build system invalidates its own caches.

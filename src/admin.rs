@@ -78,7 +78,7 @@ pub fn validate_gitmodules(_pool_root: &Path, cfg: &PoolConfig) -> Result<()> {
         return Ok(());
     }
 
-    let out = crate::git::run(&cfg.source, &["config", "--file", ".gitmodules", "--list"])?;
+    let out = crate::git::config_file_list(&cfg.source, &path)?;
 
     let mut warnings = 0u32;
     let mut tag_count = 0u32;

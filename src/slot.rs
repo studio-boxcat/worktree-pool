@@ -28,15 +28,13 @@ pub fn resolve_group<'a>(cfg: &'a PoolConfig, requested: Option<&str>) -> Result
         return Ok(None);
     }
     match requested {
-        Some(g) => {
-            if !cfg.groups.iter().any(|x| x == g) {
-                bail!(
-                    "unknown group '{g}'; pool's groups: {}",
-                    cfg.groups.join(", ")
-                );
-            }
-            Ok(Some(cfg.groups.iter().find(|x| x.as_str() == g).unwrap().as_str()))
-        }
+        Some(g) => match cfg.groups.iter().find(|x| x.as_str() == g) {
+            Some(found) => Ok(Some(found.as_str())),
+            None => bail!(
+                "unknown group '{g}'; pool's groups: {}",
+                cfg.groups.join(", ")
+            ),
+        },
         None => {
             let first = cfg.groups[0].as_str();
             eprintln!("--group not given; defaulting to '{first}' (first of: {})", cfg.groups.join(", "));

@@ -197,7 +197,7 @@ fn update_recursive(
         let source_mu = if name_scope.is_empty() {
             let source_gitdir = git::source_gitdir(&cfg.source)
                 .context("resolving source gitdir for per-source config mutex")?;
-            Some(mutex::PoolMutex::acquire(fs_paths::source_config_mutex(&source_gitdir))
+            Some(mutex::FileLock::acquire(fs_paths::source_config_mutex(&source_gitdir))
                 .context("acquiring per-source config mutex")?)
         } else {
             None

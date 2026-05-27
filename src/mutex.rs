@@ -1,17 +1,18 @@
-//! Advisory file-lock mutexes via `std::fs::File::try_lock` (stable since 1.89).
+//! Advisory file-lock mutex via `std::fs::File::try_lock` (stable since 1.89).
 //!
 //! Lock identity is the open file descriptor; the OS auto-releases on process
 //! death (SIGKILL / panic=abort / SIGHUP). No PID tracking, no heartbeat, no
 //! staleness threshold — those concerns belong to the kernel.
 //!
-//! - **Init mutex** (per-slot): held across slot allocation + materialization
-//!   and submodule init. `try_acquire` returns `None` on contention; caller
-//!   tries the next slot.
-//! - **Pool mutex**: serializes acquire/release critical sections. `acquire`
-//!   blocks via try-loop + sleep, bailing after `POOL_MAX_WAIT`.
-//! - **`is_held`**: liveness probe for crash recovery — opens the file (no
-//!   create), tries to take the lock, releases immediately. `true` if some
-//!   process holds the flock; `false` if free or file missing.
+//! One `FileLock` type, two acquisition disciplines:
+//! - **`try_acquire`** (per-slot init mutex): returns `None` on contention so
+//!   the caller can try the next slot.
+//! - **`acquire`** (pool-wide mutex): blocks via try-loop + sleep, bailing
+//!   after `POOL_MAX_WAIT` — loud failure over indefinite hangs.
+//!
+//! **`is_held`**: liveness probe for crash recovery — opens the file (no
+//! create), tries to take the lock, releases immediately. `true` if some
+//! process holds the flock; `false` if free or file missing.
 use anyhow::{Context, Result, bail};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
@@ -20,18 +21,14 @@ use std::time::Duration;
 const POOL_WAIT_STEP: Duration = Duration::from_millis(100);
 const POOL_MAX_WAIT: Duration = Duration::from_secs(60);
 
-pub struct InitMutex {
+pub struct FileLock {
     _file: File,
 }
 
-impl InitMutex {
+impl FileLock {
     /// Try to take an exclusive flock on `path`. Returns `Ok(None)` if another
     /// process holds it; the caller should try the next slot.
     pub fn try_acquire(path: PathBuf) -> Result<Option<Self>> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("mkdir -p {}", parent.display()))?;
-        }
         let file = open_for_lock(&path)?;
         match file.try_lock() {
             Ok(()) => Ok(Some(Self { _file: file })),
@@ -41,21 +38,11 @@ impl InitMutex {
             }
         }
     }
-}
 
-pub struct PoolMutex {
-    _file: File,
-}
-
-impl PoolMutex {
     /// Try-loop with sleep, bail after `POOL_MAX_WAIT`. Blocking `lock()` would
     /// be simpler but has no timeout; we want loud failure over indefinite
     /// hangs so operators can investigate.
     pub fn acquire(path: PathBuf) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("mkdir -p {}", parent.display()))?;
-        }
         let file = open_for_lock(&path)?;
         let mut waited = Duration::ZERO;
         loop {
@@ -107,6 +94,10 @@ pub fn is_held(path: &Path) -> bool {
 }
 
 fn open_for_lock(path: &Path) -> Result<File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("mkdir -p {}", parent.display()))?;
+    }
     OpenOptions::new()
         .read(true)
         .write(true)
@@ -133,7 +124,7 @@ mod tests {
     fn init_mutex_acquire_when_free() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("m.lock");
-        let m = InitMutex::try_acquire(path).unwrap();
+        let m = FileLock::try_acquire(path).unwrap();
         assert!(m.is_some());
     }
 
@@ -141,8 +132,8 @@ mod tests {
     fn init_mutex_returns_none_when_held() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("m.lock");
-        let _held = InitMutex::try_acquire(path.clone()).unwrap().unwrap();
-        let again = InitMutex::try_acquire(path).unwrap();
+        let _held = FileLock::try_acquire(path.clone()).unwrap().unwrap();
+        let again = FileLock::try_acquire(path).unwrap();
         assert!(again.is_none());
     }
 
@@ -150,8 +141,8 @@ mod tests {
     fn init_mutex_drop_releases() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("m.lock");
-        drop(InitMutex::try_acquire(path.clone()).unwrap().unwrap());
-        let again = InitMutex::try_acquire(path).unwrap();
+        drop(FileLock::try_acquire(path.clone()).unwrap().unwrap());
+        let again = FileLock::try_acquire(path).unwrap();
         assert!(again.is_some());
     }
 
@@ -159,7 +150,7 @@ mod tests {
     fn is_held_true_when_locked() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("m.lock");
-        let _held = InitMutex::try_acquire(path.clone()).unwrap().unwrap();
+        let _held = FileLock::try_acquire(path.clone()).unwrap().unwrap();
         assert!(is_held(&path));
     }
 
@@ -167,7 +158,7 @@ mod tests {
     fn is_held_false_when_unlocked() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("m.lock");
-        drop(InitMutex::try_acquire(path.clone()).unwrap().unwrap());
+        drop(FileLock::try_acquire(path.clone()).unwrap().unwrap());
         assert!(!is_held(&path));
     }
 
@@ -182,21 +173,21 @@ mod tests {
     fn pool_mutex_acquire_when_free() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("p.lock");
-        assert!(PoolMutex::acquire(path).is_ok());
+        assert!(FileLock::acquire(path).is_ok());
     }
 
     #[test]
     fn pool_mutex_blocks_then_succeeds_on_release() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("p.lock");
-        let held = PoolMutex::acquire(path.clone()).unwrap();
+        let held = FileLock::acquire(path.clone()).unwrap();
 
         let barrier = Arc::new(Barrier::new(2));
         let bc = Arc::clone(&barrier);
         let pc = path.clone();
         let handle = std::thread::spawn(move || {
             bc.wait();
-            PoolMutex::acquire(pc)
+            FileLock::acquire(pc)
         });
 
         barrier.wait();

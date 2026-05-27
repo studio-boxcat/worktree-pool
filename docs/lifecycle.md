@@ -20,32 +20,30 @@ resolution; cheap vs. the cache rebuild cost.
 
 1. Resolve `--commit` (default `default_commit` from config) against source repo → full SHA.
 2. Take pool-wide mutex (flock).
-3. Run `reclaim_stale` to fix any leftover state from a prior crash (see [[#crash-recovery]]).
-4. If `--unique-sha`, scan held slots (HEAD on a branch) for matching SHA via `rev-parse HEAD`; refuse on hit, reporting the holder's branch name.
-5. Check capacity (`count_held_in_group >= max_slots` → refuse with the slot table inline).
-6. Iterate acquirable Ns (canonical Ns 0..max_slots with detached HEAD; plus surplus N >= max_slots that exist as recycled-idle — see [[#over-provisioned-pools]]). Try per-slot init mutex (flock) on each; first success wins.
-7. Materialize at canonical path: fresh → `git worktree add --detach <pool>/{group}-N <full_sha>`; recycled → `git -C <slot> reset --hard <full_sha>`. **Never `git clean`** — untracked files are caller's warmth.
-8. Force-create branch: `git -C <slot> update-ref refs/heads/NAME HEAD && symbolic-ref HEAD refs/heads/NAME`. **This flips idle → held.** (Avoids `git checkout -B`'s 600ms of per-file filter-process pings on a tree that's already at the right state.)
-9. Drop pool-wide mutex.
-10. Submodule update, two-phase: (a) sequential `git config submodule.<name>.url` writes per submodule wrapped in a per-source mutex (`<source-gitdir>/worktree-pool-config.lock`) so parallel acquires across pools sharing a source don't fight on `<source>/.git/config`'s `O_EXCL` lockfile; (b) parallel per-submodule `git submodule update <path>` via `parallel::try_for_each` (inline-fallback on OS thread-create failure), then `update-ref refs/heads/NAME HEAD && symbolic-ref HEAD refs/heads/NAME` to attach each submodule to a branch matching the parent slot's name. Each top-level worker recurses into its nested `.gitmodules` end-to-end so the full submodule tree fans out in parallel, not just the top level. Tag exclusion via `--exclude-submodule-tags` against `worktreePoolTag` in `.gitmodules`.
-11. Drop init mutex (flock released on file close); print canonical path on stdout (last line).
+3. If `--unique-sha`, scan held slots (HEAD on a branch) for matching SHA via `rev-parse HEAD`; refuse on hit, reporting the holder's branch name.
+4. Check capacity (`count_held_in_group >= max_slots` → refuse with the slot table inline).
+5. Iterate acquirable Ns (canonical Ns 0..max_slots with detached HEAD; plus surplus N >= max_slots that exist as recycled-idle — see [[#over-provisioned-pools]]). Try per-slot init mutex (flock) on each; first success wins.
+6. Materialize at canonical path: fresh → `git worktree add --detach <pool>/{group}-N <full_sha>`; recycled → remove any leftover `<gitdir>/index.lock` (see [[#crash-recovery]]), then `git -C <slot> reset --hard <full_sha>`. **Never `git clean`** — untracked files are caller's warmth.
+7. Force-create branch: `git -C <slot> update-ref refs/heads/NAME HEAD && symbolic-ref HEAD refs/heads/NAME`. **This flips idle → held.** (Avoids `git checkout -B`'s 600ms of per-file filter-process pings on a tree that's already at the right state.)
+8. Drop pool-wide mutex.
+9. Submodule update, two-phase: (a) sequential `git config submodule.<name>.url` writes per submodule wrapped in a per-source mutex (`<source-gitdir>/worktree-pool-config.lock`) so parallel acquires across pools sharing a source don't fight on `<source>/.git/config`'s `O_EXCL` lockfile; (b) parallel per-submodule `git submodule update <path>` via `parallel::try_for_each` (inline-fallback on OS thread-create failure), then `update-ref refs/heads/NAME HEAD && symbolic-ref HEAD refs/heads/NAME` to attach each submodule to a branch matching the parent slot's name. Each top-level worker recurses into its nested `.gitmodules` end-to-end so the full submodule tree fans out in parallel, not just the top level. Tag exclusion via `--exclude-submodule-tags` against `worktreePoolTag` in `.gitmodules`.
+10. Drop init mutex (flock released on file close); print canonical path on stdout (last line).
 
 ## `release NAME`
 
 1. Take pool-wide mutex (flock).
-2. Run `reclaim_stale`.
-3. `slot::find_by_name(NAME)` — scan held slots, match by `git symbolic-ref --short HEAD`. Not found → idempotent success (already released, never acquired, or branch was hand-deleted).
-4. **`detach_head`** — this flips held → idle (under pool mutex, so no race). Then `branch -D NAME` (local), `push --delete origin NAME` (best-effort; no-op if `origin` is a bare mirror). Recursively mirror in every submodule.
-5. Drop pool mutex.
+2. `slot::find_by_name(NAME)` — scan held slots, match by `git symbolic-ref --short HEAD`. Not found → idempotent success (already released, never acquired, or branch was hand-deleted).
+3. **`detach_head`** — this flips held → idle (under pool mutex, so no race). Then `branch -D NAME` (local), `push --delete origin NAME` (best-effort; no-op if `origin` is a bare mirror). Recursively mirror in every submodule.
+4. Drop pool mutex.
+
+Release touches only refs (`detach_head` is plumbing `rev-parse` + `update-ref --no-deref`), never the index — so a leftover `index.lock` can't block it and there's no sweep here.
 
 Slot dir stays at its canonical path — ready for the next acquire to land in it with new caches still warm.
 
 ## Crash recovery
 
-Release is idempotent — replaying it after a crash converges. `reclaim_stale`
-runs immediately after the pool mutex in both `acquire` and `release`, but
-its scope is intentionally narrow: it only sweeps foreign git artifacts
-(`index.lock`). It does **not** auto-replay crashed acquire/release.
+Release is idempotent — replaying it after a crash converges. There is **no**
+auto-replay of crashed acquire/release, and no periodic recovery sweep.
 
 **Why no auto-replay?** Without a per-slot in-flight signal that survives
 normal process exit, there's no way to safely tell "completed and exited"
@@ -71,15 +69,18 @@ instead.
   (no matching branch). The orphan ref is harmless — `git gc` cleans it up.
   Operator can also `git branch -D <name>` manually.
 
-**Stale `git index.lock` sweep.** What `reclaim_stale` actually does. Run
-once per enumerated slot: `<source>/.git/worktrees/<id>/index.lock` is
-removed iff **0 bytes AND mtime older than 60s**. The lock is git's, not
-ours — it leaks when a git process dies between `open(O_CREAT|O_EXCL)` and
-the first write (SIGKILL from harness timeouts, panic, untracked-cache
-writeback aborting under concurrent-git contention). The 0-byte + age guard
-protects live `git status` / `git commit` from inside a held slot (they hold
-a non-empty, young lock for milliseconds). Non-zero locks are left alone —
-they may be partial writes the operator wants to inspect.
+**Leftover `git index.lock`.** The lock is git's, not ours — it leaks when a
+git process dies between `open(O_CREAT|O_EXCL)` and the first write (a crashed
+lazygit/`git status`, SIGKILL from harness timeouts, panic, untracked-cache
+writeback aborting under concurrent-git contention). It only matters on the
+recycle path: a recycled slot's `git reset --hard` writes the index and would
+fail `EEXIST` on a leftover lock. So `acquire` removes
+`<source>/.git/worktrees/<id>/index.lock` unconditionally right before the
+recycled `reset --hard` (acquire step 6). This is race-free — the slot is idle
+(detached HEAD) and acquire holds the pool + that slot's init mutex, so no
+legitimate git process can own the lock — and it catches partial (non-zero)
+locks a staleness heuristic would skip. Held slots are never touched: their
+`index.lock` belongs to a live session.
 
 **Residual mode still needing operator action:**
 

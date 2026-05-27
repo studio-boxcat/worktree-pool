@@ -75,7 +75,7 @@ The contract is locked by `tests/smoke.rs::acquire_capacity_exhaustion` and
 `unique_sha_refuses_second_acquire`. New conditions get new codes; existing
 codes don't shift.
 
-`doctor` is host-level (no `--pool`) and read-only. Checks: arch, `git --version`, `$WORKTREE_ROOT` + pool count, binary quarantine xattr, per-pool config + source-path validation, and stale `index.lock` files across every initialized pool. Stale-lock signature + reclamation path live in [[lifecycle.md#crash-recovery]].
+`doctor` is host-level (no `--pool`) and read-only. Checks: arch, `git --version`, `$WORKTREE_ROOT` + pool count, binary quarantine xattr, and per-pool config + source-path validation.
 
 ## Distribution
 

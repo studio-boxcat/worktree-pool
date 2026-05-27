@@ -96,26 +96,20 @@ pub fn worktree_gitdir(slot: &Path) -> Result<PathBuf> {
             slot.join(path)
         });
     }
-    let gd = run(slot, &["rev-parse", "--git-dir"])?;
-    let p = PathBuf::from(&gd);
-    if p.is_absolute() {
-        Ok(p)
-    } else {
-        Ok(slot.join(p))
-    }
+    git_dir_abs(slot)
 }
 
 /// Resolve `source`'s own gitdir (the source repo's git directory; same as
 /// source for a bare repo, `<source>/.git` for a working clone). Used to
 /// anchor the per-source mutex serializing top-level submodule config writes.
 pub fn source_gitdir(source: &Path) -> Result<PathBuf> {
-    let gd = run(source, &["rev-parse", "--git-dir"])?;
-    let p = PathBuf::from(&gd);
-    if p.is_absolute() {
-        Ok(p)
-    } else {
-        Ok(source.join(p))
-    }
+    git_dir_abs(source)
+}
+
+/// `git -C dir rev-parse --git-dir`, absolutized against `dir` when relative.
+fn git_dir_abs(dir: &Path) -> Result<PathBuf> {
+    let p = PathBuf::from(run(dir, &["rev-parse", "--git-dir"])?);
+    Ok(if p.is_absolute() { p } else { dir.join(p) })
 }
 
 /// `git -C source worktree add --detach <slot> <commit>`.
