@@ -57,8 +57,6 @@ die() { echo "${0##*/}: $*" >&2; exit 1; }
 
 require_arg() { [ -n "$2" ] || die "usage: $3"; }
 
-pool_root_path() { printf '%s/%s' "$WORKTREE_ROOT" "$1"; }
-
 # Read `source:` from a pool's config and expand `~`. Empty on failure.
 pool_source_path() {
   local cfg="$WORKTREE_ROOT/$1/.meta/config.yaml"
@@ -68,6 +66,10 @@ pool_source_path() {
   [ -n "$src" ] || return 1
   printf '%s' "${src/#\~/$HOME}"
 }
+
+# Filter captured `worktree-pool ls` output ($1) to held data rows: column 2 ==
+# "held", skipping the 2 header lines. Single source of the ls-column coupling.
+held_data_rows() { printf '%s\n' "$1" | awk 'NR>2 && $2=="held"'; }
 
 # Echo the name of any in-progress git operation (rebase, merge, cherry-pick,
 # revert) for the repo at $1. Empty if clean.
@@ -328,6 +330,19 @@ find_main_path() {
 
 # Auto-resolve pool key from cwd. Echoes the key on stdout, returns non-zero
 # (with stderr explanation) on ambiguity / no match.
+# Echo the key of each initialized pool whose `source:` repo canonicalizes to
+# $1 (an absolute, resolved git toplevel), one per line. Empty if none match.
+pool_keys_for_toplevel() {
+  local toplevel=$1 cfg key src
+  for cfg in "$WORKTREE_ROOT"/*/.meta/config.yaml; do
+    [ -f "$cfg" ] || continue
+    key=$(basename "$(dirname "$(dirname "$cfg")")")
+    src=$(pool_source_path "$key") || continue
+    src=$(cd "$src" 2>/dev/null && pwd -P) || continue
+    [ "$src" = "$toplevel" ] && printf '%s\n' "$key"
+  done
+}
+
 auto_pool_key() {
   local cwd_real
   cwd_real=$(pwd -P)
@@ -346,16 +361,10 @@ auto_pool_key() {
   toplevel=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
   toplevel=$(cd "$toplevel" && pwd -P)
 
-  local matches=() cfg key src
-  for cfg in "$WORKTREE_ROOT"/*/.meta/config.yaml; do
-    [ -f "$cfg" ] || continue
-    key=$(basename "$(dirname "$(dirname "$cfg")")")
-    src=$(pool_source_path "$key") || continue
-    src=$(cd "$src" 2>/dev/null && pwd -P) || continue
-    if [ "$src" = "$toplevel" ]; then
-      matches+=("$key")
-    fi
-  done
+  local matches=() key
+  while IFS= read -r key; do
+    [ -n "$key" ] && matches+=("$key")
+  done < <(pool_keys_for_toplevel "$toplevel")
 
   case ${#matches[@]} in
     0) return 1 ;;
@@ -370,7 +379,7 @@ require_pool() {
     POOL_KEY=$(auto_pool_key) || die "could not infer --pool from cwd. \
 Run from inside a pool's source repo or a slot, or pass --pool <key>."
   fi
-  POOL_ROOT=$(pool_root_path "$POOL_KEY")
+  POOL_ROOT="$WORKTREE_ROOT/$POOL_KEY"
   [ -d "$POOL_ROOT" ] || die "pool '$POOL_KEY' not initialized at $POOL_ROOT — \
 from inside the source repo, run: wt init [--max-slots <n>] [--groups ...]"
 }
@@ -449,7 +458,7 @@ cmd_go() {
     local ls_out
     ls_out=$(worktree-pool --pool "$POOL_KEY" ls)
     local held_rows
-    held_rows=$(printf '%s\n' "$ls_out" | awk 'NR>2 && $2=="held"')
+    held_rows=$(held_data_rows "$ls_out")
     if [ -n "$held_rows" ]; then
       printf '%s\n' "$ls_out" | awk 'NR<=2'
       printf '%s\n' "$held_rows"
@@ -1114,10 +1123,10 @@ cmd_cleanup() {
 cmd_sweep() {
   [ $# -eq 0 ] || die "sweep takes no arguments"
 
-  # Held slot names are column 3 of `worktree-pool ls` rows where col 2 == "held".
+  # Held slot names are column 3 of `worktree-pool ls` held rows.
   local out names
   out=$(worktree-pool --pool "$POOL_KEY" ls)
-  names=$(printf '%s\n' "$out" | awk 'NR>2 && $2=="held" {print $3}')
+  names=$(held_data_rows "$out" | awk '{print $3}')
   if [ -z "$names" ]; then
     echo "(no held slots to sweep)"
     return 0
@@ -1250,17 +1259,10 @@ cmd_whoami() {
   toplevel=$(git rev-parse --show-toplevel 2>/dev/null) || { echo none; return 0; }
   toplevel=$(cd "$toplevel" && pwd -P)
 
-  local cfg key src
-  for cfg in "$WORKTREE_ROOT"/*/.meta/config.yaml; do
-    [ -f "$cfg" ] || continue
-    key=$(basename "$(dirname "$(dirname "$cfg")")")
-    src=$(pool_source_path "$key") || continue
-    src=$(cd "$src" 2>/dev/null && pwd -P) || continue
-    if [ "$src" = "$toplevel" ]; then
-      printf 'source\t%s\n' "$toplevel" | sed "s|$HOME|~|"
-      return 0
-    fi
-  done
+  if [ -n "$(pool_keys_for_toplevel "$toplevel" | head -n1)" ]; then
+    printf 'source\t%s\n' "$toplevel" | sed "s|$HOME|~|"
+    return 0
+  fi
 
   echo none
 }
@@ -1300,7 +1302,7 @@ cmd_ls() {
 
   local out held
   out=$(worktree-pool --pool "$POOL_KEY" ls ${forward[@]+"${forward[@]}"})
-  held=$(printf '%s\n' "$out" | awk 'NR>2 && $2=="held"')
+  held=$(held_data_rows "$out")
   if [ -z "$held" ]; then
     echo "(no held slots)"
     return 0

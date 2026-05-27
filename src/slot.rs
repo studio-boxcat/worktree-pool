@@ -119,9 +119,8 @@ pub fn find_by_name(
     name: &str,
 ) -> Result<Option<SlotEntry>> {
     for entry in enumerate(pool_root, cfg)? {
-        if !is_held_at(&entry.path) {
-            continue;
-        }
+        // `current_branch` is None on detached (idle) HEAD, so the name match
+        // alone implies held — no separate `is_held_at` read needed.
         if git::current_branch(&entry.path).as_deref() == Some(name) {
             return Ok(Some(entry));
         }

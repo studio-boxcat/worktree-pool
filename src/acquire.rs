@@ -132,7 +132,8 @@ fn find_same_sha_holder(entries: &[slot::SlotEntry], full_sha: &str) -> Option<H
     // Under the pool mutex, doing this serially blocks all other acquires;
     // the parallel version cuts ~5x on 8-slot pools.
     parallel::map(entries, |entry| {
-        if !slot::is_held_at(&entry.path) { return None; }
+        // `current_branch` returns None on a detached (idle) HEAD, so it doubles
+        // as the held-gate — no separate `is_held_at` read needed.
         let branch = git::current_branch(&entry.path)?;
         let sha = git::run(&entry.path, &["rev-parse", "HEAD"]).ok()?;
         if sha != full_sha {
@@ -151,11 +152,10 @@ fn find_same_sha_holder(entries: &[slot::SlotEntry], full_sha: &str) -> Option<H
 fn print_capacity_error(pool_root: &Path, entries: &[slot::SlotEntry]) {
     eprintln!("\nHeld slots in pool {}:", pool_root.display());
     for e in entries {
-        if !slot::is_held_at(&e.path) {
-            continue;
+        // Held iff HEAD is on a branch; idle (detached) slots have no name to list.
+        if let Some(branch) = git::current_branch(&e.path) {
+            eprintln!("  {} (branch: {})", e.id, branch);
         }
-        let branch = git::current_branch(&e.path).unwrap_or_else(|| "(detached)".into());
-        eprintln!("  {} (branch: {})", e.id, branch);
     }
 }
 
