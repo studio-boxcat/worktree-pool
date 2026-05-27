@@ -1417,6 +1417,48 @@ fn session_land_advances_main_on_clean_path() {
 }
 
 #[test]
+fn session_land_clears_leftover_index_lock_before_commit() {
+    // land auto-commits dirty tracked work (`git add -u` + commit), which writes
+    // the index and would fail EEXIST on a leftover `index.lock` (e.g. from a
+    // crashed lazygit). land removes the lock first — verify the land succeeds
+    // and the lock is gone. Non-empty + fresh lock proves the remove is
+    // unconditional (no staleness heuristic).
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let main_path = tmp.path().join("main-wt");
+    run_git_root(&[
+        "-C", &bare.display().to_string(),
+        "worktree", "add", "--quiet",
+        &main_path.display().to_string(), "main",
+    ]);
+
+    let out = acquire_dev(&key, "feat");
+    assert!(out.status.success());
+    let slot_path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+
+    // Dirty tracked change so land must auto-commit (which needs the index lock free).
+    std::fs::write(slot_path.join("README"), b"changed\n").unwrap();
+
+    // Plant a crashed-git leftover the auto-commit would otherwise trip over.
+    let gitdir = slot_gitdir_path(&slot_path);
+    let lock = gitdir.join("index.lock");
+    std::fs::write(&lock, b"partial write before SIGKILL\n").unwrap();
+
+    let out = session_cmd_cwd(&slot_path, &["land", "wip"]).output().unwrap();
+    assert_ok(&out, "land must clear the leftover index.lock and commit");
+    assert!(!lock.exists(),
+        "land must remove the leftover index.lock before committing");
+
+    // Dirty work landed in main (ff-only is atomic → ref advanced).
+    let landed = std::fs::read(main_path.join("README")).expect("README missing in main");
+    assert_eq!(landed, b"changed\n");
+}
+
+#[test]
 fn session_land_is_idempotent_on_rerun() {
     // Running land twice in a row: second run hits the `main_before == slot_head`
     // skip and exits 0 (the "resume after manual conflict resolution" contract).
