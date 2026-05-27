@@ -530,13 +530,13 @@ Recover with: rm -rf $(printf '%q' "$literal_path"), then re-run."
   fi
 
   # EXIT trap → `wt _exit_handler`. Handler decides between (a) the misfire-
-  # preserve 🟡 path (fresh + clean + launcher exited <LAUNCH_MISFIRE_SECS),
-  # which leaves the slot personalized for inspection, and (b) the normal
-  # `wt cleanup` path. Without (a), launcher misfires (no TTY, missing PATH,
-  # crashed pre-launch hook) silently 🟢-recycle a slot that never ran a
-  # session — destroying the diagnostic surface.
-  # `WT_LAUNCH_START` is filled in just before the launcher exec; absence
-  # means we never reached the launcher, so the handler treats it as misfire.
+  # preserve 🟡 path (fresh acquire + clean tree + launcher exited fast,
+  # < LAUNCH_MISFIRE_SECS), which leaves the slot personalized for inspection,
+  # and (b) the normal `wt cleanup` path. WT_FRESH/WT_LAUNCH_START are exported
+  # empty here and set to their real values just before the launcher exec
+  # (below); a failure before that point (e.g. a crashed wt_pre_go hook) fires
+  # the trap with WT_FRESH still empty, so it routes to cleanup, not preserve.
+  # (The no-TTY misfire is refused earlier by an explicit die, before this trap.)
   export WT_KEY="$POOL_KEY" WT_NAME="$name" WT_FRESH="" WT_LAUNCH_START=""
   trap "'$0' --pool \"\$WT_KEY\" _exit_handler \"\$WT_NAME\"" EXIT
 
@@ -587,7 +587,8 @@ For save/restore around tests use commit + soft-reset instead: \
 #
 # Misfire preserve fires when ALL of:
 #   - WT_FRESH=1 (this acquire created the slot; resumes never recycle silently)
-#   - launcher exited fast (< LAUNCH_MISFIRE_SECS) OR never started (WT_LAUNCH_START empty)
+#   - launcher exited fast (dur < LAUNCH_MISFIRE_SECS); WT_FRESH=1 implies the
+#     launcher was reached (both exported together), so dur is a real measurement
 #   - working tree is clean (no porcelain output)
 #   - no commits ahead of main
 # In that case we print a 🟡 line and return without recycling. Otherwise we
@@ -603,9 +604,12 @@ cmd__exit_handler() {
   fi
 
   if [ "${WT_FRESH:-}" = "1" ]; then
-    local now dur=999
+    local now dur
     now=${EPOCHSECONDS:-$(date +%s)}
-    [ -n "${WT_LAUNCH_START:-}" ] && dur=$(( now - WT_LAUNCH_START ))
+    # WT_FRESH=1 ⟹ WT_LAUNCH_START was set (exported together, just before
+    # launch); `:-0` only covers the impossible-in-practice gap, yielding a
+    # large dur → cleanup, never a false preserve.
+    dur=$(( now - ${WT_LAUNCH_START:-0} ))
 
     local porcelain ahead
     porcelain=$(git -C "$path" status --porcelain 2>/dev/null || true)
