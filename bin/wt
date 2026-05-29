@@ -197,7 +197,8 @@ inside_dir() {
 #
 # Lock file path: `<source>/.git/worktree-pool/land.lock`. Body = bash PID of
 # the holder (operator's shell, not a subcommand). Acquire spins with PID
-# liveness + mtime fallback for crashed holders. Released explicitly on:
+# liveness + mtime fallback for crashed holders — macOS ships no `flock(1)`, so
+# this ~40-LOC PID+mtime scheme stands in for it. Released explicitly on:
 #   - normal completion, and
 #   - conflict-exit at step 6 — operator's pause is potentially long, so we
 #     drop the lock and re-acquire on resume.
