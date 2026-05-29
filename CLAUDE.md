@@ -9,6 +9,7 @@ This file is the contract. `README.md` is a symlink to it. Detail lives in `docs
 - [[docs/cli.md]] — quick start, full CLI reference, install
 - [[docs/lifecycle.md]] — `acquire`/`release` invariants, crash recovery, same-SHA exclusion, submodule filtering, design rationale
 - [[docs/wt.md]] — `wt` dev-session helper: subcommands, hooks, cleanup classifier, land flow
+- [[docs/land-submodules.md]] — `wt land` × newly-introduced submodules: populate-from-slot rationale, local-only constraint
 - [[docs/integration.md]] — integration patterns, multi-slot gotchas, limits, scope cuts
 
 ---

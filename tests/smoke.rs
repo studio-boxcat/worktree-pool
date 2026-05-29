@@ -2112,6 +2112,96 @@ fn session_land_propagates_submodule_to_main() {
         "submodule's new tracked file did not land in main worktree");
 }
 
+/// Regression: a feature branch that *introduces a brand-new submodule* must
+/// land cleanly — `main` advances AND the new submodule is populated in the
+/// main worktree. Pins the fix for the dead `land_die "main worktree's
+/// submodule clone missing at ..."`, which left `main` frozen at the pre-merge
+/// tip while the slot branch had already advanced (the pspec incident). The
+/// populate sources from the slot's clone (local, no network) and restores the
+/// declared origin so it survives slot recycle.
+#[test]
+fn session_land_populates_newly_introduced_submodule_in_main() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+
+    // Source starts WITHOUT any submodule; `main` is checked out at `staging`.
+    make_fixture(tmp.path());
+    let source = tmp.path().join("staging");
+    init_pool(&key, &source);
+
+    // A separate bare repo to introduce as a submodule from inside the slot.
+    let vendor_bare = tmp.path().join("vendor.git");
+    run_git_root(&["init", "--quiet", "--bare", &vendor_bare.display().to_string()]);
+    let vendor_staging = tmp.path().join("vendor-staging");
+    run_git_root(&[
+        "clone", "--quiet",
+        &vendor_bare.display().to_string(),
+        &vendor_staging.display().to_string(),
+    ]);
+    std::fs::write(vendor_staging.join("LIB"), b"vendor-content\n").unwrap();
+    git_commit(&vendor_staging, "vendor init");
+    run_git(&vendor_staging, &["push", "--quiet", "-u", "origin", "main"]);
+
+    // Acquire a slot and introduce the submodule there.
+    let out = acquire_dev_sub(&key, "add-vendor");
+    assert_ok(&out, "acquire");
+    let slot_path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    run_git(
+        &slot_path,
+        &[
+            "-c", "protocol.file.allow=always",
+            "submodule", "add", "--quiet",
+            &vendor_bare.display().to_string(),
+            "vendor",
+        ],
+    );
+    // A slot-local commit INSIDE the new submodule — its SHA never reaches the
+    // declared origin (`vendor.git`). This pins that the populate sources from
+    // the *slot's* clone: a naive `submodule update --init` from the declared
+    // URL couldn't see this commit (and would hit the network), so it would
+    // fail the gitlink-SHA assertion below.
+    std::fs::write(slot_path.join("vendor").join("LOCAL"), b"slot-only\n").unwrap();
+    git_commit(&slot_path.join("vendor"), "slot-local submodule commit");
+    git_commit(&slot_path, "introduce vendor submodule");
+
+    let rev = |repo: &Path| {
+        String::from_utf8_lossy(
+            &StdCommand::new("git")
+                .args(["-C", &repo.display().to_string(), "rev-parse", "HEAD"])
+                .output().unwrap().stdout,
+        ).trim().to_string()
+    };
+    let slot_head = rev(&slot_path);
+    let slot_sub_head = rev(&slot_path.join("vendor"));
+
+    let out = session_cmd_cwd(&slot_path, &["land"]).output().unwrap();
+    assert_ok(&out, "land");
+
+    // `main` advanced to the slot's landed commit (no parallel land ⇒ pure ff).
+    assert_eq!(rev(&source), slot_head, "main did not advance to the landed commit");
+
+    // The newly-introduced submodule is populated in the main worktree, at the
+    // pinned gitlink SHA.
+    let main_sub = source.join("vendor");
+    assert!(main_sub.join("LIB").exists(),
+        "newly-introduced submodule's working tree did not materialize in main");
+    assert!(main_sub.join("LOCAL").exists(),
+        "the slot-local submodule commit did not reach main — populate sourced from origin, not the slot");
+    assert_eq!(rev(&main_sub), slot_sub_head,
+        "main's new submodule clone is not at the pinned gitlink SHA");
+
+    // Origin points at the declared URL (survives slot recycle), not the
+    // ephemeral slot clone the populate temporarily cloned from.
+    let origin = String::from_utf8_lossy(
+        &StdCommand::new("git")
+            .args(["-C", &main_sub.display().to_string(), "remote", "get-url", "origin"])
+            .output().unwrap().stdout,
+    ).trim().to_string();
+    assert_eq!(origin, vendor_bare.display().to_string(),
+        "main's submodule origin should be the declared URL, not the slot clone");
+}
+
 
 /// Unit-style test for `_land_preflight_submodules`: invoke it directly via
 /// the hidden wt subcommand, with a pre-built diverged-submodule scenario.

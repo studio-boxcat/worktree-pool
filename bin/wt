@@ -229,6 +229,34 @@ _land_attach_first() {
   return 1
 }
 
+# Populate <main_path>'s clone of a top-level submodule <sub> from the SLOT's
+# already-populated clone — fully local, no network. Used by `wt land` when a
+# feature branch introduces a brand-new submodule (or main's clone went
+# missing): the slot's clone holds the pinned gitlink SHA — including any
+# slot-local commits the declared origin has never seen — so a plain
+# `submodule update --init` (which clones from the remote `.gitmodules` URL)
+# would both reach the network and miss those commits. See [[land-submodules.md]].
+#
+# Mirrors acquire's two-phase config-write→update (src/submodules.rs): register
+# from `.gitmodules`, override the URL to the slot's local clone for the clone
+# itself, then restore the declared URL so the resulting origin survives the
+# slot being recycled. Must run AFTER the parent ff (main's tree must already
+# record <sub>'s gitlink + .gitmodules). Returns non-zero on any failure; the
+# caller warns (non-fatal — main is already advanced). Top-level only.
+_land_clone_sub_from_slot() {
+  local main_path=$1 slot_path=$2 sub=$3 declared
+  [ -e "$slot_path/$sub/.git" ] || return 1   # slot has nothing to clone from
+  declared=$(git -C "$main_path" config -f .gitmodules --get "submodule.$sub.url" 2>/dev/null) || declared=""
+  git -C "$main_path" submodule init -- "$sub" >/dev/null 2>&1 || return 1
+  git -C "$main_path" config "submodule.$sub.url" "$slot_path/$sub" || return 1
+  git -C "$main_path" -c protocol.file.allow=always submodule update -- "$sub" || return 1
+  if [ -n "$declared" ]; then
+    git -C "$main_path" config "submodule.$sub.url" "$declared" || return 1
+    git -C "$main_path/$sub" remote set-url origin "$declared" 2>/dev/null || true
+  fi
+  return 0
+}
+
 # True iff cwd is somewhere under $1 (after symlink resolution on both sides).
 # Returns 1 if $1 doesn't exist — caller decides whether that's a refuse or a pass.
 inside_dir() {
@@ -716,13 +744,9 @@ cmd_land() {
   done < <(submodule_paths "$main_path")
   [ "$main_marker_failed" = 0 ] || exit 1
 
-  # `merge --ff-only` refuses if untracked files would be overwritten, so
-  # untracked content in main is preserved; ignore `??` here when checking
-  # for tracked-uncommitted state. `--ignore-submodules=untracked` keeps the
-  # submodule-internal `M sub` (untracked content inside a submodule) from
-  # blocking land — the ff-only safety net already protects against actual
-  # collision, and operators consistently want to land alongside dirty/
-  # untracked sub-content rather than silence per-submodule via gitconfig.
+  # Tracked-uncommitted check only: `merge --ff-only` (step 13) refuses on
+  # untracked-overwrite, and `--ignore-submodules=untracked` lets land proceed
+  # alongside dirty content inside submodules. The `awk` drops `??` (untracked) rows.
   local main_dirty
   main_dirty=$(git -C "$main_path" status --porcelain --ignore-submodules=untracked | awk '!/^\?\?/')
   if [ -n "$main_dirty" ]; then
@@ -733,19 +757,14 @@ cmd_land() {
 
   # Auto-commit dirty tracked work. Refuse silent WIP commits.
   if ! git diff --quiet || ! git diff --cached --quiet; then
-    # Pre-stage submodule sync. Stock `git merge` (without --recurse-submodules,
-    # the IDE/`git pull` default) advances the recorded gitlink but leaves the
-    # submodule working dir at the pre-merge SHA. `git add -u` below would then
-    # stage that stale HEAD as the new gitlink — silently regressing the merge.
-    # Per submodule, classify index gitlink vs working HEAD by ancestry:
+    # Pre-stage submodule sync (see [[land-submodules.md#the-phases]]): a stale
+    # post-merge working dir would be staged by `git add -u` as a gitlink
+    # regression. Classify index gitlink vs working HEAD by ancestry:
     #   working == index → in sync, skip.
-    #   working < index  → post-merge stale; `git submodule update` brings the
-    #                      working dir forward (idempotent; checkout refuses on
-    #                      untracked collision rather than clobbering).
+    #   working < index  → post-merge stale; `submodule update` brings it forward.
     #   working > index  → operator's pending forward bump; leave for auto-commit.
     #   diverged         → refuse; operator resolves.
-    # `protocol.file.allow=always` is required because pool slots' submodule
-    # clones use `file://` origins pointing at the source clone's `.git/modules/...`.
+    # `protocol.file.allow=always`: pool slots' submodule clones use `file://` origins.
     local sub_sync_failed=0
     if [ -f "$slot_path/.gitmodules" ]; then
       local sub_path sub_index_sha sub_head_sha sub_full
@@ -881,19 +900,15 @@ cmd_land() {
   _land_preflight_submodules "$main_before" "$slot_head" "$main_path" "$slot_path" "$branch" \
     || exit 1
 
-  # Order: submodule propagation BEFORE parent ff-merge. If propagation fails,
-  # parent stays at main_before and re-running land retries cleanly (each
-  # submodule's fetch+attach+ff is idempotent — already-advanced submodules
-  # no-op). The reverse order would strand the operator: parent advanced,
-  # `moved` empty next time, failed submodules never retried.
+  # Propagate slot→main submodule commits BEFORE the parent ff, so a failure
+  # leaves the parent at main_before and a re-run retries cleanly (each
+  # fetch+attach+ff is idempotent). Fetch by the `<slot-name>` branch acquire
+  # made, ff to the gitlink SHA; parallel, top-level only. `.git` is a gitlink
+  # *file* (`-e`, not `-d`). See [[land-submodules.md#the-phases]].
   #
-  # `acquire` branched each submodule as `<slot-name>`, so we fetch by branch
-  # name from the slot's submodule into main's, then ff-merge to the gitlink-
-  # expected SHA. ff-only refuses on untracked-overwrite — preserves operator
-  # scratch in actively-edited submodule clones. `-e` not `-d`: a submodule's
-  # `.git` is a gitlink *file*, never a directory. Parallel via background
-  # subshells (Nx speedup at 7+ submodules; output interleaves). Top-level
-  # only; nested propagation deferred (see docs/wt.md §Land flow).
+  # new_subs: moved gitlinks main has no clone for (newly introduced, or clone
+  # gone) — collected here, cloned from the slot in the post-ff populate below.
+  local new_subs=()
   local moved
   moved=$(git diff --raw "$main_before" "$slot_head" | awk '$2=="160000" {print $6}')
   if [ -n "$moved" ]; then
@@ -907,8 +922,13 @@ cmd_land() {
       [ -n "$sub" ] || continue
       # Slot's submodule absent (tag-excluded at acquire) — nothing to propagate.
       [ -e "$slot_path/$sub/.git" ] || continue
-      [ -e "$main_path/$sub/.git" ] \
-        || land_die "main worktree's submodule clone missing at $main_path/$sub"
+      # Main has no clone yet (submodule newly introduced by this branch, or
+      # main's clone went missing). Nothing to fast-forward; collect it and
+      # clone from the slot once the ff advances main's tree (populate below).
+      if [ ! -e "$main_path/$sub/.git" ]; then
+        new_subs+=("$sub")
+        continue
+      fi
       local logbase="$outdir/m2s-${#sub_logs[@]}"
       sub_logs+=("$logbase")
       (
@@ -934,8 +954,11 @@ cmd_land() {
       ) >"$logbase.out" 2>"$logbase.err" &
       pids+=($!)
     done <<< "$moved"
-    for pid in "${pids[@]}"; do wait "$pid" || sub_failed=1; done
-    for logbase in "${sub_logs[@]}"; do
+    # `${arr[@]+...}` guards the empty-array expansion under `set -u` (bash 3.2)
+    # — every `moved` sub may be newly-introduced (collected into new_subs, no
+    # subshell spawned) or tag-excluded, leaving these arrays empty.
+    for pid in ${pids[@]+"${pids[@]}"}; do wait "$pid" || sub_failed=1; done
+    for logbase in ${sub_logs[@]+"${sub_logs[@]}"}; do
       [ -s "$logbase.out" ] && cat "$logbase.out"
       [ -s "$logbase.err" ] && cat "$logbase.err" >&2
     done
@@ -960,23 +983,29 @@ cmd_land() {
   local main_after
   main_after=$(git rev-parse main)
 
-  # Refresh slot's submodule working trees for gitlinks main brought in via
-  # the merge above. Without this, `git status` in the slot reports phantom
-  # rewinds for any submodule main advanced while the slot was branched off:
-  # the merge updates the slot's parent-tree gitlinks to main's, but the slot's
-  # submodule clone HEADs stay at the old SHAs. Mirror of the slot→main block
-  # above, inverted in direction.
-  #
-  # Cosmetic only — main is already advanced. Best-effort: each failure emits
-  # a WARN and continues; operator can finish manually with `git submodule
-  # update`. Local-only — fetch source is $main_path/$sub, never origin.
-  #
-  # Diffing slot_head_pre_merge → HEAD (the merge commit) directly yields the
-  # gitlinks 3-way merge picked from main's side — exactly the set where the
-  # slot's submodule clone needs refreshing. Slot's own moves cancel out in
-  # the diff (pre-merge HEAD already had them). `$2=="160000"` filters on dst
-  # mode → excludes deletions; additions in main are skipped below by the
-  # `.git` existence guard (slot has no clone for them yet).
+  # Populate main's clones of newly-introduced submodules. Step 12 collected
+  # those with no clone in main to fast-forward; now that the ff has advanced
+  # main's tree (recording their gitlinks + .gitmodules), clone each from the
+  # slot's populated clone — fully local, no network (see [[land-submodules.md]]).
+  # Non-fatal: main is already correctly advanced, so a failure warns with the
+  # exact recovery command rather than dying (mirrors step 14's best-effort
+  # contract).
+  if [ "${#new_subs[@]}" -gt 0 ]; then
+    local sub
+    for sub in ${new_subs[@]+"${new_subs[@]}"}; do
+      if _land_clone_sub_from_slot "$main_path" "$slot_path" "$sub"; then
+        echo "land: submodule $sub populated in main → $(git -C "$main_path/$sub" rev-parse --short HEAD 2>/dev/null)"
+      else
+        land_warn "new submodule '$sub' not populated in $main_path — finish with: git -C $main_path -c protocol.file.allow=always submodule update --init -- $sub"
+      fi
+    done
+  fi
+
+  # Refresh the slot's submodule clones to the gitlinks main brought in via the
+  # step-9 merge — without it `git status` shows phantom rewinds. Cosmetic (main
+  # already advanced): failures only WARN. Diffing slot_head_pre_merge→HEAD (the
+  # merge commit) yields exactly the gitlinks merged from main's side; the `.git`
+  # guard below skips additions the slot has no clone for. See [[land-submodules.md#the-phases]].
   local main_brought
   main_brought=$(git diff --raw "$slot_head_pre_merge" HEAD | awk '$2=="160000" {print $6}')
   if [ -n "$main_brought" ]; then
@@ -1024,8 +1053,8 @@ cmd_land() {
       ) >"$logbase.out" 2>"$logbase.err" &
       sub_pids+=($!)
     done <<< "$main_brought"
-    for pid in "${sub_pids[@]}"; do wait "$pid" || true; done
-    for logbase in "${sub_logs[@]}"; do
+    for pid in ${sub_pids[@]+"${sub_pids[@]}"}; do wait "$pid" || true; done
+    for logbase in ${sub_logs[@]+"${sub_logs[@]}"}; do
       [ -s "$logbase.out" ] && cat "$logbase.out"
       [ -s "$logbase.err" ] && cat "$logbase.err" >&2
     done
@@ -1539,6 +1568,7 @@ case "$verb" in
   cleanup) require_pool; cmd_cleanup "$@" ;;
   _exit_handler) require_pool; cmd__exit_handler "$@" ;;
   _land_preflight_submodules) _land_preflight_submodules "$@" ;;
+  _land_clone_sub_from_slot) _land_clone_sub_from_slot "$@" ;;
   sweep)   require_pool; cmd_sweep   "$@" ;;
   release) require_pool; cmd_release "$@" ;;
   orient)  cmd_orient  "$@" ;;
