@@ -14,8 +14,6 @@ macro_rules! str_newtype {
 
         impl $name {
             pub fn as_str(&self) -> &str { &self.0 }
-            #[allow(dead_code)] // not every newtype consumes into its String
-            pub fn into_string(self) -> String { self.0 }
         }
         impl fmt::Display for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(&self.0) }
@@ -88,6 +86,6 @@ mod tests {
     fn str_newtypes_roundtrip() {
         assert_eq!(SlotId::from("ios-0").as_str(), "ios-0");
         assert_eq!(GroupName::from("ios").to_string(), "ios");
-        assert_eq!(BranchName::from("feat-x".to_string()).into_string(), "feat-x");
+        assert_eq!(BranchName::from("feat-x".to_string()).as_str(), "feat-x");
     }
 }

@@ -129,10 +129,10 @@ struct Row {
 impl Row {
     fn fresh(id: crate::types::SlotId, group: Option<GroupName>) -> Self {
         Self {
-            id: id.into_string(),
+            id: id.to_string(),
             state: State::Fresh,
             name: "-".into(),
-            group: group.map(GroupName::into_string).unwrap_or_else(|| "-".into()),
+            group: group.map(|g| g.to_string()).unwrap_or_else(|| "-".into()),
             full_sha: "-".into(),
             dirty: "-".into(),
             untracked: "-".into(),

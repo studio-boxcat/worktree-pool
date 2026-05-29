@@ -159,20 +159,12 @@ land_die()  { printf 'land: %s\n' "$*" >&2; exit 1; }
 git_no_hooks() { git -c core.hooksPath=/dev/null "$@"; }
 
 
-# Populate <main_path>'s clone of a top-level submodule <sub> from the SLOT's
-# already-populated clone — fully local, no network. Used by `wt land` when a
-# feature branch introduces a brand-new submodule (or main's clone went
-# missing): the slot's clone holds the pinned gitlink SHA — including any
-# slot-local commits the declared origin has never seen — so a plain
-# `submodule update --init` (which clones from the remote `.gitmodules` URL)
-# would both reach the network and miss those commits. See [[land-submodules.md]].
-#
+# Populate <main_path>'s clone of a newly-introduced top-level submodule <sub>
+# from the SLOT's clone — local, no network (why: see [[land-submodules.md]]).
 # Mirrors acquire's two-phase config-write→update (src/submodules.rs): register
-# from `.gitmodules`, override the URL to the slot's local clone for the clone
-# itself, then restore the declared URL so the resulting origin survives the
-# slot being recycled. Must run AFTER the parent ff (main's tree must already
-# record <sub>'s gitlink + .gitmodules). Returns non-zero on any failure; the
-# caller warns (non-fatal — main is already advanced). Top-level only.
+# from `.gitmodules`, override the URL to the slot clone for the clone itself,
+# then restore the declared URL so origin survives slot recycling. Must run
+# AFTER the parent ff. Returns non-zero on failure; caller warns (non-fatal).
 _land_clone_sub_from_slot() {
   local main_path=$1 slot_path=$2 sub=$3 declared
   [ -e "$slot_path/$sub/.git" ] || return 1   # slot has nothing to clone from
