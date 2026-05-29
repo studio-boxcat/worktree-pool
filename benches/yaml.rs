@@ -1,7 +1,8 @@
 //! Microbench: YAML parse/serialize hot paths.
 //! Lock parsing happens N times during `ls`, same-SHA scan, and acquire's capacity check —
 //! worth keeping <10µs per call.
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 
 #[path = "../src/yaml.rs"]
 mod yaml;

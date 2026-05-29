@@ -1,4 +1,5 @@
-//! `ls` and `inspect` rendering.
+//! Read-only subcommands: `ls` (slot table, with optional parallel git status),
+//! `inspect` (one slot's git state), `path` (slot-id lookup).
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 

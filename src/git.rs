@@ -89,14 +89,14 @@ pub fn worktree_gitdir(slot: &Path) -> Result<PathBuf> {
     if let Ok(text) = std::fs::read_to_string(&gitlink)
         && let Some(rest) = text.strip_prefix("gitdir: ")
     {
-        let path = PathBuf::from(rest.trim());
-        return Ok(if path.is_absolute() {
-            path
-        } else {
-            slot.join(path)
-        });
+        return Ok(absolutize(PathBuf::from(rest.trim()), slot));
     }
     git_dir_abs(slot)
+}
+
+/// `path` as-is when absolute, else resolved against `base`.
+fn absolutize(path: PathBuf, base: &Path) -> PathBuf {
+    if path.is_absolute() { path } else { base.join(path) }
 }
 
 /// Resolve `source`'s own gitdir (the source repo's git directory; same as
@@ -108,8 +108,7 @@ pub fn source_gitdir(source: &Path) -> Result<PathBuf> {
 
 /// `git -C dir rev-parse --git-dir`, absolutized against `dir` when relative.
 fn git_dir_abs(dir: &Path) -> Result<PathBuf> {
-    let p = PathBuf::from(run(dir, &["rev-parse", "--git-dir"])?);
-    Ok(if p.is_absolute() { p } else { dir.join(p) })
+    Ok(absolutize(PathBuf::from(run(dir, &["rev-parse", "--git-dir"])?), dir))
 }
 
 /// `git -C source worktree add --detach <slot> <commit>`.

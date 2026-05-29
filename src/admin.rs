@@ -13,7 +13,7 @@ use crate::cli::UnstickArgs;
 use crate::config::PoolConfig;
 use crate::mutex;
 
-pub fn unstick(pool_root: &Path, _cfg: &PoolConfig, args: UnstickArgs) -> Result<()> {
+pub fn unstick(pool_root: &Path, args: UnstickArgs) -> Result<()> {
     let pool_mutex_path = crate::fs_paths::pool_mutex(pool_root);
     if pool_mutex_path.exists() {
         if mutex::is_held(&pool_mutex_path) {
@@ -71,7 +71,7 @@ pub fn unstick(pool_root: &Path, _cfg: &PoolConfig, args: UnstickArgs) -> Result
 
 /// Parse the source repo's `.gitmodules` and warn on unknown `worktreePool*` keys
 /// (typo guard — git silently accepts misspelled keys).
-pub fn validate_gitmodules(_pool_root: &Path, cfg: &PoolConfig) -> Result<()> {
+pub fn validate_gitmodules(cfg: &PoolConfig) -> Result<()> {
     let path = cfg.source.join(".gitmodules");
     if !path.exists() {
         println!("no .gitmodules at {} — nothing to validate", path.display());

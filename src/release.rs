@@ -44,6 +44,9 @@ fn release_tail(slot_path: &Path, name: &str) -> Result<()> {
             detach_err
         );
     }
+    // Best-effort: the branch may already be gone and there may be no `origin`
+    // (local-only model). The detach above is what makes the slot idle; ref
+    // deletion is just tidy-up, so failures here don't matter.
     let _ = git::branch_delete(slot_path, name);
     let _ = git::push_delete(slot_path, "origin", name);
 

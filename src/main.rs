@@ -57,7 +57,7 @@ fn run(cli: cli::Cli) -> Result<()> {
             }
             let cfg = config::load(&pool_path)
                 .with_context(|| format!("loading config for pool '{pool_key}'"))?;
-            dispatch(pool_key, &pool_path, &cfg, cmd)
+            dispatch(&pool_path, &cfg, cmd)
         }
     }
 }
@@ -91,7 +91,6 @@ fn cmd_init(pool_key: &str, pool_path: &std::path::Path, args: cli::InitArgs) ->
 }
 
 fn dispatch(
-    _pool_key: &str,
     pool_path: &std::path::Path,
     cfg: &config::PoolConfig,
     cmd: cli::Command,
@@ -104,7 +103,7 @@ fn dispatch(
         Ls(args) => dashboard::ls(pool_path, cfg, args),
         Inspect(args) => dashboard::inspect(pool_path, cfg, args),
         Path(args) => dashboard::path(pool_path, cfg, args),
-        Unstick(args) => admin::unstick(pool_path, cfg, args),
-        ValidateGitmodules => admin::validate_gitmodules(pool_path, cfg),
+        Unstick(args) => admin::unstick(pool_path, args),
+        ValidateGitmodules => admin::validate_gitmodules(cfg),
     }
 }

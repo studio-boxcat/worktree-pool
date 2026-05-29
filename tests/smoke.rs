@@ -1644,7 +1644,7 @@ fn session_land_refuses_when_main_has_in_progress_merge() {
         .args(["merge", "--no-edit", "side"]).output().unwrap();
     assert!(main_path.join(".git/MERGE_HEAD").exists()
         || run_git_capture(&main_path, &["rev-parse", "--git-path", "MERGE_HEAD"])
-              .lines().next().map_or(false, |p| std::path::Path::new(p).exists()),
+              .lines().next().is_some_and(|p| std::path::Path::new(p).exists()),
         "fixture failed to leave MERGE_HEAD");
 
     let out = acquire_dev(&key, "feat");

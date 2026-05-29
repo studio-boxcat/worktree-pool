@@ -2,9 +2,12 @@
 
 Deferred work for worktree-pool. See `CLAUDE.md` for the design contract.
 
-(Empty as of 2026-05-22 — all efficiency / hardening / API / lint / `wt
-land` / test-coverage items previously listed have shipped. New items go
-here as they're identified.)
+- **Domain newtypes for slot id / branch / group / full SHA** *(needs confirmation)* —
+  these recur as raw `String` across `acquire`, `release`, `slot`, `dashboard`,
+  `config`. Newtypes (`SlotId`, `BranchName`, `GroupName`, `FullSha`) would catch
+  mix-ups at compile time. Deferred because `groups` crosses the YAML config
+  serialization boundary (`config.rs`) — needs a round-trip test to confirm the
+  on-disk format is unchanged before adopting. Flagged by the 2026-05-29 audit.
 
 ## Won't-do (decided this session)
 

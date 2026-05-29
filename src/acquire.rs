@@ -159,6 +159,8 @@ fn print_capacity_error(pool_root: &Path, entries: &[slot::SlotEntry]) {
     }
 }
 
+// Best-effort rollback of a half-created worktree; the caller already propagates
+// the real `worktree_add` error, so cleanup failures must not mask it.
 fn cleanup_partial_worktree_add(source: &Path, slot: &Path) {
     let _ = git::worktree_remove(source, slot);
     let _ = std::fs::remove_dir_all(slot);
