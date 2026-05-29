@@ -1719,11 +1719,11 @@ fn session_land_serializes_parallel_lands_on_same_source() {
 
 #[test]
 fn session_land_refreshes_slot_submodule_when_main_brought_advance() {
-    // Step 10 (slot-direction refresh): slot A bumps the submodule + lands,
-    // slot B (branched before A landed) does unrelated parent-side work + lands.
-    // B's parent merge brings in main's new gitlink; B's submodule clone must
-    // be ff'd to match (no phantom rewinds in `git status`), attached to a
-    // branch (not left detached), and the ff must be journaled in reflog.
+    // Slot-direction refresh: slot A bumps the submodule + lands, slot B
+    // (branched before A landed) does unrelated parent-side work + lands. B's
+    // parent merge brings in main's new gitlink; B's submodule clone must be
+    // updated to match (no phantom rewinds in `git status`), and the move must
+    // be journaled in reflog. `submodule update` leaves it detached at the pin.
     let key = pool_key();
     let _c = Cleanup(key.clone());
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1760,10 +1760,6 @@ fn session_land_refreshes_slot_submodule_when_main_brought_advance() {
     let b_sub_head = run_git_capture(&slot_b_sub, &["rev-parse", "HEAD"]).trim().to_string();
     assert_eq!(b_sub_head, a_sub_tip,
         "slot-b's submodule HEAD should refresh to slot-a's sub tip");
-
-    let symref = run_git_capture(&slot_b_sub, &["symbolic-ref", "HEAD"]);
-    assert!(symref.starts_with("refs/heads/"),
-        "slot-b's submodule HEAD should be attached (symref), got: {symref:?}");
 
     let status = run_git_capture(&slot_b, &["status", "--porcelain"]);
     assert!(!status.lines().any(|l| l.contains(" sub")),
@@ -1978,10 +1974,12 @@ fn session_land_recovers_after_submodule_collision_resolved() {
 }
 
 #[test]
-fn session_land_attaches_detached_submodule_to_main() {
-    // `git submodule update` leaves submodules detached; without an explicit
-    // attach, ff-only would advance HEAD only and leave `main` ref lagging.
-    // Verifies the detached → main attach path before the ff-merge.
+fn session_land_advances_detached_submodule_in_main() {
+    // Failure mode 2 (detached variant): main's submodule clone is detached at
+    // the old pin; the slot advances the pin. Land fetches the new pin from the
+    // slot's clone (LOCAL — HEAD, not the superproject branch name, which the
+    // submodule clone lacks → the old "couldn't find remote ref" bug) and
+    // fast-forwards main's clone. Detached HEAD is fine; the clone reaches the pin.
     let key = pool_key();
     let _c = Cleanup(key.clone());
     let tmp = tempfile::TempDir::new().unwrap();
@@ -2002,6 +2000,9 @@ fn session_land_attaches_detached_submodule_to_main() {
     let slot_path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
     let slot_sub = slot_path.join("sub");
 
+    // Bump on a detached HEAD so the slot-name branch doesn't carry the new pin
+    // (reproduces the branch-name fetch bug — see session_land_advances_submodule_pin_bump).
+    run_git(&slot_sub, &["checkout", "--quiet", "--detach"]);
     std::fs::write(slot_sub.join("NEW"), b"x\n").unwrap();
     git_commit(&slot_sub, "x");
     git_commit(&slot_path, "bump sub");
@@ -2013,64 +2014,66 @@ fn session_land_attaches_detached_submodule_to_main() {
     let out = session_cmd_cwd(&slot_path, &["land"]).output().unwrap();
     assert_ok(&out, "land");
 
-    // HEAD must now be on refs/heads/main (re-attached).
-    let head_ref = StdCommand::new("git")
-        .args(["-C", &main_sub.display().to_string(), "symbolic-ref", "HEAD"])
+    // main's submodule clone advanced to the pinned commit (detached is fine).
+    let main_sub_head = StdCommand::new("git")
+        .args(["-C", &main_sub.display().to_string(), "rev-parse", "HEAD"])
         .output().unwrap();
-    assert!(head_ref.status.success(),
-        "main_sub HEAD is still detached after land");
-    assert_eq!(String::from_utf8_lossy(&head_ref.stdout).trim(), "refs/heads/main");
-
-    // And main ref must equal slot's submodule HEAD.
-    let main_ref_sha = StdCommand::new("git")
-        .args(["-C", &main_sub.display().to_string(), "rev-parse", "refs/heads/main"])
-        .output().unwrap();
-    assert_eq!(main_ref_sha.stdout, slot_sub_head.stdout);
+    assert_eq!(main_sub_head.stdout, slot_sub_head.stdout,
+        "main's submodule clone did not advance to the pinned SHA");
+    assert!(main_sub.join("NEW").exists(),
+        "the bumped submodule's new file did not land in main's clone");
 }
 
 #[test]
-fn session_land_attaches_detached_submodule_to_gitmodules_branch() {
-    // `.gitmodules` branch hint takes priority over the `main` fallback. If
-    // the submodule has `branch = release` declared, attach to release on
-    // detached HEAD, not main.
+fn session_land_advances_submodule_pin_bump() {
+    // Failure mode 2 (canonical): an existing submodule's pin is advanced in the
+    // slot to a commit main's clone has never seen. Land must fetch that commit
+    // LOCALLY from the slot's clone before fast-forwarding — the pre-fix code
+    // fetched the superproject branch name (absent in the submodule clone), so
+    // main's clone never got the SHA and the ancestry check reported "diverged".
     let key = pool_key();
     let _c = Cleanup(key.clone());
     let tmp = tempfile::TempDir::new().unwrap();
     make_fixture_with_submodule(tmp.path());
     let source = tmp.path().join("staging");
+    init_pool(&key, &source);
 
     let main_sub = source.join("sub");
-    let head_sha = StdCommand::new("git")
-        .args(["-C", &main_sub.display().to_string(), "rev-parse", "HEAD"])
-        .output().unwrap();
-    let sha = String::from_utf8_lossy(&head_sha.stdout).trim().to_string();
-    run_git(&main_sub, &["branch", "release", &sha]);
-    run_git(&source, &["config", "-f", ".gitmodules", "submodule.sub.branch", "release"]);
-    git_commit(&source, "track release branch for sub");
-    run_git(&source, &["push", "--quiet", "origin", "main"]);
-    run_git(&main_sub, &["checkout", "--quiet", "--detach", &sha]);
-
-    init_pool(&key, &source);
+    let old_pin = String::from_utf8_lossy(
+        &StdCommand::new("git").args(["-C", &main_sub.display().to_string(), "rev-parse", "HEAD"])
+            .output().unwrap().stdout).trim().to_string();
 
     let out = acquire_dev_sub(&key, "feat");
     assert_ok(&out, "acquire");
     let slot_path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
     let slot_sub = slot_path.join("sub");
 
-    std::fs::write(slot_sub.join("X"), b"x\n").unwrap();
-    git_commit(&slot_sub, "x");
-    git_commit(&slot_path, "bump sub");
+    // Advance the pin on a DETACHED HEAD so acquire's `<slot-name>` branch in
+    // the submodule clone does NOT carry the new commit. That's what reproduces
+    // the bug: the old code fetched that branch name (stale, missing the new
+    // SHA) → main's clone never got it → spurious "diverged". (Verified: this
+    // test fails on the pre-fix wt.)
+    run_git(&slot_sub, &["checkout", "--quiet", "--detach"]);
+    std::fs::write(slot_sub.join("BUMP"), b"bump\n").unwrap();
+    git_commit(&slot_sub, "advance pin");
+    git_commit(&slot_path, "bump sub pin");
+    let new_pin = String::from_utf8_lossy(
+        &StdCommand::new("git").args(["-C", &slot_sub.display().to_string(), "rev-parse", "HEAD"])
+            .output().unwrap().stdout).trim().to_string();
+    assert_ne!(old_pin, new_pin, "fixture: pin did not advance");
 
     let out = session_cmd_cwd(&slot_path, &["land"]).output().unwrap();
     assert_ok(&out, "land");
 
-    let head_ref = StdCommand::new("git")
-        .args(["-C", &main_sub.display().to_string(), "symbolic-ref", "HEAD"])
-        .output().unwrap();
-    assert!(head_ref.status.success(), "main_sub HEAD detached after land");
-    assert_eq!(String::from_utf8_lossy(&head_ref.stdout).trim(),
-               "refs/heads/release",
-               "expected attach to release per .gitmodules, not main");
+    // main's clone advanced to the new pin (no "diverged", no "couldn't find remote ref").
+    let main_sub_now = String::from_utf8_lossy(
+        &StdCommand::new("git").args(["-C", &main_sub.display().to_string(), "rev-parse", "HEAD"])
+            .output().unwrap().stdout).trim().to_string();
+    assert_eq!(main_sub_now, new_pin, "main's submodule clone did not advance to the new pin");
+    assert!(main_sub.join("BUMP").exists(), "the bumped commit's file is missing from main's clone");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("couldn't find remote ref"),
+        "land hit the branch-name fetch bug: {stderr}");
 }
 
 #[test]
@@ -2200,144 +2203,6 @@ fn session_land_populates_newly_introduced_submodule_in_main() {
     ).trim().to_string();
     assert_eq!(origin, vendor_bare.display().to_string(),
         "main's submodule origin should be the declared URL, not the slot clone");
-}
-
-
-/// Unit-style test for `_land_preflight_submodules`: invoke it directly via
-/// the hidden wt subcommand, with a pre-built diverged-submodule scenario.
-/// Bypasses cmd_land's preconditions (main_dirty status check etc.) that
-/// make a full-integration test structurally impossible — see TODO.md.
-#[test]
-fn land_preflight_refuses_diverged_submodule_clones() {
-    let key = pool_key();
-    let _c = Cleanup(key.clone());
-    let tmp = tempfile::TempDir::new().unwrap();
-    make_fixture_with_submodule(tmp.path());
-    let bare = tmp.path().join("source.git");
-
-    let clone = |dst: &Path| {
-        run_git_root(&[
-            "clone", "--quiet",
-            &bare.display().to_string(),
-            &dst.display().to_string(),
-        ]);
-        run_git(
-            dst,
-            &["-c", "protocol.file.allow=always", "submodule", "update", "--init"],
-        );
-    };
-
-    // Two independent clones of the source.
-    let main_repo = tmp.path().join("main-repo");
-    clone(&main_repo);
-    let slot_repo = tmp.path().join("slot-repo");
-    clone(&slot_repo);
-
-    let main_before = String::from_utf8_lossy(
-        &StdCommand::new("git").args(["-C", &main_repo.display().to_string(), "rev-parse", "HEAD"])
-            .output().unwrap().stdout).trim().to_string();
-
-    // Slot side: branch `feat-x` in slot/sub, commit, bump parent gitlink.
-    let slot_sub = slot_repo.join("sub");
-    run_git(&slot_sub, &["checkout", "--quiet", "-b", "feat-x"]);
-    std::fs::write(slot_sub.join("FROM_SLOT"), b"slot side\n").unwrap();
-    git_commit(&slot_sub, "slot-side commit");
-    git_commit(&slot_repo, "bump sub");
-    let slot_head = String::from_utf8_lossy(
-        &StdCommand::new("git").args(["-C", &slot_repo.display().to_string(), "rev-parse", "HEAD"])
-            .output().unwrap().stdout).trim().to_string();
-
-    // Main side: branch `main-side` in main/sub, commit (diverges from B
-    // sharing only the original A as ancestor). Don't bump parent gitlink —
-    // we deliberately leave main's tree at the original (the preflight only
-    // cares about the clone HEADs).
-    let main_sub = main_repo.join("sub");
-    run_git(&main_sub, &["checkout", "--quiet", "-b", "main-side"]);
-    std::fs::write(main_sub.join("FROM_MAIN"), b"main side\n").unwrap();
-    git_commit(&main_sub, "main-side commit");
-
-    let out = session_cmd(
-        &key,
-        &[
-            "_land_preflight_submodules",
-            &main_before,
-            &slot_head,
-            &main_repo.display().to_string(),
-            &slot_repo.display().to_string(),
-            "feat-x",
-        ],
-    )
-    .output()
-    .unwrap();
-    assert!(!out.status.success(),
-        "preflight must refuse on diverged clones; stdout={}\nstderr={}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr));
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("diverged"),
-        "expected divergence message; got: {stderr}");
-    assert!(stderr.contains("preflight failed"),
-        "expected final summary line; got: {stderr}");
-}
-
-/// Positive case for `_land_preflight_submodules`: main's clone stays at
-/// the original commit (ancestor of slot's tip), so preflight passes.
-/// Locks the "no false positive" half of the contract.
-#[test]
-fn land_preflight_passes_when_main_clone_is_ancestor() {
-    let key = pool_key();
-    let _c = Cleanup(key.clone());
-    let tmp = tempfile::TempDir::new().unwrap();
-    make_fixture_with_submodule(tmp.path());
-    let bare = tmp.path().join("source.git");
-
-    let clone = |dst: &Path| {
-        run_git_root(&[
-            "clone", "--quiet",
-            &bare.display().to_string(),
-            &dst.display().to_string(),
-        ]);
-        run_git(
-            dst,
-            &["-c", "protocol.file.allow=always", "submodule", "update", "--init"],
-        );
-    };
-    let main_repo = tmp.path().join("main-repo");
-    clone(&main_repo);
-    let slot_repo = tmp.path().join("slot-repo");
-    clone(&slot_repo);
-
-    let main_before = String::from_utf8_lossy(
-        &StdCommand::new("git").args(["-C", &main_repo.display().to_string(), "rev-parse", "HEAD"])
-            .output().unwrap().stdout).trim().to_string();
-
-    // Slot bumps sub (B descends from A); main stays at A.
-    let slot_sub = slot_repo.join("sub");
-    run_git(&slot_sub, &["checkout", "--quiet", "-b", "feat-x"]);
-    std::fs::write(slot_sub.join("FROM_SLOT"), b"slot side\n").unwrap();
-    git_commit(&slot_sub, "slot-side commit");
-    git_commit(&slot_repo, "bump sub");
-    let slot_head = String::from_utf8_lossy(
-        &StdCommand::new("git").args(["-C", &slot_repo.display().to_string(), "rev-parse", "HEAD"])
-            .output().unwrap().stdout).trim().to_string();
-
-    let out = session_cmd(
-        &key,
-        &[
-            "_land_preflight_submodules",
-            &main_before,
-            &slot_head,
-            &main_repo.display().to_string(),
-            &slot_repo.display().to_string(),
-            "feat-x",
-        ],
-    )
-    .output()
-    .unwrap();
-    assert!(out.status.success(),
-        "preflight must pass when main is ancestor of slot; stdout={}\nstderr={}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr));
 }
 
 #[test]
