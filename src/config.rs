@@ -2,14 +2,14 @@
 use anyhow::{Context, Result, anyhow, bail};
 use std::path::{Path, PathBuf};
 
-use crate::types::GroupName;
+use crate::types::{CommitIsh, GroupName};
 use crate::{atomic, cli, fs_paths, yaml};
 
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
     pub schema_version: u32,
     pub source: PathBuf,
-    pub default_commit: String,
+    pub default_commit: CommitIsh,
     pub max_slots: u32,
     pub groups: Vec<GroupName>,
     pub submodule_mirror_mode: Option<cli::SubmoduleMirrorMode>,
@@ -32,7 +32,7 @@ impl PoolConfig {
         Ok(Self {
             schema_version: SCHEMA_VERSION,
             source: args.source.clone(),
-            default_commit: args.default_commit.clone(),
+            default_commit: CommitIsh::from(args.default_commit.as_str()),
             max_slots: args.max_slots,
             groups: args.groups.iter().map(|g| GroupName::from(g.as_str())).collect(),
             submodule_mirror_mode: args.submodule_mirror_mode,
@@ -54,7 +54,7 @@ impl PoolConfig {
         yaml::serialize(&[
             ("schema_version", self.schema_version.to_string()),
             ("source", self.source.display().to_string()),
-            ("default_commit", self.default_commit.clone()),
+            ("default_commit", self.default_commit.as_str().to_string()),
             ("max_slots", self.max_slots.to_string()),
             ("groups", self.groups.iter().map(GroupName::as_str).collect::<Vec<_>>().join(",")),
             ("submodule_mirror_mode", mode),
@@ -79,7 +79,7 @@ impl PoolConfig {
         let default_commit = map
             .get("default_commit")
             .filter(|s| !s.is_empty())
-            .cloned()
+            .map(|s| CommitIsh::from(s.as_str()))
             .ok_or_else(|| anyhow!("config missing `default_commit`"))?;
         let max_slots = map
             .get("max_slots")
@@ -154,7 +154,7 @@ mod tests {
         let parsed = PoolConfig::parse(&s).unwrap();
         assert_eq!(parsed.max_slots, 16);
         assert_eq!(parsed.groups, vec![GroupName::from("ios"), GroupName::from("android")]);
-        assert_eq!(parsed.default_commit, "refs/remotes/origin/main");
+        assert_eq!(parsed.default_commit, CommitIsh::from("refs/remotes/origin/main"));
         assert_eq!(
             parsed.submodule_mirror_mode,
             Some(cli::SubmoduleMirrorMode::GitModules)

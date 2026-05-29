@@ -42,6 +42,11 @@ str_newtype!(
     /// A pool group (e.g. `ios`, `android`). Persisted in `config.yaml`'s `groups`.
     GroupName
 );
+str_newtype!(
+    /// A git commit-ish (branch, tag, ref, or SHA) — the pool's `default_commit`
+    /// and `acquire --commit`. Resolved to a [`FullSha`] before use.
+    CommitIsh
+);
 
 /// A full 40-hex-char git commit SHA (`git rev-parse`), used for same-SHA
 /// exclusion. Validated at construction so `short()` can't panic.

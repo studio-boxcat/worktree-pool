@@ -2,9 +2,7 @@
 
 Deferred work for worktree-pool. See `CLAUDE.md` for the design contract.
 
-(Empty — the domain-newtype item shipped: `src/types.rs` defines `SlotId`,
-`BranchName`, `GroupName`, `FullSha`, threaded through the modules; the config
-round-trip tests confirm the on-disk `groups` format is unchanged.)
+(none)
 
 ## Won't-do (decided this session)
 
