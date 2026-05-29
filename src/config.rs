@@ -2,6 +2,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use std::path::{Path, PathBuf};
 
+use crate::types::GroupName;
 use crate::{atomic, cli, fs_paths, yaml};
 
 #[derive(Debug, Clone)]
@@ -10,7 +11,7 @@ pub struct PoolConfig {
     pub source: PathBuf,
     pub default_commit: String,
     pub max_slots: u32,
-    pub groups: Vec<String>,
+    pub groups: Vec<GroupName>,
     pub submodule_mirror_mode: Option<cli::SubmoduleMirrorMode>,
     pub submodule_mirror_base: Option<PathBuf>,
 }
@@ -33,7 +34,7 @@ impl PoolConfig {
             source: args.source.clone(),
             default_commit: args.default_commit.clone(),
             max_slots: args.max_slots,
-            groups: args.groups.clone(),
+            groups: args.groups.iter().map(|g| GroupName::from(g.as_str())).collect(),
             submodule_mirror_mode: args.submodule_mirror_mode,
             submodule_mirror_base: args.submodule_mirror_base.clone(),
         })
@@ -55,7 +56,7 @@ impl PoolConfig {
             ("source", self.source.display().to_string()),
             ("default_commit", self.default_commit.clone()),
             ("max_slots", self.max_slots.to_string()),
-            ("groups", self.groups.join(",")),
+            ("groups", self.groups.iter().map(GroupName::as_str).collect::<Vec<_>>().join(",")),
             ("submodule_mirror_mode", mode),
             ("submodule_mirror_base", base),
         ])
@@ -87,7 +88,7 @@ impl PoolConfig {
         let groups = map
             .get("groups")
             .filter(|s| !s.is_empty())
-            .map(|s| s.split(',').map(str::trim).map(String::from).collect())
+            .map(|s| s.split(',').map(str::trim).map(GroupName::from).collect())
             .unwrap_or_default();
         let submodule_mirror_mode = match map.get("submodule_mirror_mode").map(String::as_str) {
             Some("bare-mirror") => Some(cli::SubmoduleMirrorMode::BareMirror),
@@ -152,7 +153,7 @@ mod tests {
         let s = cfg.serialize();
         let parsed = PoolConfig::parse(&s).unwrap();
         assert_eq!(parsed.max_slots, 16);
-        assert_eq!(parsed.groups, vec!["ios", "android"]);
+        assert_eq!(parsed.groups, vec![GroupName::from("ios"), GroupName::from("android")]);
         assert_eq!(parsed.default_commit, "refs/remotes/origin/main");
         assert_eq!(
             parsed.submodule_mirror_mode,

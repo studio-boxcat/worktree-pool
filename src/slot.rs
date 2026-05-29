@@ -9,18 +9,24 @@ use std::path::{Path, PathBuf};
 
 use crate::config::PoolConfig;
 use crate::git;
+use crate::types::{BranchName, GroupName, SlotId};
+
+/// `cfg.groups` rendered as `ios, android` for diagnostics.
+fn groups_list(cfg: &PoolConfig) -> String {
+    cfg.groups.iter().map(GroupName::as_str).collect::<Vec<_>>().join(", ")
+}
 
 /// Canonical idle slot id: `{group}-{N}` when grouped, else `slot-{N}`.
-pub fn canonical_id(group: Option<&str>, n: u32) -> String {
+pub fn canonical_id(group: Option<&GroupName>, n: u32) -> SlotId {
     match group {
-        Some(g) => format!("{g}-{n}"),
-        None => format!("slot-{n}"),
+        Some(g) => SlotId::from(format!("{}-{n}", g.as_str())),
+        None => SlotId::from(format!("slot-{n}")),
     }
 }
 
 /// Resolve the group to use for an acquire. If pool has groups, defaults to the first.
 /// Validates that the requested group is one of the configured groups.
-pub fn resolve_group<'a>(cfg: &'a PoolConfig, requested: Option<&str>) -> Result<Option<&'a str>> {
+pub fn resolve_group<'a>(cfg: &'a PoolConfig, requested: Option<&str>) -> Result<Option<&'a GroupName>> {
     if cfg.groups.is_empty() {
         if requested.is_some() {
             bail!("pool has no groups configured; --group is not allowed");
@@ -29,15 +35,12 @@ pub fn resolve_group<'a>(cfg: &'a PoolConfig, requested: Option<&str>) -> Result
     }
     match requested {
         Some(g) => match cfg.groups.iter().find(|x| x.as_str() == g) {
-            Some(found) => Ok(Some(found.as_str())),
-            None => bail!(
-                "unknown group '{g}'; pool's groups: {}",
-                cfg.groups.join(", ")
-            ),
+            Some(found) => Ok(Some(found)),
+            None => bail!("unknown group '{g}'; pool's groups: {}", groups_list(cfg)),
         },
         None => {
-            let first = cfg.groups[0].as_str();
-            eprintln!("--group not given; defaulting to '{first}' (first of: {})", cfg.groups.join(", "));
+            let first = &cfg.groups[0];
+            eprintln!("--group not given; defaulting to '{first}' (first of: {})", groups_list(cfg));
             Ok(Some(first))
         }
     }
@@ -61,14 +64,14 @@ pub struct Acquirable {
 /// and are surfaced here as acquirable — reusing them eats down the surplus.
 pub fn acquirable(
     pool_root: &Path,
-    group: Option<&str>,
+    group: Option<&GroupName>,
     max_slots: u32,
     entries: &[SlotEntry],
 ) -> Vec<Acquirable> {
     let mut out: Vec<Acquirable> = Vec::new();
     for n in 0..max_slots {
         let id = canonical_id(group, n);
-        let p = pool_root.join(&id);
+        let p = pool_root.join(id.as_str());
         if !p.exists() {
             out.push(Acquirable { n, is_fresh: true });
         } else if !is_held_at(&p) {
@@ -76,7 +79,7 @@ pub fn acquirable(
         }
     }
     for entry in entries {
-        if entry.group.as_deref() == group
+        if entry.group.as_ref() == group
             && entry.n >= max_slots
             && !is_held_at(&entry.path)
         {
@@ -103,10 +106,10 @@ pub fn is_held_at(path: &Path) -> bool {
 }
 
 /// Count held slots in `group` — canonical slots whose HEAD is on a branch.
-pub fn count_held_in_group(entries: &[SlotEntry], group: Option<&str>) -> usize {
+pub fn count_held_in_group(entries: &[SlotEntry], group: Option<&GroupName>) -> usize {
     entries
         .iter()
-        .filter(|e| e.group.as_deref() == group && is_held_at(&e.path))
+        .filter(|e| e.group.as_ref() == group && is_held_at(&e.path))
         .count()
 }
 
@@ -116,12 +119,12 @@ pub fn count_held_in_group(entries: &[SlotEntry], group: Option<&str>) -> usize 
 pub fn find_by_name(
     pool_root: &Path,
     cfg: &PoolConfig,
-    name: &str,
+    name: &BranchName,
 ) -> Result<Option<SlotEntry>> {
     for entry in enumerate(pool_root, cfg)? {
         // `current_branch` is None on detached (idle) HEAD, so the name match
         // alone implies held — no separate `is_held_at` read needed.
-        if git::current_branch(&entry.path).as_deref() == Some(name) {
+        if git::current_branch(&entry.path).as_deref() == Some(name.as_str()) {
             return Ok(Some(entry));
         }
     }
@@ -153,7 +156,7 @@ pub fn enumerate(pool_root: &Path, cfg: &PoolConfig) -> Result<Vec<SlotEntry>> {
             continue;
         };
         out.push(SlotEntry {
-            id: name,
+            id: SlotId::from(name),
             path,
             group,
             n,
@@ -165,21 +168,21 @@ pub fn enumerate(pool_root: &Path, cfg: &PoolConfig) -> Result<Vec<SlotEntry>> {
 #[derive(Debug, Clone)]
 pub struct SlotEntry {
     /// Canonical id — same as path basename.
-    pub id: String,
+    pub id: SlotId,
     pub path: PathBuf,
-    pub group: Option<String>,
+    pub group: Option<GroupName>,
     pub n: u32,
 }
 
 /// Parse `{group}-{N}` (grouped) or `slot-{N}` (groupless) into (group, n).
 /// None when the name doesn't match the pool's canonical shape.
-fn classify(name: &str, cfg: &PoolConfig) -> Option<(Option<String>, u32)> {
+fn classify(name: &str, cfg: &PoolConfig) -> Option<(Option<GroupName>, u32)> {
     if cfg.groups.is_empty() {
         let n = name.strip_prefix("slot-")?.parse::<u32>().ok()?;
         return Some((None, n));
     }
     for g in &cfg.groups {
-        if let Some(rest) = name.strip_prefix(&format!("{g}-"))
+        if let Some(rest) = name.strip_prefix(&format!("{}-", g.as_str()))
             && let Ok(n) = rest.parse::<u32>()
         {
             return Some((Some(g.clone()), n));
@@ -212,9 +215,11 @@ mod tests {
 
     #[test]
     fn canonical_id_shapes() {
-        assert_eq!(canonical_id(Some("ios"), 0), "ios-0");
-        assert_eq!(canonical_id(Some("android"), 15), "android-15");
-        assert_eq!(canonical_id(None, 7), "slot-7");
+        let ios = GroupName::from("ios");
+        let android = GroupName::from("android");
+        assert_eq!(canonical_id(Some(&ios), 0).as_str(), "ios-0");
+        assert_eq!(canonical_id(Some(&android), 15).as_str(), "android-15");
+        assert_eq!(canonical_id(None, 7).as_str(), "slot-7");
     }
 
     #[test]

@@ -10,6 +10,7 @@ use std::path::Path;
 
 use crate::cli::ReleaseArgs;
 use crate::config::PoolConfig;
+use crate::types::BranchName;
 use crate::{fs_paths, git, mutex, slot, submodules};
 
 pub fn run(pool_root: &Path, cfg: &PoolConfig, args: ReleaseArgs) -> Result<()> {
@@ -18,7 +19,8 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: ReleaseArgs) -> Result<()> 
 
     // Lookup order: branch name (normal), then canonical slot id (operator
     // addressing a held slot by its on-disk id).
-    if let Some(entry) = slot::find_by_name(pool_root, cfg, &args.name)? {
+    let branch = BranchName::from(args.name.as_str());
+    if let Some(entry) = slot::find_by_name(pool_root, cfg, &branch)? {
         return release_tail(&entry.path, &args.name);
     }
     let path = pool_root.join(&args.name);

@@ -8,6 +8,7 @@ use crate::bail_exit;
 use crate::cli::AcquireArgs;
 use crate::config::PoolConfig;
 use crate::exit::ExitKind;
+use crate::types::{BranchName, FullSha, GroupName, SlotId};
 use crate::{fs_paths, git, mutex, parallel, slot, submodules};
 
 pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> {
@@ -33,7 +34,7 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> 
             ExitKind::UniqueSha,
             "acquire --unique-sha failed: full_sha {} already held by slot '{}' (branch '{}').\n\
              Wait for it, reuse its output, or run: worktree-pool --pool <key> release {}",
-            &full_sha[..8],
+            full_sha.short(),
             holder.slot_id,
             holder.branch,
             holder.branch
@@ -47,16 +48,16 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> 
             ExitKind::Capacity,
             "all {} {} slots are held",
             cfg.max_slots,
-            group.unwrap_or("(no group)")
+            group.map(GroupName::as_str).unwrap_or("(no group)")
         );
     }
 
     let candidates = slot::acquirable(pool_root, group, cfg.max_slots, &entries);
 
-    let mut acquired: Option<(slot::Acquirable, String, mutex::FileLock)> = None;
+    let mut acquired: Option<(slot::Acquirable, SlotId, mutex::FileLock)> = None;
     for cand in candidates {
         let id = slot::canonical_id(group, cand.n);
-        let mutex_path = fs_paths::init_mutex(pool_root, &id);
+        let mutex_path = fs_paths::init_mutex(pool_root, id.as_str());
         if let Some(m) = mutex::FileLock::try_acquire(mutex_path)? {
             acquired = Some((cand, id, m));
             break;
@@ -69,11 +70,11 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> 
              run `worktree-pool --pool <key> unstick` to inspect"
         );
     };
-    let canonical_path = pool_root.join(&slot_id);
+    let canonical_path = pool_root.join(slot_id.as_str());
 
     // Materialize the slot at full_sha. Fresh → `worktree add`; recycled → `reset --hard`.
     if cand.is_fresh {
-        if let Err(e) = git::worktree_add(&cfg.source, &canonical_path, &full_sha) {
+        if let Err(e) = git::worktree_add(&cfg.source, &canonical_path, full_sha.as_str()) {
             cleanup_partial_worktree_add(&cfg.source, &canonical_path);
             return Err(e);
         }
@@ -98,7 +99,7 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> 
         // Recycled slot: just `reset --hard`. Don't `git clean` — untracked files
         // (Unity Library/, node_modules/, build outputs) are caller warmth the pool
         // exists to preserve. The build system invalidates its own caches.
-        git::reset_hard(&canonical_path, &full_sha)?;
+        git::reset_hard(&canonical_path, full_sha.as_str())?;
     }
 
     // Branch creation flips idle → held. If we crash between worktree-add/
@@ -123,11 +124,11 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> 
 }
 
 struct Holder {
-    slot_id: String,
-    branch: String,
+    slot_id: SlotId,
+    branch: BranchName,
 }
 
-fn find_same_sha_holder(entries: &[slot::SlotEntry], full_sha: &str) -> Option<Holder> {
+fn find_same_sha_holder(entries: &[slot::SlotEntry], full_sha: &FullSha) -> Option<Holder> {
     // Parallel read: each entry needs a current_branch + rev-parse spawn.
     // Under the pool mutex, doing this serially blocks all other acquires;
     // the parallel version cuts ~5x on 8-slot pools.
@@ -136,12 +137,12 @@ fn find_same_sha_holder(entries: &[slot::SlotEntry], full_sha: &str) -> Option<H
         // as the held-gate — no separate `is_held_at` read needed.
         let branch = git::current_branch(&entry.path)?;
         let sha = git::run(&entry.path, &["rev-parse", "HEAD"]).ok()?;
-        if sha != full_sha {
+        if sha != full_sha.as_str() {
             return None;
         }
         Some(Holder {
             slot_id: entry.id.clone(),
-            branch,
+            branch: BranchName::from(branch),
         })
     })
     .into_iter()

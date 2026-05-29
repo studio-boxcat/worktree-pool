@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::{InspectArgs, LsArgs, PathArgs};
 use crate::config::PoolConfig;
+use crate::types::{BranchName, GroupName};
 use crate::{git, parallel, slot};
 
 pub fn ls(pool_root: &Path, cfg: &PoolConfig, args: LsArgs) -> Result<()> {
@@ -17,16 +18,16 @@ pub fn ls(pool_root: &Path, cfg: &PoolConfig, args: LsArgs) -> Result<()> {
 
     // Add unmaterialized canonical slots up to max_slots so the table reflects capacity.
     let present: std::collections::HashSet<String> =
-        entries.iter().map(|e| e.id.clone()).collect();
-    let groups_for_listing: Vec<Option<String>> = if cfg.groups.is_empty() {
+        entries.iter().map(|e| e.id.to_string()).collect();
+    let groups_for_listing: Vec<Option<GroupName>> = if cfg.groups.is_empty() {
         vec![None]
     } else {
         cfg.groups.iter().map(|g| Some(g.clone())).collect()
     };
     for g in &groups_for_listing {
         for n in 0..cfg.max_slots {
-            let id = slot::canonical_id(g.as_deref(), n);
-            if !present.contains(&id) {
+            let id = slot::canonical_id(g.as_ref(), n);
+            if !present.contains(id.as_str()) {
                 rows.push(Row::fresh(id, g.clone()));
             }
         }
@@ -63,7 +64,8 @@ pub fn ls(pool_root: &Path, cfg: &PoolConfig, args: LsArgs) -> Result<()> {
 }
 
 pub fn path(pool_root: &Path, cfg: &PoolConfig, args: PathArgs) -> Result<()> {
-    let Some(entry) = slot::find_by_name(pool_root, cfg, &args.name)? else {
+    let name = BranchName::from(args.name.as_str());
+    let Some(entry) = slot::find_by_name(pool_root, cfg, &name)? else {
         // Empty stderr + exit 1 so callers can `if wp path X >/dev/null; then`.
         std::process::exit(1);
     };
@@ -72,7 +74,8 @@ pub fn path(pool_root: &Path, cfg: &PoolConfig, args: PathArgs) -> Result<()> {
 }
 
 pub fn inspect(pool_root: &Path, cfg: &PoolConfig, args: InspectArgs) -> Result<()> {
-    let entry = slot::find_by_name(pool_root, cfg, &args.name)?.ok_or_else(|| {
+    let name = BranchName::from(args.name.as_str());
+    let entry = slot::find_by_name(pool_root, cfg, &name)?.ok_or_else(|| {
         anyhow::anyhow!(
             "no held slot with branch '{}' in {}",
             args.name,
@@ -124,12 +127,12 @@ struct Row {
 }
 
 impl Row {
-    fn fresh(id: String, group: Option<String>) -> Self {
+    fn fresh(id: crate::types::SlotId, group: Option<GroupName>) -> Self {
         Self {
-            id,
+            id: id.into_string(),
             state: State::Fresh,
             name: "-".into(),
-            group: group.unwrap_or_else(|| "-".into()),
+            group: group.map(GroupName::into_string).unwrap_or_else(|| "-".into()),
             full_sha: "-".into(),
             dirty: "-".into(),
             untracked: "-".into(),
@@ -142,7 +145,7 @@ impl Row {
 fn build_row(entry: &slot::SlotEntry) -> Row {
     let branch = git::current_branch(&entry.path);
     let state = if branch.is_some() { State::Held } else { State::Idle };
-    let group = entry.group.clone().unwrap_or_else(|| "-".into());
+    let group = entry.group.as_ref().map(GroupName::as_str).unwrap_or("-").to_string();
     let name = branch.unwrap_or_else(|| "-".into());
 
     let full_sha = if state == State::Held {
@@ -154,7 +157,7 @@ fn build_row(entry: &slot::SlotEntry) -> Row {
     };
 
     Row {
-        id: entry.id.clone(),
+        id: entry.id.to_string(),
         state,
         name,
         group,

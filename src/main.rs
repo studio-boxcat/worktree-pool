@@ -14,6 +14,7 @@ mod parallel;
 mod release;
 mod slot;
 mod submodules;
+mod types;
 mod yaml;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -74,7 +75,7 @@ fn cmd_init(pool_key: &str, pool_path: &std::path::Path, args: cli::InitArgs) ->
     let groups = if cfg.groups.is_empty() {
         "none".to_string()
     } else {
-        cfg.groups.join(",")
+        cfg.groups.iter().map(types::GroupName::as_str).collect::<Vec<_>>().join(",")
     };
     let mirror = match (cfg.submodule_mirror_mode, &cfg.submodule_mirror_base) {
         (Some(m), Some(b)) => format!(", submodule_mirror={}@{}", m.as_str(), b.display()),

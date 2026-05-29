@@ -2,12 +2,9 @@
 
 Deferred work for worktree-pool. See `CLAUDE.md` for the design contract.
 
-- **Domain newtypes for slot id / branch / group / full SHA** *(needs confirmation)* —
-  these recur as raw `String` across `acquire`, `release`, `slot`, `dashboard`,
-  `config`. Newtypes (`SlotId`, `BranchName`, `GroupName`, `FullSha`) would catch
-  mix-ups at compile time. Deferred because `groups` crosses the YAML config
-  serialization boundary (`config.rs`) — needs a round-trip test to confirm the
-  on-disk format is unchanged before adopting. Flagged by the 2026-05-29 audit.
+(Empty — the domain-newtype item shipped: `src/types.rs` defines `SlotId`,
+`BranchName`, `GroupName`, `FullSha`, threaded through the modules; the config
+round-trip tests confirm the on-disk `groups` format is unchanged.)
 
 ## Won't-do (decided this session)
 

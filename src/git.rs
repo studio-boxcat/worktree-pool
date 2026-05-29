@@ -5,6 +5,8 @@ use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use crate::types::FullSha;
+
 /// Run `git <args>` with `-C cwd`, capture stdout+stderr. Returns the trimmed stdout
 /// on success; on non-zero exit, returns an error including the stderr.
 pub fn run(cwd: &Path, args: &[&str]) -> Result<String> {
@@ -71,10 +73,11 @@ pub fn config_file_list(cwd: &Path, file: &Path) -> Result<String> {
 /// We tried both `gix` and `git2` (vendored libgit2). Both shaved ~10 ms off `acquire`
 /// (1 spawn eliminated) but penalized `ls` and `release` startup. See da8b429 commit
 /// message for the full 3-way profile matrix.
-pub fn resolve_full_sha(source: &Path, commitish: &str) -> Result<String> {
+pub fn resolve_full_sha(source: &Path, commitish: &str) -> Result<FullSha> {
     let arg = format!("{commitish}^{{commit}}");
-    run(source, &["rev-parse", "--verify", &arg])
-        .with_context(|| format!("resolving '{commitish}' in {}", source.display()))
+    let sha = run(source, &["rev-parse", "--verify", &arg])
+        .with_context(|| format!("resolving '{commitish}' in {}", source.display()))?;
+    FullSha::parse(sha).with_context(|| format!("'{commitish}' did not resolve to a full SHA"))
 }
 
 /// Returns the absolute path of the worktree's gitdir
