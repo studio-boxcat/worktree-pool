@@ -1066,6 +1066,36 @@ fn post_acquire_hook_fires_in_slot() {
     );
 }
 
+/// A chatty hook must not pollute stdout: build-pool callers parse acquire's
+/// stdout as the slot path, so the hook's stdout is routed to stderr. stdout
+/// must be exactly the slot path even when the hook echoes.
+#[test]
+fn post_acquire_hook_stdout_does_not_pollute_path() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture_with_hook(
+        tmp.path(),
+        "wt_post_acquire() { echo noise-on-stdout; }\n",
+    );
+    init_pool(&key, &bare);
+
+    let out = acquire_dev(&key, "feat-chatty");
+    assert_ok(&out, "acquire with chatty hook");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // stdout is a single line — the slot path — with no hook noise.
+    assert!(!stdout.contains("noise-on-stdout"),
+        "hook stdout leaked into acquire stdout: {stdout}");
+    assert_eq!(stdout.lines().count(), 1,
+        "acquire stdout must be exactly the slot path; got: {stdout}");
+    assert!(stdout.trim().ends_with("/ios-0"),
+        "stdout should be the canonical slot path; got: {stdout}");
+    // The hook's chatter landed on stderr instead.
+    assert!(stderr.contains("noise-on-stdout"),
+        "hook stdout should be redirected to stderr; stderr: {stderr}");
+}
+
 /// A failing `wt_post_acquire` is fail-loud: acquire exits non-zero (the gate
 /// that stops a rejecting hook from yielding a usable slot).
 #[test]

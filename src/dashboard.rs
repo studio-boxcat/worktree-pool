@@ -245,7 +245,7 @@ fn print_table(rows: &[Row], with_git: bool) {
         cells
             .iter()
             .zip(&widths)
-            .map(|(c, w)| format!("{c:<w$}", c = c, w = w))
+            .map(|(c, w)| format!("{c:<w$}"))
             .collect::<Vec<_>>()
             .join("  ")
     };

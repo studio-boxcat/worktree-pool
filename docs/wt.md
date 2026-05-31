@@ -74,8 +74,14 @@ WT_LAUNCHER="ai --chrome"
 
 # Fired by core on every fresh acquire (incl. direct `worktree-pool acquire`).
 # Runs in the slot; gate first-time-only setup on a freshly created worktree.
+# The body runs under `set -e` (a non-zero return REJECTS the acquire), so use
+# an `if` block rather than `cond && cmd` — the latter returns 1 as the last
+# statement on a recycled (WT_FRESH=0) slot and would fail every warm acquire.
+# Write only to stderr; stdout is reserved for the slot path acquire emits.
 wt_post_acquire() {
-  [ "$WT_FRESH" = 1 ] && cp "$HOME/.config/myapp/local.env" "$WT_PATH/.env"
+  if [ "$WT_FRESH" = 1 ]; then
+    cp "$HOME/.config/myapp/local.env" "$WT_PATH/.env"
+  fi
 }
 wt_pre_go() {
   cd "$WT_PATH/app" && bun install --silent

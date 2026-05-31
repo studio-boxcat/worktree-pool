@@ -123,7 +123,10 @@ pub fn run(pool_key: &str, pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs
     // the slot with the WT_* contract; fires for direct `worktree-pool acquire`
     // (build pools) as well as `wt go`. Fail-loud + BEFORE the path is printed,
     // so a rejecting hook — e.g. langpack `ensure` on a stale release pin —
-    // fails the acquire rather than yielding a usable slot.
+    // fails the acquire rather than yielding a usable slot. On failure the slot
+    // is already HELD (branch created above), so — mirroring the submodule path
+    // — we leave it HELD and hand the caller a release breadcrumb rather than
+    // silently leaking the slot.
     hooks::fire(
         "wt_post_acquire",
         &canonical_path,
@@ -131,7 +134,13 @@ pub fn run(pool_key: &str, pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs
         args.name.as_str(),
         cand.is_fresh,
     )
-    .context("post-acquire hook failed")?;
+    .with_context(|| {
+        format!(
+            "post-acquire hook failed for slot '{slot_id}' (branch '{name}'); slot is left HELD. \
+             Recover: `worktree-pool --pool <key> release {name}`.",
+            name = args.name
+        )
+    })?;
 
     println!("{}", canonical_path.display());
     Ok(())

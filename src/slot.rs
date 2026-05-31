@@ -195,6 +195,17 @@ fn classify(name: &str, cfg: &PoolConfig) -> Option<(Option<GroupName>, u32)> {
 mod tests {
     use super::*;
 
+    /// Materialize an idle/held slot dir at `<root>/<name>` with a sibling fake
+    /// gitdir whose `HEAD` holds `head` (`ref: ...` = held, raw SHA = idle).
+    fn fake_slot(root: &Path, name: &str, head: &str) {
+        let slot = root.join(name);
+        std::fs::create_dir(&slot).unwrap();
+        let gitdir = root.join(format!("{name}-gitdir"));
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(slot.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+        std::fs::write(gitdir.join("HEAD"), head).unwrap();
+    }
+
     fn cfg_grouped() -> PoolConfig {
         PoolConfig {
             schema_version: 1,
@@ -252,12 +263,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         // slot-0 idle on disk (.git gitlink resolves, HEAD detached);
         // slot-1 fresh (no dir).
-        let slot0 = tmp.path().join("slot-0");
-        std::fs::create_dir(&slot0).unwrap();
-        let gitdir = tmp.path().join("fake-gitdir");
-        std::fs::create_dir_all(&gitdir).unwrap();
-        std::fs::write(gitdir.join("HEAD"), "0000000000000000000000000000000000000000\n").unwrap();
-        std::fs::write(slot0.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+        fake_slot(tmp.path(), "slot-0", "0000000000000000000000000000000000000000\n");
         let v = acquirable(tmp.path(), None, 2, &[]);
         assert_eq!(v.iter().map(|a| (a.n, a.is_fresh)).collect::<Vec<_>>(),
                    vec![(0, false), (1, true)]);
@@ -266,13 +272,8 @@ mod tests {
     #[test]
     fn acquirable_skips_held() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let slot0 = tmp.path().join("slot-0");
-        std::fs::create_dir(&slot0).unwrap();
-        let gitdir = tmp.path().join("fake-gitdir");
-        std::fs::create_dir_all(&gitdir).unwrap();
-        std::fs::write(slot0.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
         // HEAD on a branch = held.
-        std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/my-feature\n").unwrap();
+        fake_slot(tmp.path(), "slot-0", "ref: refs/heads/my-feature\n");
 
         let v = acquirable(tmp.path(), None, 3, &[]);
         assert_eq!(v.iter().map(|a| a.n).collect::<Vec<_>>(), vec![1, 2]);
@@ -281,13 +282,8 @@ mod tests {
     #[test]
     fn is_held_treats_empty_head_as_held() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let slot = tmp.path().join("slot-0");
-        std::fs::create_dir(&slot).unwrap();
-        let gitdir = tmp.path().join("fake-gitdir");
-        std::fs::create_dir_all(&gitdir).unwrap();
-        std::fs::write(slot.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
         // Empty HEAD = corruption → conservative held (don't stomp).
-        std::fs::write(gitdir.join("HEAD"), "").unwrap();
-        assert!(is_held_at(&slot));
+        fake_slot(tmp.path(), "slot-0", "");
+        assert!(is_held_at(&tmp.path().join("slot-0")));
     }
 }

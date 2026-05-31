@@ -5,7 +5,7 @@
 //! wrapper-only hooks (go / cleanup / land); core fires the hooks for verbs
 //! that are core commands — today just `acquire` (`wt_post_acquire`), so the
 //! hook runs for direct `worktree-pool acquire` (CI / build pools) as well as
-//! a fresh `wt go`.
+//! a fresh `wt go`. See [[docs/wt.md#hooks-sourcewt-hookssh]] for the contract.
 //!
 //! The file is read from the **acquired slot's checkout** — not the source —
 //! because the source may be bare (CLAUDE.md: source can be bare or working
@@ -40,13 +40,30 @@ pub fn fire(
     if !hooks_file.exists() {
         return Ok(());
     }
-    // Source the file FIRST, *outside* `set -e` — a benign non-zero top-level
-    // statement in `.wt-hooks.sh` (e.g. a `command -v foo` guard) must not abort
-    // the acquire when the target hook itself is fine. This matches `wt`'s
-    // `source_hooks` (which sources without `set -e`). Only the hook *body* runs
-    // under `set -e`, so a failing command inside it still surfaces.
+    // Reserve stdout for acquire's path line: `exec 1>&2` routes the hook's
+    // stdout to stderr so a chatty hook can't pollute what build-pool callers
+    // parse (acquire prints the slot path on stdout *after* this returns).
+    //
+    // `bash -n` rejects a *syntactically* broken hooks file loud — otherwise
+    // `source` aborts mid-file, the function is never defined, the `declare -F`
+    // guard skips it, and the acquire would succeed with a gate hook that never
+    // ran (silent bypass).
+    //
+    // Then source the file *outside* `set -e` — a benign non-zero top-level
+    // statement (e.g. a `command -v foo` guard) must not abort when the target
+    // hook itself is fine; matches `wt`'s `source_hooks`. The hook *body* runs
+    // *under* `set -e`: wt_post_acquire is a fail-loud GATE (it may reject the
+    // acquire), unlike `wt`'s best-effort wrapper hooks — a deliberate asymmetry.
+    //
+    // `hook_name` is a crate-internal literal (safe to interpolate); the slot
+    // path is passed via the `$WT_HOOKS_FILE` env var, never interpolated, since
+    // it is not a literal.
     let script = format!(
-        "source \"$WT_HOOKS_FILE\"; set -e; \
+        "exec 1>&2; \
+         if ! bash -n \"$WT_HOOKS_FILE\"; then \
+           echo \"worktree-pool: {hook_name}: .wt-hooks.sh has a syntax error\"; exit 1; \
+         fi; \
+         source \"$WT_HOOKS_FILE\"; set -e; \
          if declare -F {hook_name} >/dev/null 2>&1; then {hook_name}; fi"
     );
     let status = Command::new("bash")
@@ -105,14 +122,33 @@ mod tests {
         let slot = tmp.path().join("slot");
         fs::create_dir(&slot).unwrap();
         // The hook file lives in the slot checkout (core reads it from there).
-        // Relative `out` proves cwd == slot; the body captures the WT_* contract.
+        // Relative `out` proves cwd == slot; the body captures the full WT_*
+        // contract including WT_PATH (the export the path-isolation relies on).
         fs::write(
             slot.join(HOOKS_FILE),
-            "wt_post_acquire() { printf '%s|%s|%s' \"$WT_KEY\" \"$WT_NAME\" \"$WT_FRESH\" > out; }\n",
+            "wt_post_acquire() { printf '%s|%s|%s|%s' \"$WT_KEY\" \"$WT_NAME\" \"$WT_FRESH\" \"$WT_PATH\" > out; }\n",
         )
         .unwrap();
         fire("wt_post_acquire", &slot, "mykey", "myname", true).unwrap();
-        assert_eq!(fs::read_to_string(slot.join("out")).unwrap(), "mykey|myname|1");
+        assert_eq!(
+            fs::read_to_string(slot.join("out")).unwrap(),
+            format!("mykey|myname|1|{}", slot.display())
+        );
+    }
+
+    #[test]
+    fn malformed_file_is_error() {
+        // A syntax error means `source` aborts and the function is never defined.
+        // Without the `bash -n` guard this would be a silent no-op (Ok), bypassing
+        // a gate hook — so it must surface as a hard error (fail-loud contract).
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join(HOOKS_FILE),
+            "wt_post_acquire() { echo (broken; }\n",
+        )
+        .unwrap();
+        let err = fire("wt_post_acquire", tmp.path(), "k", "n", true).unwrap_err();
+        assert!(format!("{err:#}").contains("wt_post_acquire"));
     }
 
     #[test]

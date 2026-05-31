@@ -17,15 +17,15 @@ use crate::cli::SubmoduleMirrorMode;
 use crate::config::PoolConfig;
 use crate::{fs_paths, git, mutex};
 
-#[derive(Debug, Clone)]
-pub struct SubmoduleEntry {
-    pub name: String,
-    pub path: String,
-    pub url: String,
-    pub tags: Vec<String>,
+#[derive(Debug)]
+struct SubmoduleEntry {
+    name: String,
+    path: String,
+    url: String,
+    tags: Vec<String>,
 }
 
-pub fn parse_gitmodules(slot_dir: &Path) -> Result<Vec<SubmoduleEntry>> {
+fn parse_gitmodules(slot_dir: &Path) -> Result<Vec<SubmoduleEntry>> {
     let gitmodules_path = slot_dir.join(".gitmodules");
     if !gitmodules_path.exists() {
         return Ok(Vec::new());
@@ -84,7 +84,7 @@ fn parse_gitmodules_text(raw: &str) -> Result<Vec<SubmoduleEntry>> {
 /// `name_scope` is the prefix under `<source>/.git/modules/` for nested submodules
 /// (`""` at top level, `<parent_composed>/modules` for nested levels — this mirrors
 /// git's per-worktree storage convention).
-pub fn rewrite_url(
+fn rewrite_url(
     cfg: &PoolConfig,
     submodule_name: &str,
     declared_url: &str,
@@ -111,7 +111,7 @@ pub fn rewrite_url(
 }
 
 /// Extract `<org>/<repo>` from `git@host:org/repo[.git]`, `scheme://host/org/repo[.git]`.
-pub fn extract_org_repo(url: &str) -> Option<String> {
+fn extract_org_repo(url: &str) -> Option<String> {
     let trimmed = url.strip_suffix(".git").unwrap_or(url);
 
     // URL-style first — contains `://`.

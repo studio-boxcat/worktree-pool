@@ -61,7 +61,7 @@ Per-host `init` runs once per pool key. Source path differs by host (build serve
 
 ## Build / development
 
-- Code lives in `src/`; one module per concern (`acquire`, `release`, `slot`, `mutex`, `submodules`, `parallel`, `dashboard`, `admin`, `doctor`, `exit`). `parallel` wraps `std::thread::scope` with inline-fallback on OS thread-create failure (`Scope::spawn` panics under thread starvation; `panic = "abort"` would otherwise kill the process mid-release). Exposes `for_each`, `try_for_each`, and `map` (order-preserving collector). `exit` defines distinct exit codes for retry-aware callers — see [[docs/cli.md#exit-codes]].
+- Code lives in `src/`; one module per concern (e.g. `acquire`, `release`, `slot`, `mutex`, `submodules`, `parallel`, `dashboard`, `admin`, `doctor`, `exit`, `hooks` — `src/` is the source of truth). `parallel` wraps `std::thread::scope` with inline-fallback on OS thread-create failure (`Scope::spawn` panics under thread starvation; `panic = "abort"` would otherwise kill the process mid-release). Exposes `for_each`, `try_for_each`, and `map` (order-preserving collector). `exit` defines distinct exit codes for retry-aware callers — see [[docs/cli.md#exit-codes]].
 - Hand-rolled YAML in `yaml.rs` — line-oriented scalars only. `serde_yaml` is unmaintained; ~30 LOC suffices.
 - `git` operations shell out via `git.rs`. Slot identity is the canonical path; the user-given name is just a branch ref. No rename, no `git worktree move`, no submodule admin self-heal.
 - Atomic writes via `tempfile::NamedTempFile::persist` (handles EXDEV across volumes).
