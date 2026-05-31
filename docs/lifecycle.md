@@ -27,7 +27,8 @@ resolution; cheap vs. the cache rebuild cost.
 7. Force-create branch: `git -C <slot> update-ref refs/heads/NAME HEAD && symbolic-ref HEAD refs/heads/NAME`. **This flips idle → held.** (Avoids `git checkout -B`'s 600ms of per-file filter-process pings on a tree that's already at the right state.)
 8. Drop pool-wide mutex.
 9. Submodule update, two-phase: (a) sequential `git config submodule.<name>.url` writes per submodule wrapped in a per-source mutex (`<source-gitdir>/worktree-pool-config.lock`) so parallel acquires across pools sharing a source don't fight on `<source>/.git/config`'s `O_EXCL` lockfile; (b) parallel per-submodule `git submodule update <path>` via `parallel::try_for_each` (inline-fallback on OS thread-create failure), then `update-ref refs/heads/NAME HEAD && symbolic-ref HEAD refs/heads/NAME` to attach each submodule to a branch matching the parent slot's name. Each top-level worker recurses into its nested `.gitmodules` end-to-end so the full submodule tree fans out in parallel, not just the top level. Tag exclusion via `--exclude-submodule-tags` against `worktreePoolTag` in `.gitmodules`.
-10. Drop init mutex (flock released on file close); print canonical path on stdout (last line).
+10. Fire the `wt_post_acquire` hook in the slot if the source ships `.wt-hooks.sh` (`src/hooks.rs`). Fail-loud — a non-zero hook fails the acquire before any path is printed, so a rejecting hook (e.g. a stale-pin check) never yields a usable slot. Runs for direct `worktree-pool acquire` (build pools) as well as `wt go`. See [[wt.md#hooks-sourcewt-hookssh]].
+11. Drop init mutex (flock released on file close); print canonical path on stdout (last line).
 
 ## `release NAME`
 

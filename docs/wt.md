@@ -52,28 +52,34 @@ Acquire removes a leftover `git index.lock` in the slot it recycles, right befor
 
 ## Hooks (`<source>/.wt-hooks.sh`)
 
-If the source repo has a `.wt-hooks.sh` at its toplevel, `wt` sources it before each lifecycle verb runs. Define any subset of these bash functions to extend behavior; all are optional. Every hook sees `$WT_KEY`, `$WT_NAME`, `$WT_PATH`, `$WT_FRESH` (1=fresh acquire, 0=resume) in env.
+If the source repo has a `.wt-hooks.sh` at its toplevel, the named bash functions below extend lifecycle verbs. Define any subset; all are optional. Every hook sees `$WT_KEY`, `$WT_NAME`, `$WT_PATH` in env, plus `$WT_FRESH` — but note the two firers carry **different axes** in `WT_FRESH`: for `wt`-fired hooks it's acquire-vs-resume (`1`=fresh acquire, `0`=resume of an existing slot); for the core-fired `wt_post_acquire` it's slot-materialization (`1`=freshly created worktree with cold caches, `0`=recycled warm slot). Branch on it accordingly.
 
-| Function | When | Failure semantics |
-|---|---|---|
-| `wt_pre_go` | After acquire/resume, before launching the shell | Non-zero aborts launch (set -e); EXIT trap then fires `cleanup` |
-| `wt_pre_release` | After safety checks pass, before `release` | Best-effort (errors don't block release) |
-| `wt_pre_cleanup` | Before the cleanup classifier runs | Best-effort |
-| `wt_post_cleanup` | After classifier, only on the green/recycled path | Best-effort |
-| `wt_post_land` | After `land` succeeds; sees `$WT_MAIN_BEFORE` / `$WT_MAIN_AFTER` (full SHAs) | Best-effort |
+**Who fires what.** `wt_post_acquire` is fired by **worktree-pool core** (`src/hooks.rs`), so it runs for a direct `worktree-pool acquire` (CI / build pools) *and* on a fresh `wt go` acquire. It does **not** fire on `wt go` *resume* — resume reuses the existing slot without calling `acquire`. The rest are wrapper-only verbs (`go` shell-launch, `cleanup`, `land`) and are fired by `wt`, which sources `.wt-hooks.sh` before each. Core reads `.wt-hooks.sh` from the **acquired slot's checkout** (so it works for bare sources too and reflects the acquired commit's hook); `wt` sources it from the source worktree.
+
+| Function | Fired by | When | Failure semantics |
+|---|---|---|---|
+| `wt_post_acquire` | core | After a slot is acquired (fresh `acquire`, not `wt go` resume), in the slot, before the path is printed; `$WT_FRESH`=1 means a freshly created worktree (cold caches) | **Non-zero fails the acquire** (no path emitted) |
+| `wt_pre_go` | wt | After acquire/resume, before launching the shell | Non-zero aborts launch (set -e); EXIT trap then fires `cleanup` |
+| `wt_pre_cleanup` | wt | Before the cleanup classifier runs | Best-effort |
+| `wt_post_cleanup` | wt | After classifier, only on the green/recycled path | Best-effort |
+| `wt_post_land` | wt | After `land` succeeds; sees `$WT_MAIN_BEFORE` / `$WT_MAIN_AFTER` (full SHAs) | Best-effort |
 
 Hook scripts may also set the `WT_LAUNCHER` variable (default `ai`) to override the launcher invocation — receives `-n <name>` and `--continue` (on resume) appended.
 
-Example minimal hooks file replacing the previous `WORKTREE_POOL_SESSION_*` pattern:
+Example minimal hooks file:
 
 ```bash
 # <source>/.wt-hooks.sh
 WT_LAUNCHER="ai --chrome"
 
+# Fired by core on every fresh acquire (incl. direct `worktree-pool acquire`).
+# Runs in the slot; gate first-time-only setup on a freshly created worktree.
+wt_post_acquire() {
+  [ "$WT_FRESH" = 1 ] && cp "$HOME/.config/myapp/local.env" "$WT_PATH/.env"
+}
 wt_pre_go() {
   cd "$WT_PATH/app" && bun install --silent
 }
-wt_pre_release() { just _dev-stop "$WT_NAME" || true; }
 wt_pre_cleanup() { just _dev-stop "$WT_NAME" || true; }
 wt_post_cleanup() { rm -f "$WT_PATH.log"; }
 wt_post_land() {

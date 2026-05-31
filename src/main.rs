@@ -9,6 +9,7 @@ mod doctor;
 mod exit;
 mod fs_paths;
 mod git;
+mod hooks;
 mod mutex;
 mod parallel;
 mod release;
@@ -58,7 +59,7 @@ fn run(cli: cli::Cli) -> Result<()> {
             }
             let cfg = config::load(&pool_path)
                 .with_context(|| format!("loading config for pool '{pool_key}'"))?;
-            dispatch(&pool_path, &cfg, cmd)
+            dispatch(pool_key, &pool_path, &cfg, cmd)
         }
     }
 }
@@ -92,6 +93,7 @@ fn cmd_init(pool_key: &str, pool_path: &std::path::Path, args: cli::InitArgs) ->
 }
 
 fn dispatch(
+    pool_key: &str,
     pool_path: &std::path::Path,
     cfg: &config::PoolConfig,
     cmd: cli::Command,
@@ -99,7 +101,7 @@ fn dispatch(
     use cli::Command::*;
     match cmd {
         Init(_) | Doctor => unreachable!("handled in run()"),
-        Acquire(args) => acquire::run(pool_path, cfg, args),
+        Acquire(args) => acquire::run(pool_key, pool_path, cfg, args),
         Release(args) => release::run(pool_path, cfg, args),
         Ls(args) => dashboard::ls(pool_path, cfg, args),
         Inspect(args) => dashboard::inspect(pool_path, cfg, args),

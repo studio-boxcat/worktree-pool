@@ -1015,6 +1015,80 @@ fn parallel_submodule_init_acquires_all() {
     );
 }
 
+// ---------- wt_post_acquire hook (core-fired) ----------
+
+/// Like `make_fixture`, but also commits a `.wt-hooks.sh` carrying `hook_body`
+/// into the source. Core reads the hook from the *slot checkout* (not the
+/// source worktree) — so the file MUST be committed to be present after acquire.
+/// This is precisely why slot-read works for bare sources: the bare `source.git`
+/// has no working tree, but the committed file lands in every slot checkout.
+fn make_fixture_with_hook(dir: &Path, hook_body: &str) -> PathBuf {
+    let bare = dir.join("source.git");
+    run_git_root(&["init", "--quiet", "--bare", &bare.display().to_string()]);
+    let staging = dir.join("staging");
+    run_git_root(&[
+        "clone",
+        "--quiet",
+        &bare.display().to_string(),
+        &staging.display().to_string(),
+    ]);
+    std::fs::write(staging.join("README"), b"hi").unwrap();
+    std::fs::write(staging.join(".wt-hooks.sh"), hook_body.as_bytes()).unwrap();
+    git_commit(&staging, "initial with hook");
+    run_git(&staging, &["push", "--quiet", "-u", "origin", "main"]);
+    bare
+}
+
+/// A defined `wt_post_acquire` fires in the slot after acquire: its marker lands
+/// in the slot checkout, acquire still succeeds, and stdout is the slot path.
+#[test]
+fn post_acquire_hook_fires_in_slot() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    // Relative `HOOK_MARKER` proves cwd == slot; body captures the WT_* contract.
+    let bare = make_fixture_with_hook(
+        tmp.path(),
+        "wt_post_acquire() { printf '%s|%s' \"$WT_KEY\" \"$WT_NAME\" > HOOK_MARKER; }\n",
+    );
+    init_pool(&key, &bare);
+
+    let out = acquire_dev(&key, "feat-hook");
+    assert_ok(&out, "acquire with hook");
+    let slot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+
+    let marker = slot.join("HOOK_MARKER");
+    assert!(marker.exists(), "hook marker missing in slot: {}", marker.display());
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap(),
+        format!("{key}|feat-hook"),
+        "hook saw wrong WT_KEY/WT_NAME contract"
+    );
+}
+
+/// A failing `wt_post_acquire` is fail-loud: acquire exits non-zero (the gate
+/// that stops a rejecting hook from yielding a usable slot).
+#[test]
+fn post_acquire_hook_failure_fails_acquire() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture_with_hook(tmp.path(), "wt_post_acquire() { exit 1; }\n");
+    init_pool(&key, &bare);
+
+    let out = acquire_dev(&key, "feat-reject");
+    assert!(
+        !out.status.success(),
+        "acquire must fail when wt_post_acquire exits non-zero; stdout={}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("wt_post_acquire") || stderr.contains("post-acquire hook"),
+        "expected post-acquire hook failure message; got: {stderr}"
+    );
+}
+
 // ---------- wt (bash wrapper) ----------
 
 fn session_script() -> PathBuf {

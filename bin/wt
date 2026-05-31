@@ -30,7 +30,6 @@
 # $WT_KEY $WT_NAME $WT_PATH $WT_FRESH (1=fresh acquire, 0=resume) in env:
 #
 #   wt_pre_go       — runs after acquire/resume, before launching the shell
-#   wt_pre_release  — runs after safety checks, before `release`
 #   wt_pre_cleanup  — runs before the cleanup classifier
 #   wt_post_cleanup — runs after classifier, only on the green/recycled path
 #   wt_post_land    — runs after land succeeds; sees $WT_MAIN_BEFORE/$WT_MAIN_AFTER
@@ -1100,9 +1099,6 @@ cmd_release() {
       fi
     fi
   fi
-
-  # Pre-release hook (e.g. dev-server stop). Best-effort.
-  fire_hook wt_pre_release 0 || true
 
   # Remote branch delete is delegated to release.rs's silent push_delete
   # (best-effort).

@@ -9,9 +9,9 @@ use crate::cli::AcquireArgs;
 use crate::config::PoolConfig;
 use crate::exit::ExitKind;
 use crate::types::{BranchName, FullSha, GroupName, SlotId};
-use crate::{fs_paths, git, mutex, parallel, slot, submodules};
+use crate::{fs_paths, git, hooks, mutex, parallel, slot, submodules};
 
-pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> {
+pub fn run(pool_key: &str, pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> {
     let group = slot::resolve_group(cfg, args.group.as_deref())?;
     let commitish = args
         .commit
@@ -118,6 +118,20 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> 
             name = args.name
         )
     })?;
+
+    // Post-acquire hook (if the slot's checkout ships `.wt-hooks.sh`). Runs in
+    // the slot with the WT_* contract; fires for direct `worktree-pool acquire`
+    // (build pools) as well as `wt go`. Fail-loud + BEFORE the path is printed,
+    // so a rejecting hook — e.g. langpack `ensure` on a stale release pin —
+    // fails the acquire rather than yielding a usable slot.
+    hooks::fire(
+        "wt_post_acquire",
+        &canonical_path,
+        pool_key,
+        args.name.as_str(),
+        cand.is_fresh,
+    )
+    .context("post-acquire hook failed")?;
 
     println!("{}", canonical_path.display());
     Ok(())

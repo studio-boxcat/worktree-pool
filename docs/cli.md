@@ -51,6 +51,11 @@ worktree-pool doctor
 chosen canonical slot. For `release`/`inspect`/`path`, it's the lookup key —
 the tool scans held slots and matches by branch name.
 
+`acquire` fires the `wt_post_acquire` hook if the source ships `.wt-hooks.sh` —
+runs in the slot, fail-loud (a non-zero hook fails the acquire before the path
+is printed), so build pools using `worktree-pool acquire` directly get the same
+extension point as `wt go`. See [[wt.md#hooks-sourcewt-hookssh]].
+
 `unstick` is a read-only diagnostic now: it reports whether each init mutex
 file is currently locked by a live process. With OS-managed flocks
 (`std::fs::File::try_lock`, stable since Rust 1.89) the kernel
