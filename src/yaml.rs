@@ -42,6 +42,11 @@ pub fn parse(text: &str) -> BTreeMap<String, String> {
 
 #[cfg(test)]
 mod tests {
+    // `benches/yaml.rs` pulls this file in via `#[path]`; in that build the
+    // `#[test]` bodies are stripped but this `use` survives, so it reads as
+    // unused there (it is used in the normal `cargo test` build). Allow it
+    // rather than split the tests out for a bench-only lint.
+    #[allow(unused_imports)]
     use super::*;
 
     #[test]

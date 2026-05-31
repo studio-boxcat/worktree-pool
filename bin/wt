@@ -199,8 +199,8 @@ inside_dir() {
 # liveness + mtime fallback for crashed holders — macOS ships no `flock(1)`, so
 # this ~40-LOC PID+mtime scheme stands in for it. Released explicitly on:
 #   - normal completion, and
-#   - conflict-exit at step 6 — operator's pause is potentially long, so we
-#     drop the lock and re-acquire on resume.
+#   - conflict-exit on the `git merge main` halt — operator's pause is
+#     potentially long, so we drop the lock and re-acquire on resume.
 # Both paths use the EXIT trap below so signals + early `exit 1` always clear.
 #
 # Stale threshold = 5 min. Legitimate hold spans seconds (lock → pre-flight →
@@ -581,9 +581,9 @@ cmd__exit_handler() {
 }
 
 # Land slot's commits onto local main: auto-commit dirty work, ff main → slot HEAD.
-# Bidirectional submodule sync: slot→main (gating; step 8) and main→slot working
-# tree (cosmetic; step 10). Local-only — never fetches origin, never pushes, never
-# opens a PR. See docs/wt.md §Land flow.
+# Bidirectional submodule sync: slot→main (gating) and main→slot working tree
+# (cosmetic). Local-only — never fetches origin, never pushes, never opens a PR.
+# See [[docs/wt.md#land-flow]] for the authoritative, numbered step list.
 cmd_land() {
   set -e
   local msg="${1:-}"
@@ -651,12 +651,12 @@ cmd_land() {
   land_lock_acquire "$main_path"
   trap 'land_lock_release' EXIT
 
-  # In-progress check on main worktree + its top-level submodules. Step-8 (slot
-  # → main submodule propagation) and step-9 (parent ff) write to these clones;
-  # an unfinished rebase/merge there would surface as a confusing mid-flow
-  # failure with no precise hint. Refuse early with a per-path recovery hint.
-  # Skip nested (step 8 is top-level only) and skip slot's submodules (step 10
-  # is cosmetic best-effort).
+  # In-progress check on main worktree + its top-level submodules. The slot→main
+  # submodule-clone advance and the parent ff below write to these clones; an
+  # unfinished rebase/merge there would surface as a confusing mid-flow failure
+  # with no precise hint. Refuse early with a per-path recovery hint. Skip nested
+  # (the submodule advance is top-level only) and skip the slot's own submodules
+  # (the slot-side refresh is cosmetic best-effort).
   local main_marker_failed=0
   report_in_progress "$main_path" || main_marker_failed=1
   while IFS= read -r sub_path; do
@@ -666,7 +666,7 @@ cmd_land() {
   done < <(submodule_paths "$main_path")
   [ "$main_marker_failed" = 0 ] || exit 1
 
-  # Tracked-uncommitted check only: `merge --ff-only` (step 13) refuses on
+  # Tracked-uncommitted check only: the parent `merge --ff-only` refuses on
   # untracked-overwrite, and `--ignore-submodules=untracked` lets land proceed
   # alongside dirty content inside submodules. The `awk` drops `??` (untracked) rows.
   local main_dirty
@@ -882,7 +882,7 @@ cmd_land() {
   done
 
   # Refresh the slot's submodule clones to the gitlinks main brought in via the
-  # step-9 merge — without it `git status` shows phantom rewinds. Fetch each pin
+  # `git merge main` above — without it `git status` shows phantom rewinds. Fetch each pin
   # LOCALLY from main's clone (HEAD = the pin), then `submodule update` checks
   # them out. Cosmetic — main is already advanced — so failures only WARN.
   # Diffing slot_head_pre_merge→HEAD yields the gitlinks merged from main's side;
