@@ -588,6 +588,25 @@ fn parallel_unique_sha_at_most_one_succeeds() {
 
 // ---------- submodule rename regression ----------
 
+/// Build a standalone bare repo at `<dir>/<name>.git` with a single committed
+/// `FILE` containing `content`; returns the bare path. The leaf submodule-source
+/// pattern shared by the submodule fixture builders below.
+fn make_sub_bare(dir: &Path, name: &str, content: &str) -> PathBuf {
+    let sub_bare = dir.join(format!("{name}.git"));
+    run_git_root(&["init", "--quiet", "--bare", &sub_bare.display().to_string()]);
+    let sub_staging = dir.join(format!("{name}-staging"));
+    run_git_root(&[
+        "clone",
+        "--quiet",
+        &sub_bare.display().to_string(),
+        &sub_staging.display().to_string(),
+    ]);
+    std::fs::write(sub_staging.join("FILE"), content.as_bytes()).unwrap();
+    git_commit(&sub_staging, "init");
+    run_git(&sub_staging, &["push", "--quiet", "-u", "origin", "main"]);
+    sub_bare
+}
+
 /// Make a bare repo whose tip commit registers a submodule. Returns the parent bare.
 ///
 /// Layout:
@@ -595,18 +614,7 @@ fn parallel_unique_sha_at_most_one_succeeds() {
 ///   <dir>/source.git        (bare parent source, one commit with .gitmodules + sub/)
 fn make_fixture_with_submodule(dir: &Path) -> PathBuf {
     // Submodule source.
-    let sub_bare = dir.join("sub.git");
-    run_git_root(&["init", "--quiet", "--bare", &sub_bare.display().to_string()]);
-    let sub_staging = dir.join("sub-staging");
-    run_git_root(&[
-        "clone",
-        "--quiet",
-        &sub_bare.display().to_string(),
-        &sub_staging.display().to_string(),
-    ]);
-    std::fs::write(sub_staging.join("FILE"), b"sub-content").unwrap();
-    git_commit(&sub_staging, "sub initial");
-    run_git(&sub_staging, &["push", "--quiet", "-u", "origin", "main"]);
+    let sub_bare = make_sub_bare(dir, "sub", "sub-content");
 
     // Parent source.
     let bare = dir.join("source.git");
@@ -648,17 +656,7 @@ fn make_fixture_with_submodule(dir: &Path) -> PathBuf {
 ///   <dir>/source.git   (registers outer as a submodule at `outer/`)
 fn make_fixture_with_nested_submodule(dir: &Path) -> PathBuf {
     // Innermost bare.
-    let inner_bare = dir.join("inner.git");
-    run_git_root(&["init", "--quiet", "--bare", &inner_bare.display().to_string()]);
-    let inner_staging = dir.join("inner-staging");
-    run_git_root(&[
-        "clone", "--quiet",
-        &inner_bare.display().to_string(),
-        &inner_staging.display().to_string(),
-    ]);
-    std::fs::write(inner_staging.join("FILE"), b"inner-content").unwrap();
-    git_commit(&inner_staging, "inner init");
-    run_git(&inner_staging, &["push", "--quiet", "-u", "origin", "main"]);
+    let inner_bare = make_sub_bare(dir, "inner", "inner-content");
 
     // Outer bare with nested inner.
     let outer_bare = dir.join("outer.git");
@@ -759,22 +757,8 @@ fn acquire_recurses_into_nested_submodules() {
 /// Make a bare repo with two submodules; `editor_sub` is tagged
 /// `worktreePoolTag = editor` so `--exclude-submodule-tags editor` skips it.
 fn make_fixture_with_tagged_submodules(dir: &Path) -> PathBuf {
-    let mk_bare = |name: &str| -> PathBuf {
-        let sub_bare = dir.join(format!("{name}.git"));
-        run_git_root(&["init", "--quiet", "--bare", &sub_bare.display().to_string()]);
-        let sub_staging = dir.join(format!("{name}-staging"));
-        run_git_root(&[
-            "clone", "--quiet",
-            &sub_bare.display().to_string(),
-            &sub_staging.display().to_string(),
-        ]);
-        std::fs::write(sub_staging.join("FILE"), format!("{name}-content").as_bytes()).unwrap();
-        git_commit(&sub_staging, "init");
-        run_git(&sub_staging, &["push", "--quiet", "-u", "origin", "main"]);
-        sub_bare
-    };
-    let runtime_bare = mk_bare("runtime");
-    let editor_bare = mk_bare("editor");
+    let runtime_bare = make_sub_bare(dir, "runtime", "runtime-content");
+    let editor_bare = make_sub_bare(dir, "editor", "editor-content");
 
     let bare = dir.join("source.git");
     run_git_root(&["init", "--quiet", "--bare", &bare.display().to_string()]);
@@ -922,19 +906,7 @@ fn make_fixture_with_n_submodules(dir: &Path, n: usize) -> PathBuf {
     // Build N tiny submodule bares.
     let mut sub_bares = Vec::new();
     for i in 0..n {
-        let sub_bare = dir.join(format!("sub{i}.git"));
-        run_git_root(&["init", "--quiet", "--bare", &sub_bare.display().to_string()]);
-        let sub_staging = dir.join(format!("sub{i}-staging"));
-        run_git_root(&[
-            "clone",
-            "--quiet",
-            &sub_bare.display().to_string(),
-            &sub_staging.display().to_string(),
-        ]);
-        std::fs::write(sub_staging.join("FILE"), format!("sub{i}-content").as_bytes()).unwrap();
-        git_commit(&sub_staging, "init");
-        run_git(&sub_staging, &["push", "--quiet", "-u", "origin", "main"]);
-        sub_bares.push(sub_bare);
+        sub_bares.push(make_sub_bare(dir, &format!("sub{i}"), &format!("sub{i}-content")));
     }
 
     // Parent source with N submodules.

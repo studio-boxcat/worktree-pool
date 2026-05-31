@@ -64,10 +64,13 @@ impl PoolConfig {
 
     fn parse(text: &str) -> Result<Self> {
         let map = yaml::parse(text);
+        // `.context()` keeps the underlying ParseIntError as the error source
+        // rather than dropping it with `.ok()`, and splits missing vs. malformed.
         let schema_version: u32 = map
             .get("schema_version")
-            .and_then(|s| s.parse().ok())
-            .ok_or_else(|| anyhow!("config missing or invalid `schema_version`"))?;
+            .ok_or_else(|| anyhow!("config missing `schema_version`"))?
+            .parse()
+            .context("config has invalid `schema_version` (want a u32)")?;
         if schema_version != SCHEMA_VERSION {
             bail!("config schema_version {schema_version} unsupported (expected {SCHEMA_VERSION})");
         }
@@ -81,10 +84,11 @@ impl PoolConfig {
             .filter(|s| !s.is_empty())
             .map(|s| CommitIsh::from(s.as_str()))
             .ok_or_else(|| anyhow!("config missing `default_commit`"))?;
-        let max_slots = map
+        let max_slots: u32 = map
             .get("max_slots")
-            .and_then(|s| s.parse().ok())
-            .ok_or_else(|| anyhow!("config missing or invalid `max_slots`"))?;
+            .ok_or_else(|| anyhow!("config missing `max_slots`"))?
+            .parse()
+            .context("config has invalid `max_slots` (want a u32)")?;
         let groups = map
             .get("groups")
             .filter(|s| !s.is_empty())
