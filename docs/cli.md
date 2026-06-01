@@ -77,7 +77,7 @@ them:
 | 4    | Capacity    | Every slot in the requested group is held                         | `release` something    |
 | 5    | UniqueSha   | `--unique-sha` matched an already-held slot                       | Reuse / release holder |
 
-The contract is locked by `tests/smoke.rs::acquire_capacity_exhaustion` and
+The contract is locked by `tests/lifecycle.rs::acquire_capacity_exhaustion` and
 `unique_sha_refuses_second_acquire`. New conditions get new codes; existing
 codes don't shift.
 

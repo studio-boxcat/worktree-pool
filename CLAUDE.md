@@ -68,6 +68,7 @@ Per-host `init` runs once per pool key. Source path differs by host (build serve
 - `git` operations shell out via `git.rs`. Slot identity is the canonical path; the user-given name is just a branch ref. No rename, no `git worktree move`, no submodule admin self-heal.
 - Atomic writes via `tempfile::NamedTempFile::persist` (handles EXDEV across volumes).
 - Tests: `cargo test` or `just test` (pre-builds the binary; tests are parallel-safe — each owns a unique pool key + isolated temp `WORKTREE_ROOT`). Unit + integration covering full lifecycle, race conditions, recycled-slot warmth, and crash recovery.
+- Docs: a `lefthook` pre-commit hook runs `md-orphan CLAUDE.md` — flags orphaned docs, broken links, and broken `[[wiki]]` anchors. Needs `lefthook` + `md-orphan` on `$PATH` and a one-time `lefthook install` per clone; exclusions live in `.md-orphan`.
 
 `just install` runs `cargo build --release` and symlinks `~/.local/bin/{worktree-pool,wt}` at the cargo artifact path (`target/release/worktree-pool`) and `bin/wt`. Re-running `cargo build --release` after edits updates the installed tool in place. No committed binary; `target/` stays gitignored.
 

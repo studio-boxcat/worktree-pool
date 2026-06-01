@@ -225,11 +225,7 @@ fn release_replay_completes_with_submodules() {
     release(&key, "feat-sub");
 
     // Slot is now idle (detached HEAD).
-    let head_after = StdCommand::new("git")
-        .args(["symbolic-ref", "--quiet", "HEAD"])
-        .current_dir(&slot)
-        .output().unwrap();
-    assert!(!head_after.status.success(), "HEAD should be detached after release");
+    assert_head_detached(&slot);
 
     // Submodule's per-slot branch should be gone too.
     let sub_branches_after = run_git_capture(&sub, &["branch", "--list", "feat-sub"]);

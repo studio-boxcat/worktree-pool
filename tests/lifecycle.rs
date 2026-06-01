@@ -3,7 +3,6 @@ mod common;
 use common::*;
 
 use std::path::PathBuf;
-use std::process::Command as StdCommand;
 use std::sync::{Arc, Barrier};
 
 #[test]
@@ -532,11 +531,7 @@ fn release_succeeds_despite_stale_index_lock() {
     assert!(!stderr.contains("may persist as a dangling ref"),
         "release should not hit detach-failure warn (the bug being fixed): {stderr}");
     // Slot is now idle (detached HEAD).
-    let head_after = StdCommand::new("git")
-        .args(["symbolic-ref", "--quiet", "HEAD"])
-        .current_dir(&slot)
-        .output().unwrap();
-    assert!(!head_after.status.success(), "HEAD should be detached after release");
+    assert_head_detached(&slot);
 
     // Branch should be gone — confirms the detach actually freed the ref for
     // the subsequent `branch -D`. (If detach silently no-op'd, `branch -D`
@@ -567,11 +562,7 @@ fn release_converges_and_slot_recycles() {
     release(&key, "feat-half");
 
     // Slot is now idle (detached HEAD). Branch is deleted.
-    let head_after = StdCommand::new("git")
-        .args(["symbolic-ref", "--quiet", "HEAD"])
-        .current_dir(&slot)
-        .output().unwrap();
-    assert!(!head_after.status.success(), "HEAD should be detached after release");
+    assert_head_detached(&slot);
     let branches = run_git_capture(&bare, &["branch", "--list", "feat-half"]);
     assert!(branches.trim().is_empty(), "'feat-half' branch should be deleted");
 

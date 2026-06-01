@@ -87,6 +87,18 @@ pub fn assert_ok(out: &std::process::Output, ctx: &str) {
         String::from_utf8_lossy(&out.stderr));
 }
 
+/// Assert the slot's HEAD is detached (idle): `symbolic-ref --quiet HEAD` exits
+/// non-zero when HEAD isn't on a branch. The post-release idle invariant the
+/// lifecycle/submodule tests check.
+pub fn assert_head_detached(slot: &Path) {
+    let out = StdCommand::new("git")
+        .args(["symbolic-ref", "--quiet", "HEAD"])
+        .current_dir(slot)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "HEAD should be detached (idle) after release");
+}
+
 /// Extract the slot path from a successful acquire's stdout (stdout → trim →
 /// `PathBuf`). Centralizes the one-liner the lifecycle/submodule/session tests
 /// all repeat after every acquire.
