@@ -19,6 +19,25 @@ pub fn run(pool_key: &str, pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs
         .unwrap_or(cfg.default_commit.as_str());
     let full_sha = git::resolve_full_sha(&cfg.source, commitish)?;
 
+    // Backstop the init-time mirror gate, BEFORE any allocation or checkout: a
+    // pool predating the gate (or whose source gained submodules since) could
+    // carry submodules with no mirror configured. Reading the source's
+    // `.gitmodules` at `full_sha` lets us fail loud here — no slot materialized,
+    // no cold checkout wasted, no mutex taken — rather than after `worktree add`.
+    // No-op for mirror-configured pools (the common case short-circuits on mode).
+    if cfg.submodule_mirror_mode.is_none()
+        && submodules::source_declares_submodules(&cfg.source, full_sha.as_str())?
+    {
+        bail!(
+            "source {} declares submodules at {} but pool has no submodule mirror configured. \
+             Set submodule_mirror_mode (source-submodules or bare-mirror) + submodule_mirror_base \
+             in {}.",
+            cfg.source.display(),
+            full_sha.short(),
+            fs_paths::pool_config(pool_root).display()
+        );
+    }
+
     // Pool-wide mutex covers slot allocation + branch creation (the idle→held
     // transition). See module-level serialization rationale in earlier history.
     let pool_mu = mutex::FileLock::acquire(fs_paths::pool_mutex(pool_root))
@@ -100,22 +119,6 @@ pub fn run(pool_key: &str, pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs
         // (Unity Library/, node_modules/, build outputs) are caller warmth the pool
         // exists to preserve. The build system invalidates its own caches.
         git::reset_hard(&canonical_path, full_sha.as_str())?;
-    }
-
-    // Backstop the init-time mirror gate BEFORE the idle→held flip: a pool
-    // created before the gate (or whose source gained submodules since) could
-    // still carry submodules with no mirror configured. Bailing here leaves the
-    // slot detached (idle) and cleanly reclaimable, rather than HELD with a
-    // half-fetched submodule tree. See [[docs/lifecycle.md]].
-    if cfg.submodule_mirror_mode.is_none()
-        && submodules::slot_declares_submodules(&canonical_path)?
-    {
-        bail!(
-            "slot '{slot_id}' checkout declares submodules but pool has no submodule mirror \
-             configured. Set submodule_mirror_mode (source-submodules or bare-mirror) + \
-             submodule_mirror_base in {}, then retry.",
-            fs_paths::pool_config(pool_root).display()
-        );
     }
 
     // Branch creation flips idle → held. If we crash between worktree-add/
