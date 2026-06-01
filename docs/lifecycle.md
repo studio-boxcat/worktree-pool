@@ -1,6 +1,6 @@
 # Lifecycle invariants
 
-> **Related:** [[../CLAUDE.md]], [[cli.md]], [[wt.md]] (land flow + cleanup classifier)
+> **Related:** [[CLAUDE.md]], [[cli.md]], [[wt.md]] (land flow + cleanup classifier)
 
 ## Identity model
 

@@ -1,6 +1,6 @@
 # CLI reference
 
-> **Related:** [[../CLAUDE.md]], [[wt.md]] (dev-session helper), [[lifecycle.md]] (acquire/release invariants)
+> **Related:** [[CLAUDE.md]], [[wt.md]] (dev-session helper), [[lifecycle.md]] (acquire/release invariants)
 
 ## Quick start
 

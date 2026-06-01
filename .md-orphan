@@ -1,0 +1,2 @@
+# Rust build artifacts (gitignored; listed so md-orphan prunes at the dir level).
+target/

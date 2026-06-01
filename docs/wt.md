@@ -1,6 +1,6 @@
 # `wt` (dev-session helper)
 
-> **Related:** [[../CLAUDE.md]], [[cli.md]] (underlying primitive), [[lifecycle.md]] (acquire/release invariants)
+> **Related:** [[CLAUDE.md]], [[cli.md]] (underlying primitive), [[lifecycle.md]] (acquire/release invariants)
 
 Bash dispatcher in `bin/wt`. Subcommands wrapping the slot + git-flow lifecycle for interactive dev work:
 

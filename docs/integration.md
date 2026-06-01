@@ -1,6 +1,6 @@
 # Integration
 
-> **Related:** [[../CLAUDE.md]], [[wt.md]] (hooks, land flow), [[cli.md]]
+> **Related:** [[CLAUDE.md]], [[wt.md]] (hooks, land flow), [[cli.md]]
 
 ## Integration patterns
 

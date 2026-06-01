@@ -1,0 +1,7 @@
+pre-commit:
+  commands:
+    md-orphan:
+      glob: "*.md"
+      # Excludes live in `.md-orphan` at repo root. Entry point is the contract;
+      # md-orphan crawls docs/ from it and flags orphans, broken links + anchors.
+      run: md-orphan CLAUDE.md
