@@ -3,11 +3,13 @@
 install:
     scripts/install.sh
 
-# Run all tests. Integration tests (tests/smoke.rs) spawn the binary via assert_cmd
-# and race on cargo's build lock when parallel — run serial to dodge that.
+# Run all tests. The `cargo build` pre-step materializes the binary that
+# integration tests (tests/smoke.rs) invoke via assert_cmd, so the run doesn't
+# trigger a lazy build. Tests are parallel-safe (each owns a unique pool key),
+# so the default multi-threaded runner is used.
 test:
-    cargo build  # pre-build so integration tests don't race on it
-    cargo test -- --test-threads=1
+    cargo build
+    cargo test
 
 # Cargo check + clippy.
 lint:

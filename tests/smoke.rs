@@ -1,20 +1,33 @@
 //! End-to-end and race tests against a real bare-repo fixture.
-//! Spawn the built binary; serial run only (cargo build lock would race in parallel).
+//! Spawn the built binary. Parallel-safe: each test owns a unique pool key
+//! (`pool_key`) and its own source fixture, so the default multi-threaded
+//! `cargo test` runner is fine — no `--test-threads=1` needed.
 use assert_cmd::Command;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::SystemTime;
 
 // ---------- helpers ----------
 
 fn pool_key() -> String {
+    // Must be unique per call. `cargo test` runs every test as a thread in ONE
+    // process, so `pid` is constant across them — uniqueness then rests entirely
+    // on `nonce`, and two parallel tests calling this in the same `SystemTime`
+    // tick collide, aliasing their pool dirs. The damage isn't subtle: each test's
+    // `Cleanup` does `remove_dir_all(pool_root(key))` on drop, so the first to
+    // finish deletes the other's *live* pool mid-run → random capacity/acquire
+    // failures. The atomic counter makes intra-process uniqueness total; pid +
+    // nonce keep it unique across separate test processes and repeat runs.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let pid = std::process::id();
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let nonce = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    format!("wtp-test-{pid}-{nonce}")
+    format!("wtp-test-{pid}-{seq}-{nonce}")
 }
 
 fn pool_root(key: &str) -> PathBuf {
