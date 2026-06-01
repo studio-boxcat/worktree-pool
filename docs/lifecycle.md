@@ -148,7 +148,7 @@ mirror** by `submodule_mirror_mode`:
 
 | Mode | Effective URL | Resolves local-only pins? |
 |------|---------------|---------------------------|
-| `git-modules` | `<base>/.git/modules/<composedName>` | **yes** — reads a working clone's own object store |
+| `source-submodules` | `<base>/.git/modules/<composedName>` | **yes** — reads a working clone's own object store |
 | `bare-mirror` | `<base>/<org>/<repo>.git` | only if the mirror is fresh |
 
 Both need `submodule_mirror_base`. When the source declares submodules, a mirror
@@ -162,7 +162,7 @@ submodule — the common dev case). So we fail loud instead:
   submodules since): it bails **before** the idle→held flip, leaving the slot
   detached (idle) and reclaimable rather than HELD with a half-fetched tree.
 
-For a working-clone source you actively commit in, use `git-modules` with
+For a working-clone source you actively commit in, use `source-submodules` with
 `base = source`: it resolves whatever the source HEAD references, pushed or not.
 `base` may differ from `source` — e.g. a bare source mirrored from its sibling
 working clone's `.git/modules`.

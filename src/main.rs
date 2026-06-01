@@ -81,7 +81,7 @@ fn cmd_init(pool_key: &str, pool_path: &std::path::Path, args: cli::InitArgs) ->
     {
         bail!(
             "source {} declares submodules but no submodule mirror is configured.\n\
-             Pass --submodule-mirror-mode <git-modules|bare-mirror> --submodule-mirror-base <path>. \
+             Pass --submodule-mirror-mode <source-submodules|bare-mirror> --submodule-mirror-base <path>. \
              A submodule pool must resolve submodules from a local mirror — there is no \
              declared-URL fallback (it breaks on local-only, unpushed pins).",
             cfg.source.display()

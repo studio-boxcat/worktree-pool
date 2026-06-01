@@ -1,4 +1,4 @@
-//! Submodule update with URL rewriting (bare-mirror / git-modules) and tag-based filtering.
+//! Submodule update with URL rewriting (bare-mirror / source-submodules) and tag-based filtering.
 //!
 //! Reads `<slot>/.gitmodules` to enumerate submodules + their `worktreePoolTag` values.
 //! For each submodule:
@@ -123,7 +123,7 @@ fn rewrite_url(
             let org_repo = extract_org_repo(declared_url)?;
             format!("{}/{org_repo}.git", base.display())
         }
-        SubmoduleMirrorMode::GitModules => {
+        SubmoduleMirrorMode::SourceSubmodules => {
             // <base>/.git/modules/<composed_name>
             format!("{}/.git/modules/{composed_name}", base.display())
         }
@@ -206,7 +206,7 @@ fn update_recursive(
     //
     // `protocol.file.allow=always` overrides git's post-CVE-2022-39253 default that
     // refuses `file:` (incl. plain local path) submodule clones — required for our
-    // bare-mirror and git-modules modes.
+    // bare-mirror and source-submodules modes.
     if !included.is_empty() {
         // Phase 1: serialized url registration. Top-level writes target
         // `<source>/.git/config`, which is shared across pools using the same
@@ -231,7 +231,7 @@ fn update_recursive(
             let effective_url = rewrite_url(cfg, &e.name, &e.url, name_scope).ok_or_else(|| {
                 anyhow::anyhow!(
                     "no submodule mirror rewrite available for submodule {} (url `{}`). \
-                     Configure submodule_mirror_mode (git-modules or bare-mirror) in the pool \
+                     Configure submodule_mirror_mode (source-submodules or bare-mirror) in the pool \
                      config; for bare-mirror the declared URL must resolve to <org>/<repo>.",
                     e.name,
                     e.url
@@ -413,7 +413,7 @@ submodule.foo.worktreepooltag=optional
             default_commit: "main".into(),
             max_slots: 4,
             groups: vec![],
-            submodule_mirror_mode: Some(SubmoduleMirrorMode::GitModules),
+            submodule_mirror_mode: Some(SubmoduleMirrorMode::SourceSubmodules),
             submodule_mirror_base: Some("/Users/foo/meow-tower".into()),
         };
         assert_eq!(

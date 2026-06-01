@@ -112,7 +112,7 @@ pub fn run(pool_key: &str, pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs
     {
         bail!(
             "slot '{slot_id}' checkout declares submodules but pool has no submodule mirror \
-             configured. Set submodule_mirror_mode (git-modules or bare-mirror) + \
+             configured. Set submodule_mirror_mode (source-submodules or bare-mirror) + \
              submodule_mirror_base in {}, then retry.",
             fs_paths::pool_config(pool_root).display()
         );

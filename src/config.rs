@@ -96,7 +96,7 @@ impl PoolConfig {
             .unwrap_or_default();
         let submodule_mirror_mode = match map.get("submodule_mirror_mode").map(String::as_str) {
             Some("bare-mirror") => Some(cli::SubmoduleMirrorMode::BareMirror),
-            Some("git-modules") => Some(cli::SubmoduleMirrorMode::GitModules),
+            Some("source-submodules") => Some(cli::SubmoduleMirrorMode::SourceSubmodules),
             Some("") | None => None,
             Some(other) => bail!("invalid submodule_mirror_mode: {other:?}"),
         };
@@ -145,7 +145,7 @@ mod tests {
             default_commit: "refs/remotes/origin/main".into(),
             max_slots: 16,
             groups: vec!["ios".into(), "android".into()],
-            submodule_mirror_mode: Some(cli::SubmoduleMirrorMode::GitModules),
+            submodule_mirror_mode: Some(cli::SubmoduleMirrorMode::SourceSubmodules),
             submodule_mirror_base: Some(tmp.path().join("source")),
         }
     }
@@ -161,7 +161,7 @@ mod tests {
         assert_eq!(parsed.default_commit, CommitIsh::from("refs/remotes/origin/main"));
         assert_eq!(
             parsed.submodule_mirror_mode,
-            Some(cli::SubmoduleMirrorMode::GitModules)
+            Some(cli::SubmoduleMirrorMode::SourceSubmodules)
         );
     }
 

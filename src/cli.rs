@@ -79,14 +79,18 @@ pub struct InitArgs {
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubmoduleMirrorMode {
     BareMirror,
-    GitModules,
+    /// Resolve submodules from the source's own submodule object stores
+    /// (`<base>/.git/modules/<name>`). `base` is a working clone — usually the
+    /// source itself — so it serves whatever the source HEAD references,
+    /// including local-only/unpushed pins that a bare mirror wouldn't have.
+    SourceSubmodules,
 }
 
 impl SubmoduleMirrorMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::BareMirror => "bare-mirror",
-            Self::GitModules => "git-modules",
+            Self::SourceSubmodules => "source-submodules",
         }
     }
 }

@@ -702,7 +702,7 @@ fn make_fixture_with_nested_submodule(dir: &Path) -> PathBuf {
         ],
     );
     // Recursively init in the working clone so its `.git/modules/outer/modules/inner`
-    // object store exists — the `git-modules` mirror base resolves the nested inner
+    // object store exists — the `source-submodules` mirror base resolves the nested inner
     // from there. `submodule add outer` alone doesn't descend into inner.
     run_git(
         &staging,
@@ -2484,7 +2484,7 @@ fn recycled_acquire_clears_leftover_index_lock() {
 
 // ---------- submodule mirror gate (fail loud when no mirror) ----------
 
-/// `init` like `init_pool` but configures a `git-modules` submodule mirror.
+/// `init` like `init_pool` but configures a `source-submodules` submodule mirror.
 /// Required now that a submodule-bearing pool must resolve submodules from a
 /// local mirror (no declared-URL fallback). `base` is the working clone whose
 /// `.git/modules/<name>` object stores serve the slots; it may differ from
@@ -2497,7 +2497,7 @@ fn init_pool_mirror(key: &str, source: &Path, base: &Path) {
         .arg(source)
         .args([
             "--max-slots", "4", "--groups", "ios,android",
-            "--submodule-mirror-mode", "git-modules", "--submodule-mirror-base",
+            "--submodule-mirror-mode", "source-submodules", "--submodule-mirror-base",
         ])
         .arg(base)
         .assert()
@@ -2535,7 +2535,7 @@ fn init_refuses_submodule_source_without_mirror() {
     );
 }
 
-/// `init` with an explicit `git-modules` mirror accepts a submodule-bearing
+/// `init` with an explicit `source-submodules` mirror accepts a submodule-bearing
 /// source: the operator named a local mirror, so there's no silent network path.
 #[test]
 fn init_accepts_submodule_source_with_git_modules_mirror() {
@@ -2604,7 +2604,7 @@ fn acquire_backstop_refuses_no_mirror_submodule_pool_and_keeps_slot_idle() {
 
 /// Capstone for the original incident: a working-clone source whose submodule is
 /// advanced to a LOCAL-ONLY commit (present in `<source>/.git/modules/<name>` but
-/// never pushed to the submodule's origin). `git-modules` mirror resolves it from
+/// never pushed to the submodule's origin). `source-submodules` mirror resolves it from
 /// the source's own object store, so acquire succeeds where a network fetch would
 /// fail with `not our ref`.
 #[test]
@@ -2632,7 +2632,7 @@ fn acquire_resolves_local_only_submodule_via_git_modules_mirror() {
     // Bump the gitlink in the superproject and commit (advances staging's main).
     git_commit(&source, "bump submodule to local-only commit");
 
-    // Init with git-modules mirror rooted at the source itself.
+    // Init with source-submodules mirror rooted at the source itself.
     Command::cargo_bin("worktree-pool")
         .unwrap()
         .args(["--pool", &key, "init"])
@@ -2640,7 +2640,7 @@ fn acquire_resolves_local_only_submodule_via_git_modules_mirror() {
         .arg(&source)
         .args([
             "--max-slots", "4", "--groups", "ios,android",
-            "--submodule-mirror-mode", "git-modules", "--submodule-mirror-base",
+            "--submodule-mirror-mode", "source-submodules", "--submodule-mirror-base",
         ])
         .arg(&source)
         .assert()
