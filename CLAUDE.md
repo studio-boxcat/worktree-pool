@@ -53,7 +53,7 @@ submodule_mirror_mode: source-submodules             # bare-mirror | source-subm
 submodule_mirror_base: ~/Develop/myapp
 ```
 
-`source` is the absolute path to the source git repo (bare or working clone). `submodule_mirror_*` rewrites submodule URLs to a **local mirror** at acquire time (avoids network fetch). Two modes: bare-mirror (`<base>/<orgRepo>.git`) and source-submodules (`<base>/.git/modules/<composedName>`; the base resolves local-only submodule bumps the source hasn't pushed). A mirror is **mandatory** when the source declares submodules — `init` and `acquire` fail loud otherwise. There is deliberately no declared-URL fallback: a freshly-bumped-but-unpushed submodule pin would fail a network fetch mid-acquire with a cryptic `not our ref`, so the tool forces a local mirror that always has the objects.
+`source` is the absolute path to the source git repo (bare or working clone). `submodule_mirror_*` rewrites submodule URLs to a **local mirror** (`source-submodules` or `bare-mirror`) at acquire time; a mirror is **mandatory** when the source declares submodules. Mode semantics, the deliberately-absent declared-URL fallback, and the init/acquire fail-loud gates: [[docs/lifecycle.md#submodule-mirror-mandatory-when-submodules-exist]].
 
 Per-host `init` runs once per pool key. Source path differs by host (build server's bare mirror vs laptop's working clone); pool config carries the host-specific values.
 

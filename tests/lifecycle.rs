@@ -2,7 +2,6 @@
 mod common;
 use common::*;
 
-use assert_cmd::Command;
 use std::path::PathBuf;
 use std::process::Command as StdCommand;
 use std::sync::{Arc, Barrier};
@@ -21,8 +20,7 @@ fn full_lifecycle() {
     // Canonical-only: slot stays at `{group}-N`, never `<name>`.
     assert!(path.ends_with("/ios-0"), "expected canonical ios-0 path, got: {path}");
 
-    let ls = Command::cargo_bin("worktree-pool")
-        .unwrap()
+    let ls = wtp()
         .args(["--pool", &key, "ls"])
         .output()
         .unwrap();
@@ -30,8 +28,7 @@ fn full_lifecycle() {
     assert!(ls_text.contains("feat-x"), "ls should mention branch name 'feat-x'");
     assert!(ls_text.contains("held"));
 
-    let inspect = Command::cargo_bin("worktree-pool")
-        .unwrap()
+    let inspect = wtp()
         .args(["--pool", &key, "inspect", "feat-x"])
         .output()
         .unwrap();
@@ -42,8 +39,7 @@ fn full_lifecycle() {
     release(&key, "feat-x");
 
     // Idempotent re-release.
-    Command::cargo_bin("worktree-pool")
-        .unwrap()
+    wtp()
         .args(["--pool", &key, "release", "feat-x"])
         .assert()
         .success();
@@ -96,8 +92,7 @@ fn groupless_pool_full_lifecycle() {
     init_pool_groupless(&key, &bare);
 
     // Acquire (no --group) → slot-0.
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
+    let out = wtp()
         .args(["--pool", &key, "acquire", "feat-x"])
         .output()
         .unwrap();
@@ -106,8 +101,7 @@ fn groupless_pool_full_lifecycle() {
     assert!(path.ends_with("/slot-0"), "expected slot-0, got: {path}");
 
     // --group on a groupless pool is rejected.
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
+    let out = wtp()
         .args(["--pool", &key, "acquire", "feat-y", "--group", "ios"])
         .output()
         .unwrap();
@@ -120,8 +114,7 @@ fn groupless_pool_full_lifecycle() {
     release(&key, "feat-x");
 
     // Recycle: re-acquire lands at the same slot-0.
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
+    let out = wtp()
         .args(["--pool", &key, "acquire", "feat-z"])
         .output()
         .unwrap();
@@ -138,8 +131,7 @@ fn unique_sha_refuses_second_acquire() {
     let bare = make_fixture(tmp.path());
     init_pool(&key, &bare);
 
-    let out1 = Command::cargo_bin("worktree-pool")
-        .unwrap()
+    let out1 = wtp()
         .args([
             "--pool", &key, "acquire", "build-1",
             "--commit", "main", "--group", "ios", "--unique-sha",
@@ -147,8 +139,7 @@ fn unique_sha_refuses_second_acquire() {
         .output()
         .unwrap();
     assert_ok(&out1, "first acquire");
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
+    let out = wtp()
         .args([
             "--pool", &key, "acquire", "build-2",
             "--commit", "main", "--group", "ios", "--unique-sha",
@@ -165,8 +156,7 @@ fn unique_sha_refuses_second_acquire() {
     assert!(stderr.contains("build-1"));
 
     // Dev acquire (no --unique-sha) is allowed.
-    let out_dev = Command::cargo_bin("worktree-pool")
-        .unwrap()
+    let out_dev = wtp()
         .args([
             "--pool", &key, "acquire", "dev-foo",
             "--commit", "main", "--group", "ios",
@@ -180,8 +170,7 @@ fn unique_sha_refuses_second_acquire() {
 fn refuses_uninitialized_pool() {
     let key = pool_key();
     let _c = Cleanup(key.clone());
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
+    let out = wtp()
         .args(["--pool", &key, "ls"])
         .output()
         .unwrap();
@@ -192,8 +181,7 @@ fn refuses_uninitialized_pool() {
 
 #[test]
 fn doctor_runs_without_pool() {
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
+    let out = wtp()
         .arg("doctor")
         .output()
         .unwrap();
@@ -220,8 +208,7 @@ fn unstick_reports_init_mutex_state() {
     let leftover = init_dir.join("ios-2.lock");
     std::fs::write(&leftover, b"").unwrap();
 
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
+    let out = wtp()
         .args(["--pool", &key, "unstick"])
         .output()
         .unwrap();
@@ -245,8 +232,7 @@ fn ls_renders_with_git_status_for_held_only() {
     init_pool(&key, &bare);
     assert_ok(&acquire_dev(&key, "feat-x"), "acquire feat-x");
 
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
+    let out = wtp()
         .args(["--pool", &key, "ls", "--git-status"])
         .output()
         .unwrap();
@@ -328,8 +314,7 @@ fn acquire_capacity_exhaustion() {
     let bare = make_fixture(tmp.path());
 
     // Smaller pool to make exhaustion fast.
-    Command::cargo_bin("worktree-pool")
-        .unwrap()
+    wtp()
         .args(["--pool", &key, "init"])
         .arg("--source")
         .arg(&bare)
@@ -371,8 +356,7 @@ fn parallel_releases_different_names() {
         let barrier = Arc::clone(&barrier);
         handles.push(std::thread::spawn(move || {
             barrier.wait();
-            Command::cargo_bin("worktree-pool")
-                .unwrap()
+            wtp()
                 .args(["--pool", &key, "release", name])
                 .output()
                 .unwrap()
@@ -388,8 +372,7 @@ fn parallel_releases_different_names() {
     }
 
     // Both back in pool as ios-0/ios-1 (some order).
-    let ls = Command::cargo_bin("worktree-pool")
-        .unwrap()
+    let ls = wtp()
         .args(["--pool", &key, "ls"])
         .output()
         .unwrap();
@@ -411,8 +394,7 @@ fn parallel_unique_sha_at_most_one_succeeds() {
     let bare = make_fixture(tmp.path());
     init_pool(&key, &bare);
 
-    let out1 = Command::cargo_bin("worktree-pool")
-        .unwrap()
+    let out1 = wtp()
         .args([
             "--pool", &key, "acquire", "b-0",
             "--commit", "main", "--group", "ios", "--unique-sha",
@@ -420,8 +402,7 @@ fn parallel_unique_sha_at_most_one_succeeds() {
         .output()
         .unwrap();
     assert_ok(&out1, "first --unique-sha acquire");
-    let out2 = Command::cargo_bin("worktree-pool")
-        .unwrap()
+    let out2 = wtp()
         .args([
             "--pool", &key, "acquire", "b-1",
             "--commit", "main", "--group", "ios", "--unique-sha",
@@ -543,7 +524,7 @@ fn release_succeeds_despite_stale_index_lock() {
     // Invoke the binary directly: the `wt` wrapper would itself run `git status
     // --porcelain` for the dirty-tree precheck and could race the same lock,
     // muddying what this test is meant to pin (release.rs's detach step).
-    let out = Command::cargo_bin("worktree-pool").unwrap()
+    let out = wtp()
         .args(["--pool", &key, "release", "leaky"])
         .output().unwrap();
     assert_ok(&out, "release should succeed despite stale index.lock");

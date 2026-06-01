@@ -13,6 +13,7 @@ use assert_cmd::Command;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::LazyLock;
 use std::time::SystemTime;
 
 // ---------- helpers ----------
@@ -36,14 +37,33 @@ pub fn pool_key() -> String {
     format!("wtp-test-{pid}-{seq}-{nonce}")
 }
 
+/// Isolated `WORKTREE_ROOT` for the whole test process. Tests must NOT touch the
+/// operator's real `~/.worktree-pool`: a crashed/killed test would leak
+/// `wtp-test-*` dirs next to live pools, and test pools would share a directory
+/// with real ones. A per-pid temp dir keeps concurrent `cargo test` runs (and
+/// the unit-test binary) from colliding; per-test `Cleanup` removes each pool
+/// under it. Every binary spawn routes through `wtp()` / `session_cmd*`, which
+/// point the subprocess at this root via the `WORKTREE_ROOT` env.
+static TEST_ROOT: LazyLock<PathBuf> = LazyLock::new(|| {
+    let root = std::env::temp_dir().join(format!("wtp-test-root-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("create isolated test WORKTREE_ROOT");
+    root
+});
+
+fn test_root() -> &'static Path {
+    TEST_ROOT.as_path()
+}
+
 pub fn pool_root(key: &str) -> PathBuf {
-    // Mirrors src/fs_paths::worktree_root — tests inherit WORKTREE_ROOT from
-    // the parent shell (just test / cargo test); fail loud if unset.
-    let root = std::env::var_os("WORKTREE_ROOT")
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
-        .expect("WORKTREE_ROOT unset; tests inherit it from the shell — set it in ~/.zshenv.local");
-    root.join(key)
+    test_root().join(key)
+}
+
+/// `worktree-pool` binary command with the isolated `WORKTREE_ROOT` preset — the
+/// single choke point so no spawn ever reads the operator's real root.
+pub fn wtp() -> Command {
+    let mut cmd = Command::cargo_bin("worktree-pool").unwrap();
+    cmd.env("WORKTREE_ROOT", test_root());
+    cmd
 }
 
 pub fn run_git(cwd: &Path, args: &[&str]) {
@@ -113,8 +133,7 @@ impl Drop for Cleanup {
 }
 
 pub fn init_pool(key: &str, bare: &Path) {
-    Command::cargo_bin("worktree-pool")
-        .unwrap()
+    wtp()
         .args(["--pool", key, "init"])
         .arg("--source")
         .arg(bare)
@@ -124,8 +143,7 @@ pub fn init_pool(key: &str, bare: &Path) {
 }
 
 pub fn init_pool_groupless(key: &str, bare: &Path) {
-    Command::cargo_bin("worktree-pool")
-        .unwrap()
+    wtp()
         .args(["--pool", key, "init"])
         .arg("--source")
         .arg(bare)
@@ -135,16 +153,14 @@ pub fn init_pool_groupless(key: &str, bare: &Path) {
 }
 
 pub fn acquire_dev(key: &str, name: &str) -> std::process::Output {
-    Command::cargo_bin("worktree-pool")
-        .unwrap()
+    wtp()
         .args(["--pool", key, "acquire", name, "--group", "ios"])
         .output()
         .unwrap()
 }
 
 pub fn acquire_dev_sub(key: &str, name: &str) -> std::process::Output {
-    Command::cargo_bin("worktree-pool")
-        .unwrap()
+    wtp()
         .args(["--pool", key, "acquire", name, "--group", "ios"])
         .env("GIT_ALLOW_PROTOCOL", "file")
         .output()
@@ -152,8 +168,7 @@ pub fn acquire_dev_sub(key: &str, name: &str) -> std::process::Output {
 }
 
 pub fn release(key: &str, name: &str) {
-    Command::cargo_bin("worktree-pool")
-        .unwrap()
+    wtp()
         .args(["--pool", key, "release", name])
         .assert()
         .success();
@@ -166,8 +181,7 @@ pub fn slot_id_from_output(out: &std::process::Output) -> String {
 }
 
 pub fn init_pool_groupless_max1(key: &str, bare: &Path) {
-    Command::cargo_bin("worktree-pool")
-        .unwrap()
+    wtp()
         .args(["--pool", key, "init"])
         .arg("--source")
         .arg(bare)
@@ -177,8 +191,7 @@ pub fn init_pool_groupless_max1(key: &str, bare: &Path) {
 }
 
 pub fn acquire_dev_groupless(key: &str, name: &str) -> std::process::Output {
-    Command::cargo_bin("worktree-pool")
-        .unwrap()
+    wtp()
         .args(["--pool", key, "acquire", name])
         .output()
         .unwrap()
@@ -442,7 +455,8 @@ pub fn session_cmd(key: &str, args: &[&str]) -> StdCommand {
     cmd.arg(session_script())
         .args(["--pool", key])
         .args(args)
-        .env("PATH", new_path);
+        .env("PATH", new_path)
+        .env("WORKTREE_ROOT", test_root());
     cmd.env("SHELL", "/usr/bin/true");
     // Tests run without a TTY; bypass cmd_go's TTY guard so we exercise the
     // launcher-misfire and ghost-slot paths it protects.
@@ -497,7 +511,8 @@ pub fn session_cmd_cwd(cwd: &Path, args: &[&str]) -> StdCommand {
         .args(args)
         .current_dir(cwd)
         .env("PATH", new_path)
-        .env("SHELL", "/usr/bin/true");
+        .env("SHELL", "/usr/bin/true")
+        .env("WORKTREE_ROOT", test_root());
     cmd
 }
 
@@ -524,8 +539,7 @@ pub fn run_git_capture(cwd: &Path, args: &[&str]) -> String {
 /// `.git/modules/<name>` object stores serve the slots; it may differ from
 /// `source` (e.g. a bare source mirrored from its sibling working clone).
 pub fn init_pool_mirror(key: &str, source: &Path, base: &Path) {
-    Command::cargo_bin("worktree-pool")
-        .unwrap()
+    wtp()
         .args(["--pool", key, "init"])
         .arg("--source")
         .arg(source)

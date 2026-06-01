@@ -2,7 +2,6 @@
 mod common;
 use common::*;
 
-use assert_cmd::Command;
 use std::process::Command as StdCommand;
 
 /// Nested submodules materialize end-to-end on acquire: outer + inner both
@@ -63,8 +62,7 @@ fn exclude_submodule_tags_skips_tagged_submodule() {
     let bare = make_fixture_with_tagged_submodules(tmp.path());
     init_pool_mirror(&key, &bare, &tmp.path().join("staging"));
 
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
+    let out = wtp()
         .args([
             "--pool", &key, "acquire", "ci-1",
             "--group", "ios",
@@ -166,8 +164,7 @@ fn parallel_submodule_init_acquires_all() {
     let bare = make_fixture_with_n_submodules(tmp.path(), N);
     init_pool_mirror(&key, &bare, &tmp.path().join("staging"));
 
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
+    let out = wtp()
         .args(["--pool", &key, "acquire", "many", "--group", "ios"])
         .output()
         .unwrap();
@@ -250,8 +247,7 @@ fn init_refuses_submodule_source_without_mirror() {
     let tmp = tempfile::TempDir::new().unwrap();
     let bare = make_fixture_with_submodule(tmp.path());
 
-    let out = Command::cargo_bin("worktree-pool")
-        .unwrap()
+    let out = wtp()
         .args(["--pool", &key, "init"])
         .arg("--source")
         .arg(&bare)
@@ -369,8 +365,7 @@ fn acquire_resolves_local_only_submodule_via_git_modules_mirror() {
     git_commit(&source, "bump submodule to local-only commit");
 
     // Init with source-submodules mirror rooted at the source itself.
-    Command::cargo_bin("worktree-pool")
-        .unwrap()
+    wtp()
         .args(["--pool", &key, "init"])
         .arg("--source")
         .arg(&source)
