@@ -82,10 +82,8 @@ fn parse_gitmodules_text(raw: &str) -> Result<Vec<SubmoduleEntry>> {
 
 /// True if the tree at `commit` in `source` declares any submodule. Reads
 /// `.gitmodules` from the commit object (not the working tree), so it works
-/// uniformly for bare and working-clone sources. Drives the mirror fail-loud
-/// gates in both `init` (against `default_commit`) and `acquire` (against the
-/// pinned SHA, before materializing the slot) — see
-/// [[docs/lifecycle.md#submodule-mirror-mandatory-when-submodules-exist]].
+/// uniformly for bare and working-clone sources. Drives the `init`-time mirror
+/// gate — see [[docs/lifecycle.md#submodule-mirror-mandatory-when-submodules-exist]].
 pub fn source_declares_submodules(source: &Path, commit: &str) -> Result<bool> {
     let spec = format!("{commit}:.gitmodules");
     let (ok, stdout, _stderr) = git::run_lenient(source, &["config", "--blob", &spec, "--list"])?;
@@ -93,6 +91,13 @@ pub fn source_declares_submodules(source: &Path, commit: &str) -> Result<bool> {
         return Ok(false); // no `.gitmodules` in that tree (or commit unresolvable)
     }
     Ok(iter_keys(&stdout).any(|(_name, key, _val)| key == "path"))
+}
+
+/// True if the materialized slot checkout declares any submodule. The acquire
+/// backstop reads this from the slot (vs the source) so it also catches a source
+/// that gained submodules after `init`.
+pub fn slot_declares_submodules(slot: &Path) -> Result<bool> {
+    Ok(!parse_gitmodules(slot)?.is_empty())
 }
 
 /// Compose a submodule's effective URL based on the pool's mirror config.

@@ -159,9 +159,8 @@ submodule — the common dev case). So we fail loud instead:
 
 - **`init`** refuses a submodule-bearing source with no mirror (no pool is created).
 - **`acquire`** backstops pools that predate the gate (or whose source gained
-  submodules since): it reads the source's `.gitmodules` at the pinned SHA and
-  bails **before materializing the slot** — no cold checkout wasted, no slot dir
-  created — rather than discovering it after `worktree add`.
+  submodules since): it bails **before** the idle→held flip, leaving the slot
+  detached (idle) and reclaimable rather than HELD with a half-fetched tree.
 
 For a working-clone source you actively commit in, use `source-submodules` with
 `base = source`: it resolves whatever the source HEAD references, pushed or not.

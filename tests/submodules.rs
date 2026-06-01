@@ -291,11 +291,11 @@ fn init_allows_submoduleless_source_without_mirror() {
 }
 
 /// Acquire backstop: a pool whose config carries no mirror but whose source has
-/// submodules (e.g. created before the gate existed) must fail BEFORE
-/// materializing the slot — read from the source at the pinned SHA — so no cold
-/// checkout is wasted and no slot dir is created.
+/// submodules (e.g. created before the gate existed) must fail BEFORE the
+/// idle→held flip, leaving the slot detached (idle) and cleanly reclaimable
+/// rather than HELD with a half-fetched submodule tree.
 #[test]
-fn acquire_backstop_refuses_no_mirror_submodule_pool_before_materializing() {
+fn acquire_backstop_refuses_no_mirror_submodule_pool_and_keeps_slot_idle() {
     let key = pool_key();
     let _c = Cleanup(key.clone());
     let tmp = tempfile::TempDir::new().unwrap();
@@ -321,10 +321,16 @@ fn acquire_backstop_refuses_no_mirror_submodule_pool_before_materializing() {
         "stderr should explain the missing mirror, got: {stderr}"
     );
 
-    // Bailed before any allocation/checkout → no slot dir was created at all.
+    // Slot was materialized then bailed pre-held → detached HEAD (idle), not on a branch.
+    let slot = pool.join("ios-0");
+    let head = StdCommand::new("git")
+        .current_dir(&slot)
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .output()
+        .unwrap();
     assert!(
-        !pool.join("ios-0").exists() && !pool.join("android-0").exists(),
-        "backstop must bail before materializing any slot"
+        !head.status.success(),
+        "backstop must leave the slot detached (idle), but HEAD is on a branch"
     );
 }
 
