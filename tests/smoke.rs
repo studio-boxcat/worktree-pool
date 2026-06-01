@@ -701,6 +701,13 @@ fn make_fixture_with_nested_submodule(dir: &Path) -> PathBuf {
             "outer",
         ],
     );
+    // Recursively init in the working clone so its `.git/modules/outer/modules/inner`
+    // object store exists — the `git-modules` mirror base resolves the nested inner
+    // from there. `submodule add outer` alone doesn't descend into inner.
+    run_git(
+        &staging,
+        &["-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive"],
+    );
     git_commit(&staging, "with nested outer");
     run_git(&staging, &["push", "--quiet", "-u", "origin", "main"]);
     bare
@@ -715,7 +722,7 @@ fn acquire_recurses_into_nested_submodules() {
     let _c = Cleanup(key.clone());
     let tmp = tempfile::TempDir::new().unwrap();
     let bare = make_fixture_with_nested_submodule(tmp.path());
-    init_pool(&key, &bare);
+    init_pool_mirror(&key, &bare, &tmp.path().join("staging"));
 
     let slot_name = "feat-nest";
     let out = acquire_dev_sub(&key, slot_name);
@@ -809,7 +816,7 @@ fn exclude_submodule_tags_skips_tagged_submodule() {
     let _c = Cleanup(key.clone());
     let tmp = tempfile::TempDir::new().unwrap();
     let bare = make_fixture_with_tagged_submodules(tmp.path());
-    init_pool(&key, &bare);
+    init_pool_mirror(&key, &bare, &tmp.path().join("staging"));
 
     let out = Command::cargo_bin("worktree-pool")
         .unwrap()
@@ -847,7 +854,7 @@ fn acquire_branches_submodule_release_cleans_up() {
     let _c = Cleanup(key.clone());
     let tmp = tempfile::TempDir::new().unwrap();
     let bare = make_fixture_with_submodule(tmp.path());
-    init_pool(&key, &bare);
+    init_pool_mirror(&key, &bare, &tmp.path().join("staging"));
 
     let slot_name = "feat-branch";
     let out = acquire_dev_sub(&key, slot_name);
@@ -952,7 +959,7 @@ fn parallel_submodule_init_acquires_all() {
     let tmp = tempfile::TempDir::new().unwrap();
     const N: usize = 6;
     let bare = make_fixture_with_n_submodules(tmp.path(), N);
-    init_pool(&key, &bare);
+    init_pool_mirror(&key, &bare, &tmp.path().join("staging"));
 
     let out = Command::cargo_bin("worktree-pool")
         .unwrap()
@@ -1660,7 +1667,7 @@ fn session_land_refuses_when_main_submodule_has_in_progress_merge() {
     make_fixture_with_submodule(tmp.path());
     let source = tmp.path().join("staging");
     run_git(&source, &["config", "submodule.sub.ignore", "untracked"]);
-    init_pool(&key, &source);
+    init_pool_mirror(&key, &source, &source);
     let main_sub = source.join("sub");
 
     // Induce MERGE_HEAD in <main>/<sub>.
@@ -1806,7 +1813,7 @@ fn session_land_refreshes_slot_submodule_when_main_brought_advance() {
     make_fixture_with_submodule(tmp.path());
     let source = tmp.path().join("staging");
     run_git(&source, &["config", "submodule.sub.ignore", "untracked"]);
-    init_pool(&key, &source);
+    init_pool_mirror(&key, &source, &source);
 
     let out = acquire_dev_sub(&key, "slot-a");
     assert_ok(&out, "acquire slot-a");
@@ -1866,7 +1873,7 @@ fn session_land_syncs_stale_submodule_after_plain_merge() {
     make_fixture_with_submodule(tmp.path());
     let source = tmp.path().join("staging");
     run_git(&source, &["config", "submodule.sub.ignore", "untracked"]);
-    init_pool(&key, &source);
+    init_pool_mirror(&key, &source, &source);
 
     let out = acquire_dev_sub(&key, "feat");
     assert_ok(&out, "acquire");
@@ -1948,7 +1955,7 @@ fn session_land_preserves_untracked_in_submodule_on_collision() {
     // "M sub" noise from untracked content inside submodules — without this,
     // land's precheck refuses before reaching the propagation block.
     run_git(&source, &["config", "submodule.sub.ignore", "untracked"]);
-    init_pool(&key, &source);
+    init_pool_mirror(&key, &source, &source);
 
     let out = acquire_dev_sub(&key, "feat");
     assert_ok(&out, "acquire");
@@ -2007,7 +2014,7 @@ fn session_land_recovers_after_submodule_collision_resolved() {
     make_fixture_with_submodule(tmp.path());
     let source = tmp.path().join("staging");
     run_git(&source, &["config", "submodule.sub.ignore", "untracked"]);
-    init_pool(&key, &source);
+    init_pool_mirror(&key, &source, &source);
 
     let out = acquire_dev_sub(&key, "feat");
     assert!(out.status.success());
@@ -2061,7 +2068,7 @@ fn session_land_advances_detached_submodule_in_main() {
     let tmp = tempfile::TempDir::new().unwrap();
     make_fixture_with_submodule(tmp.path());
     let source = tmp.path().join("staging");
-    init_pool(&key, &source);
+    init_pool_mirror(&key, &source, &source);
 
     // Simulate `git submodule update` aftermath: detach source/sub at gitlink SHA.
     let main_sub = source.join("sub");
@@ -2112,7 +2119,7 @@ fn session_land_advances_submodule_pin_bump() {
     let tmp = tempfile::TempDir::new().unwrap();
     make_fixture_with_submodule(tmp.path());
     let source = tmp.path().join("staging");
-    init_pool(&key, &source);
+    init_pool_mirror(&key, &source, &source);
 
     let main_sub = source.join("sub");
     let old_pin = String::from_utf8_lossy(
@@ -2163,7 +2170,7 @@ fn session_land_propagates_submodule_to_main() {
     let tmp = tempfile::TempDir::new().unwrap();
     make_fixture_with_submodule(tmp.path());
     let source = tmp.path().join("staging");
-    init_pool(&key, &source);
+    init_pool_mirror(&key, &source, &source);
 
     let out = acquire_dev_sub(&key, "feat");
     assert_ok(&out, "acquire");
@@ -2403,7 +2410,7 @@ fn release_replay_completes_with_submodules() {
     let _c = Cleanup(key.clone());
     let tmp = tempfile::TempDir::new().unwrap();
     let bare = make_fixture_with_submodule(tmp.path());
-    init_pool(&key, &bare);
+    init_pool_mirror(&key, &bare, &tmp.path().join("staging"));
 
     let out = acquire_dev(&key, "feat-sub");
     assert_ok(&out, "");
@@ -2473,4 +2480,188 @@ fn recycled_acquire_clears_leftover_index_lock() {
     assert_eq!(recycled, slot, "should recycle the same canonical slot");
     assert!(!lock.exists(),
         "acquire must remove the leftover index.lock before reset --hard");
+}
+
+// ---------- submodule mirror gate (fail loud when no mirror) ----------
+
+/// `init` like `init_pool` but configures a `git-modules` submodule mirror.
+/// Required now that a submodule-bearing pool must resolve submodules from a
+/// local mirror (no declared-URL fallback). `base` is the working clone whose
+/// `.git/modules/<name>` object stores serve the slots; it may differ from
+/// `source` (e.g. a bare source mirrored from its sibling working clone).
+fn init_pool_mirror(key: &str, source: &Path, base: &Path) {
+    Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", key, "init"])
+        .arg("--source")
+        .arg(source)
+        .args([
+            "--max-slots", "4", "--groups", "ios,android",
+            "--submodule-mirror-mode", "git-modules", "--submodule-mirror-base",
+        ])
+        .arg(base)
+        .assert()
+        .success();
+}
+
+/// `init` refuses a submodule-bearing source when no mirror mode is given — the
+/// silent declared-URL fallback is gone, so the operator must choose. No pool
+/// config is written on the rejected init.
+#[test]
+fn init_refuses_submodule_source_without_mirror() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture_with_submodule(tmp.path());
+
+    let out = Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", &key, "init"])
+        .arg("--source")
+        .arg(&bare)
+        .args(["--max-slots", "4", "--groups", "ios,android"])
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success(), "init must refuse a no-mirror submodule pool");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("submodule mirror"),
+        "stderr should name the mirror requirement, got: {stderr}"
+    );
+    assert!(
+        !pool_root(&key).join(".meta/config.yaml").exists(),
+        "rejected init must not leave a pool config behind"
+    );
+}
+
+/// `init` with an explicit `git-modules` mirror accepts a submodule-bearing
+/// source: the operator named a local mirror, so there's no silent network path.
+#[test]
+fn init_accepts_submodule_source_with_git_modules_mirror() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture_with_submodule(tmp.path());
+    init_pool_mirror(&key, &bare, &tmp.path().join("staging")); // asserts success
+    assert!(pool_root(&key).join(".meta/config.yaml").exists());
+}
+
+/// A submodule-less source needs no mirror — `init` without mirror flags still
+/// succeeds (the gate keys on submodule presence, not on the flag).
+#[test]
+fn init_allows_submoduleless_source_without_mirror() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare); // asserts success
+}
+
+/// Acquire backstop: a pool whose config carries no mirror but whose source has
+/// submodules (e.g. created before the gate existed) must fail BEFORE the
+/// idle→held flip, leaving the slot detached (idle) and cleanly reclaimable
+/// rather than HELD with a half-fetched submodule tree.
+#[test]
+fn acquire_backstop_refuses_no_mirror_submodule_pool_and_keeps_slot_idle() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture_with_submodule(tmp.path());
+
+    // Hand-write a mirror-less config, bypassing the init gate.
+    let pool = pool_root(&key);
+    std::fs::create_dir_all(pool.join(".meta")).unwrap();
+    std::fs::write(
+        pool.join(".meta/config.yaml"),
+        format!(
+            "schema_version: 1\nsource: {}\ndefault_commit: main\nmax_slots: 4\ngroups: ios,android\n",
+            bare.display()
+        ),
+    )
+    .unwrap();
+
+    let out = acquire_dev_sub(&key, "feat");
+    assert!(!out.status.success(), "acquire must refuse a no-mirror submodule pool");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("submodule mirror"),
+        "stderr should explain the missing mirror, got: {stderr}"
+    );
+
+    // Slot was materialized then bailed pre-held → detached HEAD (idle), not on a branch.
+    let slot = pool.join("ios-0");
+    let head = StdCommand::new("git")
+        .current_dir(&slot)
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(
+        !head.status.success(),
+        "backstop must leave the slot detached (idle), but HEAD is on a branch"
+    );
+}
+
+/// Capstone for the original incident: a working-clone source whose submodule is
+/// advanced to a LOCAL-ONLY commit (present in `<source>/.git/modules/<name>` but
+/// never pushed to the submodule's origin). `git-modules` mirror resolves it from
+/// the source's own object store, so acquire succeeds where a network fetch would
+/// fail with `not our ref`.
+#[test]
+fn acquire_resolves_local_only_submodule_via_git_modules_mirror() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    make_fixture_with_submodule(tmp.path());
+    let source = tmp.path().join("staging"); // working clone with `sub/` inited
+
+    // Advance the submodule to a commit that is NOT pushed to its origin (sub.git).
+    let sub = source.join("sub");
+    std::fs::write(sub.join("LOCAL"), b"local-only change").unwrap();
+    git_commit(&sub, "local-only submodule commit");
+    let local_sha = String::from_utf8_lossy(
+        &StdCommand::new("git")
+            .current_dir(&sub)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    // Bump the gitlink in the superproject and commit (advances staging's main).
+    git_commit(&source, "bump submodule to local-only commit");
+
+    // Init with git-modules mirror rooted at the source itself.
+    Command::cargo_bin("worktree-pool")
+        .unwrap()
+        .args(["--pool", &key, "init"])
+        .arg("--source")
+        .arg(&source)
+        .args([
+            "--max-slots", "4", "--groups", "ios,android",
+            "--submodule-mirror-mode", "git-modules", "--submodule-mirror-base",
+        ])
+        .arg(&source)
+        .assert()
+        .success();
+
+    let out = acquire_dev_sub(&key, "feat");
+    assert_ok(&out, "acquire should resolve the local-only submodule via the mirror");
+    let slot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+
+    let sub_head = String::from_utf8_lossy(
+        &StdCommand::new("git")
+            .current_dir(slot.join("sub"))
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(
+        sub_head, local_sha,
+        "slot submodule should be checked out at the local-only commit"
+    );
 }

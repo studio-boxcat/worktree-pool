@@ -9,7 +9,7 @@
 //!
 //! Recurses into nested `.gitmodules`. `editorOnly`-style filtering applies only to top-level
 //! submodules (the convention is Unity-Package-specific even though this tool is generic).
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -78,6 +78,26 @@ fn parse_gitmodules_text(raw: &str) -> Result<Vec<SubmoduleEntry>> {
         .collect();
     out.sort_by(|a, b| a.path.cmp(&b.path)); // deterministic output
     Ok(out)
+}
+
+/// True if the tree at `commit` in `source` declares any submodule. Reads
+/// `.gitmodules` from the commit object (not the working tree), so it works
+/// uniformly for bare and working-clone sources. Drives the `init`-time mirror
+/// gate — see [[docs/lifecycle.md#submodule-mirror-mandatory-when-submodules-exist]].
+pub fn source_declares_submodules(source: &Path, commit: &str) -> Result<bool> {
+    let spec = format!("{commit}:.gitmodules");
+    let (ok, stdout, _stderr) = git::run_lenient(source, &["config", "--blob", &spec, "--list"])?;
+    if !ok {
+        return Ok(false); // no `.gitmodules` in that tree (or commit unresolvable)
+    }
+    Ok(iter_keys(&stdout).any(|(_name, key, _val)| key == "path"))
+}
+
+/// True if the materialized slot checkout declares any submodule. The acquire
+/// backstop reads this from the slot (vs the source) so it also catches a source
+/// that gained submodules after `init`.
+pub fn slot_declares_submodules(slot: &Path) -> Result<bool> {
+    Ok(!parse_gitmodules(slot)?.is_empty())
 }
 
 /// Compose a submodule's effective URL based on the pool's mirror config.
@@ -203,26 +223,20 @@ fn update_recursive(
             None
         };
         for e in &included {
-            let effective_url = match rewrite_url(cfg, &e.name, &e.url, name_scope) {
-                Some(u) => u,
-                None => {
-                    // No mirror configured: fall back to the declared URL. We skip
-                    // `git submodule init`'s URL-resolution step (which we'd otherwise
-                    // get for free), so refuse relative URLs here — they'd be written
-                    // verbatim and silently fetch from the wrong place. (`git submodule
-                    // init` resolves `../foo.git` against the parent's `origin` URL.)
-                    if e.url.starts_with("./") || e.url.starts_with("../") {
-                        bail!(
-                            "submodule {} has relative url `{}` and no `submodule_mirror_*` \
-                             rewrite is configured. Either configure a mirror in pool config, \
-                             or change the submodule URL to absolute.",
-                            e.name,
-                            e.url
-                        );
-                    }
-                    e.url.clone()
-                }
-            };
+            // A submodule pool must mirror locally — there is no silent declared-URL
+            // fetch (it breaks on local-only pins). `rewrite_url` yields None when no
+            // mirror mode is set (the init gate / acquire backstop should have caught
+            // this already) or when `bare-mirror` can't extract `<org>/<repo>` from the
+            // declared URL. Either way, fail loud rather than reach the network.
+            let effective_url = rewrite_url(cfg, &e.name, &e.url, name_scope).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no submodule mirror rewrite available for submodule {} (url `{}`). \
+                     Configure submodule_mirror_mode (git-modules or bare-mirror) in the pool \
+                     config; for bare-mirror the declared URL must resolve to <org>/<repo>.",
+                    e.name,
+                    e.url
+                )
+            })?;
             git::run(
                 dir,
                 &[

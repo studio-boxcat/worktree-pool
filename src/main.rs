@@ -72,6 +72,21 @@ fn cmd_init(pool_key: &str, pool_path: &std::path::Path, args: cli::InitArgs) ->
         );
     }
     let cfg = config::PoolConfig::from_init_args(&args)?;
+    // Fail loud before creating the pool: a submodule-bearing source with no
+    // mirror mode has no safe URL default — the only fallback would be a silent
+    // declared-URL network fetch that breaks on local-only pins. Require a local
+    // mirror up front.
+    if cfg.submodule_mirror_mode.is_none()
+        && submodules::source_declares_submodules(&cfg.source, cfg.default_commit.as_str())?
+    {
+        bail!(
+            "source {} declares submodules but no submodule mirror is configured.\n\
+             Pass --submodule-mirror-mode <git-modules|bare-mirror> --submodule-mirror-base <path>. \
+             A submodule pool must resolve submodules from a local mirror — there is no \
+             declared-URL fallback (it breaks on local-only, unpushed pins).",
+            cfg.source.display()
+        );
+    }
     config::write(pool_path, &cfg).context("writing pool config")?;
     let groups = if cfg.groups.is_empty() {
         "none".to_string()

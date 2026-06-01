@@ -1,7 +1,7 @@
 //! `acquire` orchestration. Picks an idle canonical slot, pins HEAD to the
 //! requested commit, creates a branch (which flips idle → held).
 //! See CLAUDE.md §Lifecycle for the spec.
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::Path;
 
 use crate::bail_exit;
@@ -100,6 +100,22 @@ pub fn run(pool_key: &str, pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs
         // (Unity Library/, node_modules/, build outputs) are caller warmth the pool
         // exists to preserve. The build system invalidates its own caches.
         git::reset_hard(&canonical_path, full_sha.as_str())?;
+    }
+
+    // Backstop the init-time mirror gate BEFORE the idle→held flip: a pool
+    // created before the gate (or whose source gained submodules since) could
+    // still carry submodules with no mirror configured. Bailing here leaves the
+    // slot detached (idle) and cleanly reclaimable, rather than HELD with a
+    // half-fetched submodule tree. See [[docs/lifecycle.md]].
+    if cfg.submodule_mirror_mode.is_none()
+        && submodules::slot_declares_submodules(&canonical_path)?
+    {
+        bail!(
+            "slot '{slot_id}' checkout declares submodules but pool has no submodule mirror \
+             configured. Set submodule_mirror_mode (git-modules or bare-mirror) + \
+             submodule_mirror_base in {}, then retry.",
+            fs_paths::pool_config(pool_root).display()
+        );
     }
 
     // Branch creation flips idle → held. If we crash between worktree-add/

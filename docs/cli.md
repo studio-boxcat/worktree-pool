@@ -33,7 +33,8 @@ worktree-pool --pool myapp path abc12345       # prints the canonical slot path;
 ## CLI
 
 ```
-worktree-pool --pool <key> init --source <repo> [--submodule-mirror-mode <m>] [--submodule-mirror-base <p>] [--default-commit <ref>] --max-slots <n> [--groups <g1,g2>]
+worktree-pool --pool <key> init --source <repo> [--submodule-mirror-mode <git-modules|bare-mirror> --submodule-mirror-base <p>] [--default-commit <ref>] --max-slots <n> [--groups <g1,g2>]
+  # mirror flags are REQUIRED (together) when <repo> declares submodules — see [[lifecycle.md#submodule-mirror-mandatory-when-submodules-exist]]
 
 worktree-pool --pool <key> acquire NAME [--commit <commitish>] [--group <g>] [--unique-sha] [--exclude-submodule-tags <t1,t2>]
 

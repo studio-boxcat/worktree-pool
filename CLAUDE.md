@@ -49,11 +49,11 @@ source: ~/Develop/myapp
 default_commit: refs/remotes/origin/main      # used when --commit omitted
 max_slots: 16
 groups: [ios, android]                         # optional; absent → slots named slot-{N}
-submodule_mirror_mode: git-modules             # bare-mirror | git-modules; optional
+submodule_mirror_mode: git-modules             # bare-mirror | git-modules
 submodule_mirror_base: ~/Develop/myapp
 ```
 
-`source` is the absolute path to the source git repo (bare or working clone). `submodule_mirror_*` rewrites submodule URLs to local mirrors at acquire time (avoids GitHub fetch); both bare-mirror (`<base>/<orgRepo>.git`) and git-modules (`<source>/.git/modules/<composedName>`) modes supported. Omit if submodules use their declared URLs.
+`source` is the absolute path to the source git repo (bare or working clone). `submodule_mirror_*` rewrites submodule URLs to a **local mirror** at acquire time (avoids network fetch). Two modes: bare-mirror (`<base>/<orgRepo>.git`) and git-modules (`<base>/.git/modules/<composedName>`; the base resolves local-only submodule bumps the source hasn't pushed). A mirror is **mandatory** when the source declares submodules — `init` and `acquire` fail loud otherwise. There is deliberately no declared-URL fallback: a freshly-bumped-but-unpushed submodule pin would fail a network fetch mid-acquire with a cryptic `not our ref`, so the tool forces a local mirror that always has the objects.
 
 Per-host `init` runs once per pool key. Source path differs by host (build server's bare mirror vs laptop's working clone); pool config carries the host-specific values.
 

@@ -141,6 +141,32 @@ pool is its own bucket.
 
 ---
 
+## Submodule mirror (mandatory when submodules exist)
+
+A submodule's effective fetch URL at acquire time is rewritten to a **local
+mirror** by `submodule_mirror_mode`:
+
+| Mode | Effective URL | Resolves local-only pins? |
+|------|---------------|---------------------------|
+| `git-modules` | `<base>/.git/modules/<composedName>` | **yes** — reads a working clone's own object store |
+| `bare-mirror` | `<base>/<org>/<repo>.git` | only if the mirror is fresh |
+
+Both need `submodule_mirror_base`. When the source declares submodules, a mirror
+is **mandatory** — there is deliberately no declared-URL fallback. An absent
+mirror could only reach the network, which fails mid-acquire with a cryptic
+`not our ref` the moment a pin is local-only (a freshly-bumped-but-unpushed
+submodule — the common dev case). So we fail loud instead:
+
+- **`init`** refuses a submodule-bearing source with no mirror (no pool is created).
+- **`acquire`** backstops pools that predate the gate (or whose source gained
+  submodules since): it bails **before** the idle→held flip, leaving the slot
+  detached (idle) and reclaimable rather than HELD with a half-fetched tree.
+
+For a working-clone source you actively commit in, use `git-modules` with
+`base = source`: it resolves whatever the source HEAD references, pushed or not.
+`base` may differ from `source` — e.g. a bare source mirrored from its sibling
+working clone's `.git/modules`.
+
 ## Submodule filtering (`worktreePoolTag`)
 
 Submodule taxonomy lives in source repo's `.gitmodules` (version-controlled,
