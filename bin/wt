@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# wt — convenience wrapper around `worktree-pool` for the common dev-session
-# lifecycle: acquire + launch an interactive shell + safe-recycle on exit.
-# See https://github.com/studio-boxcat/worktree-pool
+# wt — dev-session wrapper around `worktree-pool`: acquire + launch a shell +
+# safe-recycle on exit. See https://github.com/studio-boxcat/worktree-pool
 #
 # Usage:
 #   wt [--pool <key>] init    [--max-slots <n>] [pool-init-flags...]   # default --max-slots 16
+#   wt [--pool <key>] acquire <name> [--from <commit-ish>] [pool-acquire-flags...]   # acquire only, print path
 #   wt [--pool <key>] go      <name> [--from <commit-ish>] [pool-acquire-flags...]
-#   wt [--pool <key>] release <name> [--force]
+#   wt [--pool <key>] release [name] [--force]   # name defaults to cwd's slot
 #   wt [--pool <key>] cleanup <name>     # 🟢/🟡/🔴 exit-trap classifier
 #   wt [--pool <key>] path    <name>     # exit 0 if exists, 1 if not, 2 on error
 #   wt [--pool <key>] ls      [--git-status]
@@ -15,9 +15,6 @@
 #   wt whoami                            # cwd context: worktree|source|none + path
 #   wt orient                            # print current repo path + CLAUDE.md
 #
-# `init` infers --source from `git rev-parse --show-toplevel` and --pool from
-# its basename; pass --pool <key> to override. All other init flags pass through.
-#
 # Pool root: $WORKTREE_ROOT (required — no fallback). Set in ~/.zshenv.local.
 #
 # Pool key auto-resolution (override with --pool):
@@ -25,31 +22,22 @@
 #   2. cwd inside a git repo whose toplevel matches some pool's `source:`
 #   3. error if zero or multiple matches
 #
-# Hooks: if `<source>/.wt-hooks.sh` exists, it is sourced before lifecycle
-# verbs run. Define any of these bash functions to extend behavior; all see
-# $WT_KEY $WT_NAME $WT_PATH $WT_FRESH (1=fresh acquire, 0=resume) in env:
-#
-#   wt_pre_go       — runs after acquire/resume, before launching the shell
-#   wt_pre_cleanup  — runs before the cleanup classifier
-#   wt_post_cleanup — runs after classifier, only on the green/recycled path
-#   wt_post_land    — runs after land succeeds; sees $WT_MAIN_BEFORE/$WT_MAIN_AFTER
-#
-# Hook scripts may also set:
-#   WT_LAUNCHER     — launcher invocation; default `ai`. Receives `-n <name>`
-#                     (and `--continue` on resume) appended.
+# Hooks: `<source>/.wt-hooks.sh` is sourced before lifecycle verbs run; defines
+# any of wt_pre_go / wt_pre_cleanup / wt_post_cleanup / wt_post_land (+ core's
+# wt_post_acquire) and may set WT_LAUNCHER. Full contract (env, firers,
+# WT_FRESH axes): [[wt.md#hooks-sourcewt-hookssh]].
 
 set -uo pipefail   # set -e is per-subcommand (cleanup must always exit 0).
 
-# Fresh-acquire launches that return in <N seconds are suspect — claude/ai
-# couldn't have started a real session. We warn before the EXIT trap recycles.
+# Fresh-acquire launches returning in <N seconds are suspect (launcher never
+# really started); warn before the EXIT trap recycles.
 readonly LAUNCH_MISFIRE_SECS=3
 
 # ---------- helpers ----------
 
 die() { echo "${0##*/}: $*" >&2; exit 1; }
 
-# WORKTREE_ROOT is required. No fallback — every pool path is anchored here, so
-# silent default-to-$HOME/.worktree-pool would mis-locate state on hosts that
+# Required, no fallback: a silent default would mis-locate state on hosts that
 # put the pool elsewhere (external SSD, etc.).
 [ -n "${WORKTREE_ROOT:-}" ] \
   || die "WORKTREE_ROOT is unset. Add 'export WORKTREE_ROOT=\"\$HOME/.worktree-pool\"' to ~/.zshenv.local (or equivalent) and reopen your shell."
@@ -66,12 +54,11 @@ pool_source_path() {
   printf '%s' "${src/#\~/$HOME}"
 }
 
-# Filter captured `worktree-pool ls` output ($1) to held data rows: column 2 ==
-# "held", skipping the 2 header lines. Single source of the ls-column coupling.
+# Filter captured `worktree-pool ls` output ($1) to held data rows (col 2 ==
+# "held", past the 2 header lines). Single source of the ls-column coupling.
 held_data_rows() { printf '%s\n' "$1" | awk 'NR>2 && $2=="held"'; }
 
-# Echo the name of any in-progress git operation (rebase, merge, cherry-pick,
-# revert) for the repo at $1. Empty if clean.
+# Echo any in-progress git operation marker for the repo at $1; empty if clean.
 in_progress_marker() {
   local git_dir
   git_dir=$(git -C "$1" rev-parse --git-dir 2>/dev/null || true)
@@ -86,8 +73,7 @@ in_progress_marker() {
 }
 
 # If $1 has an in-progress git operation, print a recovery hint to stderr and
-# return 1 (dirty). Returns 0 when clean. Callers OR multiple paths together:
-# `report_in_progress p1 || failed=1; report_in_progress p2 || failed=1`.
+# return 1; return 0 when clean. Callers OR multiple paths' failures together.
 report_in_progress() {
   local path=$1 marker
   marker=$(in_progress_marker "$path")
@@ -104,15 +90,14 @@ report_in_progress() {
   return 1
 }
 
-# Echo top-level submodule paths from `<repo>/.gitmodules`, one per line. Empty
-# when the repo has no `.gitmodules`. Top-level only — `git submodule foreach`
-# would recurse into nested.
+# Echo top-level submodule paths from `<repo>/.gitmodules`, one per line.
+# Top-level only — `git submodule foreach` would recurse into nested.
 submodule_paths() {
   git -C "$1" config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null \
     | awk '{print $2}'
 }
 
-# Echo count of commits in <branch> not in main. '?' on rev-list failure.
+# Echo count of commits in <branch> not in main; '?' on rev-list failure.
 # Returns 1 if the branch ref doesn't exist.
 ahead_count() {
   local path=$1 branch=$2
@@ -120,20 +105,17 @@ ahead_count() {
   git -C "$path" rev-list --count "main..$branch" 2>/dev/null || echo '?'
 }
 
-# True iff <slot-path>/.git exists AND resolves. The existence prefix prevents
-# git's upward-walk on a missing gitlink from passing by accident (e.g. user
-# has $HOME/.git for dotfiles).
+# True iff <slot-path>/.git exists AND resolves. The existence prefix stops
+# git's upward-walk on a missing gitlink from passing by accident (e.g. a
+# $HOME/.git for dotfiles).
 slot_repo_ok() {
   [ -e "$1/.git" ] && git -C "$1" rev-parse --git-dir >/dev/null 2>&1
 }
 
-# Resolve a HELD slot's canonical path by branch name OR by canonical slot id.
-# Echoes the path on stdout (exit 0) when held; nothing + exit 1 when not.
-#
-# Two-step resolution lets operators use either identity: branch name from
-# their workflow (`wt release feat-x`) or slot id (`wt release ios-0`).
-# The fallback requires HEAD to be on a branch (held) so `wt go ios-0`
-# against an idle canonical dir doesn't mis-resume.
+# Resolve a HELD slot's canonical path by branch name OR by canonical slot id
+# (exit 0 + path when held; exit 1 when not). Two-step so operators can use
+# either identity. The id fallback requires HEAD on a branch (held) so
+# `wt go ios-0` against an idle canonical dir doesn't mis-resume.
 slot_path_for() {
   local name=$1 path
   if path=$(worktree-pool --pool "$POOL_KEY" path "$name" 2>/dev/null) && [ -n "$path" ]; then
@@ -147,23 +129,22 @@ slot_path_for() {
   printf '%s\n' "$path"
 }
 
-# `land`-prefixed stderr (non-fatal) and fatal helpers. Collapses repeated
-# `echo "land: ..." >&2 [; exit 1]` patterns scattered across cmd_land.
+# `land`-prefixed stderr (non-fatal) and fatal helpers.
 land_warn() { printf 'land: %s\n' "$*" >&2; }
 land_die()  { printf 'land: %s\n' "$*" >&2; exit 1; }
 
-# `git_no_hooks`: suppress user-repo merge/post-checkout
-# hooks during land's mechanical fast-forwards. `wt_post_land` is the
-# documented hook extension point.
+# Suppress user-repo merge/post-checkout hooks during land's mechanical
+# fast-forwards (see [[wt.md#land-flow]] step 12; `wt_post_land` is the
+# documented extension point).
 git_no_hooks() { git -c core.hooksPath=/dev/null "$@"; }
 
 
 # Populate <main_path>'s clone of a newly-introduced top-level submodule <sub>
-# from the SLOT's clone — local, no network (why: see [[land-submodules.md]]).
-# Mirrors acquire's two-phase config-write→update (src/submodules.rs): register
-# from `.gitmodules`, override the URL to the slot clone for the clone itself,
-# then restore the declared URL so origin survives slot recycling. Must run
-# AFTER the parent ff. Returns non-zero on failure; caller warns (non-fatal).
+# from the SLOT's clone — local, no network (see [[land-submodules.md]]).
+# Mirrors acquire's two-phase config-write→update (src/submodules.rs): override
+# the URL to the slot clone for the clone, then restore the declared URL so
+# origin survives slot recycling. Must run AFTER the parent ff. Returns
+# non-zero on failure; caller warns (non-fatal).
 _land_clone_sub_from_slot() {
   local main_path=$1 slot_path=$2 sub=$3 declared
   [ -e "$slot_path/$sub/.git" ] || return 1   # slot has nothing to clone from
@@ -178,8 +159,8 @@ _land_clone_sub_from_slot() {
   return 0
 }
 
-# True iff cwd is somewhere under $1 (after symlink resolution on both sides).
-# Returns 1 if $1 doesn't exist — caller decides whether that's a refuse or a pass.
+# True iff cwd is somewhere under $1 (symlinks resolved on both sides).
+# Returns 1 if $1 doesn't exist — caller decides refuse vs pass.
 inside_dir() {
   [ -d "$1" ] || return 1
   local cwd_real root_real
@@ -188,31 +169,31 @@ inside_dir() {
   [[ "$cwd_real" == "$root_real"/* ]]
 }
 
-# Land lock: per-source mutex serializing `wt land` invocations against the
-# same source repo. Two parallel slots both landing race on `<main>/<sub>` ref
-# updates + main's parent-merge — git's per-ref lockfile catches the worst,
-# but TOCTOU between ancestry-probe and ff is not atomic. One source = one
-# in-flight land; different sources parallelize.
-#
-# Lock file path: `<source>/.git/worktree-pool/land.lock`. Body = bash PID of
-# the holder (operator's shell, not a subcommand). Acquire spins with PID
-# liveness + mtime fallback for crashed holders — macOS ships no `flock(1)`, so
-# this ~40-LOC PID+mtime scheme stands in for it. Released explicitly on:
-#   - normal completion, and
-#   - conflict-exit on the `git merge main` halt — operator's pause is
-#     potentially long, so we drop the lock and re-acquire on resume.
-# Both paths use the EXIT trap below so signals + early `exit 1` always clear.
-#
-# Stale threshold = 5 min. Legitimate hold spans seconds (lock → pre-flight →
-# `git merge main`). Anything older is a wedged holder; PID-liveness catches
-# the common case (SIGHUP / SIGKILL / panic) immediately.
+# Echo the canonical path of the slot cwd sits in ($POOL_ROOT/<slot-id>), or
+# return 1 if cwd isn't inside a slot of this pool. Requires POOL_ROOT set.
+# `inside_dir` guarantees cwd is strictly below the pool root, so the first
+# path component is a slot dir (caller validates via slot_repo_ok).
+slot_path_from_cwd() {
+  inside_dir "$POOL_ROOT" || return 1
+  local cwd_real pool_root_real rel
+  cwd_real=$(pwd -P)
+  pool_root_real=$(cd "$POOL_ROOT" && pwd -P)
+  rel="${cwd_real#"$pool_root_real"/}"
+  printf '%s\n' "$pool_root_real/${rel%%/*}"
+}
+
+# Land lock: per-source mutex serializing `wt land` (see [[wt.md#land-flow]]
+# step 5 for why + reclaim semantics). macOS ships no `flock(1)`, so this is a
+# PID+mtime scheme: lockfile body = holder bash PID, acquire spins with
+# PID-liveness + mtime-stale fallback.
+# Stale threshold 5 min: a legit hold spans seconds; PID-liveness catches the
+# common crash case (SIGHUP/SIGKILL/panic) immediately.
 LAND_LOCK_STALE_SECS=300
 LAND_LOCK_MAX_WAIT_S=60
 
 _land_lock_path() {
-  # `--git-common-dir` returns a path relative to the worktree root on non-bare
-  # clones; anchor on $1 so two lands from different cwds resolve to the same
-  # lockfile.
+  # `--git-common-dir` is relative to the worktree root on non-bare clones;
+  # anchor on $1 so lands from different cwds resolve to the same lockfile.
   local common
   common=$(git -C "$1" rev-parse --git-common-dir 2>/dev/null) || common=".git"
   case "$common" in
@@ -257,7 +238,7 @@ land_lock_acquire() {
 }
 
 # Refuses to delete if the holder PID isn't ours — guards against stomping a
-# successor that reclaimed our lock mid-run after a PID-liveness false positive.
+# successor that reclaimed our lock after a PID-liveness false positive.
 land_lock_release() {
   [ -n "${LAND_LOCK_HELD:-}" ] || return 0
   local holder
@@ -268,9 +249,9 @@ land_lock_release() {
   LAND_LOCK_HELD=""
 }
 
-# Find the absolute path of the worktree that has refs/heads/main checked out.
-# Echoes empty string if no worktree holds main. Pool slots are themselves
-# `git worktree`s of source, so from any slot this returns the source path.
+# Echo the absolute path of the worktree with refs/heads/main checked out,
+# empty if none. Slots are `git worktree`s of source, so from any slot this
+# returns the source path.
 find_main_path() {
   git worktree list --porcelain | awk '
     /^worktree /{p=substr($0, 10)}
@@ -278,8 +259,6 @@ find_main_path() {
   '
 }
 
-# Auto-resolve pool key from cwd. Echoes the key on stdout, returns non-zero
-# (with stderr explanation) on ambiguity / no match.
 # Echo the key of each initialized pool whose `source:` repo canonicalizes to
 # $1 (an absolute, resolved git toplevel), one per line. Empty if none match.
 pool_keys_for_toplevel() {
@@ -334,8 +313,8 @@ Run from inside a pool's source repo or a slot, or pass --pool <key>."
 from inside the source repo, run: wt init [--max-slots <n>] [--groups ...]"
 }
 
-# Lazily resolve `source:` from pool config. Cached in POOL_SOURCE on first call
-# so verbs that don't need it (ls, info, path) skip the awk fork.
+# Lazily resolve+cache `source:` so verbs that don't need it (ls, info, path)
+# skip the awk fork.
 pool_source() {
   [ -n "${POOL_SOURCE:-}" ] && { printf '%s' "$POOL_SOURCE"; return 0; }
   POOL_SOURCE=$(pool_source_path "$POOL_KEY") || die "pool '$POOL_KEY' has no source: in config.yaml"
@@ -353,8 +332,8 @@ source_hooks() {
 }
 
 # Call hook function $1 if defined, passing remaining args. Returns 0 when
-# absent so callers under `set -e` aren't aborted by the missing-fn case
-# (a bare `declare -F … && fn` would propagate declare's non-zero return).
+# absent so callers under `set -e` aren't aborted (a bare `declare -F … && fn`
+# would propagate declare's non-zero return).
 call_hook() {
   local fn="$1"; shift
   if declare -F "$fn" >/dev/null 2>&1; then
@@ -362,9 +341,8 @@ call_hook() {
   fi
 }
 
-# Common prelude for hook fire points: export the WT_* env contract, source
-# the hooks file, then invoke the named hook. $name and $path come from the
-# enclosing function's locals (bash dynamic scoping).
+# Export the WT_* env contract, source the hooks file, invoke the named hook.
+# $name and $path come from the enclosing function's locals (dynamic scoping).
 fire_hook() {
   local hook_name="$1" fresh="$2"
   export WT_KEY="$POOL_KEY" WT_NAME="$name" WT_PATH="$path" WT_FRESH="$fresh"
@@ -374,10 +352,7 @@ fire_hook() {
 
 # ---------- subcommands ----------
 
-# Print the absolute slot path. With canonical-only slots, the path basename is
-# always `{group}-N` / `slot-N` — the user-given name lives in the branch ref.
-# Resolution delegated to `slot_path_for` (branch lookup, then canonical-id
-# fallback for held slots with detached HEAD). Exit:
+# Print the absolute slot path (resolution via slot_path_for). Exit:
 #   0 — held slot found at the printed path
 #   1 — no held slot matches NAME (printed path is a literal canonical-id guess)
 #   2 — usage error or pool not initialized
@@ -392,18 +367,36 @@ cmd_path() {
     printf '%s\n' "$path"
     return 0
   fi
-  # Not held — emit a best-guess literal-canonical path for the caller to inspect.
+  # Not held — emit a best-guess literal-canonical path for the caller.
   printf '%s\n' "$POOL_ROOT/$name"
   return 1
+}
+
+# Thin acquire: create a slot, print its path. No cd, no launcher, no trap.
+cmd_acquire() {
+  set -e
+  local name="${1:-}"; shift || true
+  [ -n "$name" ] || die "usage: wt acquire <name> [--from <commit-ish>] [pool-acquire-flags...]"
+
+  # `--from <X>` → `--commit <X>`.
+  local acquire_args=() from=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from)   [ $# -ge 2 ] || die "--from requires an argument"; from="$2"; shift 2 ;;
+      --from=*) from="${1#--from=}"; shift ;;
+      *)        acquire_args+=("$1"); shift ;;
+    esac
+  done
+  [ -n "$from" ] && acquire_args=(--commit "$from" ${acquire_args[@]+"${acquire_args[@]}"})
+
+  worktree-pool --pool "$POOL_KEY" acquire "$name" ${acquire_args[@]+"${acquire_args[@]}"}
 }
 
 cmd_go() {
   set -e
   local name="${1:-}"; shift || true
-  # Bare `wt go`: show currently-held slots so the operator can see what's
-  # already in flight before typing a name, then a usage warning so the
-  # missing arg is unambiguous (vs. a silent ls). Idle/fresh rows are
-  # filtered out — uninteresting noise at this prompt.
+  # Bare `wt go`: show held slots (what's in flight) then a usage warning.
+  # Idle/fresh rows filtered out as noise.
   if [ -z "$name" ]; then
     local ls_out
     ls_out=$(worktree-pool --pool "$POOL_KEY" ls)
@@ -422,7 +415,7 @@ cmd_go() {
     exit 2
   fi
 
-  # Translate `--from <X>` → `--commit <X>` for the underlying acquire.
+  # `--from <X>` → `--commit <X>` for the underlying acquire.
   local acquire_args=() from=""
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -431,17 +424,15 @@ cmd_go() {
       *)          acquire_args+=("$1"); shift ;;
     esac
   done
-  # `${arr[@]+...}` form keeps empty-array expansion safe under bash 3.2's `set -u`.
+  # `${arr[@]+...}` keeps empty-array expansion safe under bash 3.2 `set -u`.
   [ -n "$from" ] && acquire_args=(--commit "$from" ${acquire_args[@]+"${acquire_args[@]}"})
 
   inside_dir "$POOL_ROOT" && die "refusing to nest — already inside a pool slot."
 
-  # Non-TTY guard. The launcher (`ai` / `claude`) needs an interactive terminal;
-  # without one it exits in <1s, the EXIT trap fires, and a fresh+clean slot
-  # silently 🟢-recycles — operator sees nothing useful happen. Refuse early
-  # with a clear message. Override via `WT_GO_ALLOW_NOTTY=1` for CI/scripts
-  # that drive `wt go` non-interactively (rare; usually `worktree-pool acquire`
-  # is the right primitive).
+  # Non-TTY guard: the launcher needs an interactive terminal; without one it
+  # exits in <1s, the EXIT trap fires, and a fresh+clean slot silently
+  # 🟢-recycles. Refuse early. Override via `WT_GO_ALLOW_NOTTY=1` for CI
+  # (rare; `worktree-pool acquire` is usually the right primitive).
   if [ -z "${WT_GO_ALLOW_NOTTY:-}" ] && { [ ! -t 0 ] || [ ! -t 1 ]; }; then
     die "go: no TTY on stdin/stdout — launcher would misfire and the EXIT trap \
 would silently recycle the slot.
@@ -450,15 +441,10 @@ would silently recycle the slot.
 WT_GO_ALLOW_NOTTY=1."
   fi
 
-  # If a slot with this name already exists, resume it instead of acquiring.
-  # Warn loudly — `--from` and other acquire flags are ignored on resume
-  # (slot stays at its existing commit). A dir whose `.git` gitlink is missing
-  # or dangling (ghost slot — partial cleanup debris) is NOT resumable; we
-  # refuse loudly so the operator can decide between recovery and rm -rf.
-  # Broken-dir guard: a canonical dir whose `.git` gitlink is missing or
-  # dangling. `slot_path_for` (which requires HEAD on a branch) would skip
-  # these and fall through to fresh-acquire, silently masking the operator's
-  # debris. Surface it loudly here before deciding resume vs fresh.
+  # Broken-dir guard: a canonical dir with a missing/dangling `.git` gitlink
+  # (ghost slot — partial-cleanup debris). slot_path_for (needs HEAD on a
+  # branch) would skip it and fall through to fresh-acquire, masking the debris.
+  # Surface it loudly before deciding resume vs fresh.
   local literal_path="$POOL_ROOT/$name"
   if [ -d "$literal_path" ] && ! slot_repo_ok "$literal_path"; then
     die "slot '$name' at $literal_path is broken (no valid .git — likely partial-cleanup debris). \
@@ -479,30 +465,24 @@ Recover with: rm -rf $(printf '%q' "$literal_path"), then re-run."
     fi
   fi
 
-  # EXIT trap → `wt _exit_handler`. Handler decides between (a) the misfire-
-  # preserve 🟡 path (fresh acquire + clean tree + launcher exited fast,
-  # < LAUNCH_MISFIRE_SECS), which leaves the slot personalized for inspection,
-  # and (b) the normal `wt cleanup` path. WT_FRESH/WT_LAUNCH_START are exported
-  # empty here and set to their real values just before the launcher exec
-  # (below); a failure before that point (e.g. a crashed wt_pre_go hook) fires
-  # the trap with WT_FRESH still empty, so it routes to cleanup, not preserve.
-  # (The no-TTY misfire is refused earlier by an explicit die, before this trap.)
+  # EXIT trap → `wt _exit_handler`, which routes between the misfire-preserve
+  # 🟡 path and the normal `wt cleanup` path. WT_FRESH/WT_LAUNCH_START start
+  # empty and get real values just before the launcher exec; a failure before
+  # that (e.g. crashed wt_pre_go) fires the trap with WT_FRESH empty → cleanup,
+  # not preserve.
   export WT_KEY="$POOL_KEY" WT_NAME="$name" WT_FRESH="" WT_LAUNCH_START=""
   trap "'$0' --pool \"\$WT_KEY\" _exit_handler \"\$WT_NAME\"" EXIT
 
   printf '\n──── session: %s/%s @ %s ────\n\n' "$POOL_KEY" "$name" "$path"
 
-  # Pre-launch hook (deps install, dev-server start, etc). Non-zero exit aborts
-  # launch under set -e and triggers the EXIT trap.
+  # Pre-launch hook. Non-zero exit aborts launch under set -e + fires EXIT trap.
   local fresh; fresh=$([ "$existing" = 0 ] && echo 1 || echo 0)
   fire_hook wt_pre_go "$fresh"
 
-  # `-n <name>` sets claude's session display name (prompt box, /resume picker,
-  # terminal title). `--append-system-prompt` warns subagents about the
-  # cross-worktree refs/stash race (the per-slot alias enforces it; this is the
-  # in-band reminder so models pick the right pattern up front). Both flags
-  # assume the launcher accepts them — true for `claude` and the default `ai`
-  # wrapper. printf %q quotes for the inline `zsh -ic` shell.
+  # `-n <name>` sets claude's session display name. `--append-system-prompt`
+  # warns subagents about the cross-worktree refs/stash race up front. Both
+  # flags assume the launcher accepts them (true for `claude` / default `ai`).
+  # printf %q quotes for the inline `zsh -ic` shell.
   local launcher="${WT_LAUNCHER:-ai}"
   local wt_prompt
   wt_prompt="You are inside a worktree-pool slot ($POOL_KEY/$name). Never run \`git stash\` here — \
@@ -513,10 +493,9 @@ For save/restore around tests use commit + soft-reset instead: \
   printf -v cmd '%s -n %q --append-system-prompt %q' "$launcher" "$name" "$wt_prompt"
   [ "$existing" = 1 ] && cmd="$cmd --continue"
 
-  # `set +e` for the subshell so a non-zero exit doesn't trip cmd_go's `set -e`
-  # before we can print the misfire warning below.
-  # WT_LAUNCH_START exported into the EXIT trap env: its presence proves we
-  # reached the launcher; the handler reads it to compute launch_dur.
+  # `set +e` around the subshell so a non-zero exit doesn't trip cmd_go's
+  # `set -e` before the misfire warning below. WT_LAUNCH_START in the trap env
+  # proves we reached the launcher; the handler reads it to compute launch_dur.
   export WT_FRESH="$fresh"
   export WT_LAUNCH_START=${EPOCHSECONDS:-$(date +%s)}
   set +e
@@ -532,17 +511,11 @@ For save/restore around tests use commit + soft-reset instead: \
   fi
 }
 
-# EXIT-trap target installed by `cmd_go`. Decides whether to preserve the slot
-# (🟡 misfire path) or delegate to `cmd_cleanup` (normal path).
-#
-# Misfire preserve fires when ALL of:
+# EXIT-trap target installed by `cmd_go`. Preserves the slot (🟡 misfire) or
+# tail-calls cmd_cleanup. Always exits 0. Misfire-preserve fires only when ALL:
 #   - WT_FRESH=1 (this acquire created the slot; resumes never recycle silently)
-#   - launcher exited fast (dur < LAUNCH_MISFIRE_SECS); WT_FRESH=1 implies the
-#     launcher was reached (both exported together), so dur is a real measurement
-#   - working tree is clean (no porcelain output)
-#   - no commits ahead of main
-# In that case we print a 🟡 line and return without recycling. Otherwise we
-# tail-call cmd_cleanup. Always exits 0.
+#   - launcher exited fast (dur < LAUNCH_MISFIRE_SECS)
+#   - working tree clean, and no commits ahead of main
 cmd__exit_handler() {
   local name="${1:-}"
   [ -n "$name" ] || exit 0
@@ -556,9 +529,8 @@ cmd__exit_handler() {
   if [ "${WT_FRESH:-}" = "1" ]; then
     local now dur
     now=${EPOCHSECONDS:-$(date +%s)}
-    # WT_FRESH=1 ⟹ WT_LAUNCH_START was set (exported together, just before
-    # launch); `:-0` only covers the impossible-in-practice gap, yielding a
-    # large dur → cleanup, never a false preserve.
+    # WT_FRESH=1 ⟹ WT_LAUNCH_START set; `:-0` only covers the impossible gap,
+    # yielding a large dur → cleanup, never a false preserve.
     dur=$(( now - ${WT_LAUNCH_START:-0} ))
 
     local porcelain ahead
@@ -602,10 +574,9 @@ cmd_land() {
     exit 1
   fi
 
-  # No-op early exit: slot already landed (HEAD ≡ main) and tree is clean. Skip
-  # the land.lock acquisition and submodule preflight entirely — operators
-  # verifying "did I land?" shouldn't trip refusals from unrelated in-progress
-  # state in main_path or its submodules.
+  # No-op early exit: slot already landed (HEAD ≡ main) and tree clean. Skips
+  # the land.lock + submodule preflight so a "did I land?" check never trips
+  # refusals from unrelated in-progress state in main_path or its submodules.
   if [ -z "$msg" ] && git diff --quiet && git diff --cached --quiet \
       && [ -z "$(git ls-files --others --exclude-standard)" ]; then
     local main_sha
@@ -616,13 +587,11 @@ cmd_land() {
     fi
   fi
 
-  # Clear a leftover git index.lock before the auto-commit below — a crashed
-  # lazygit/git can leave one, which would fail `git add`/`commit` with a generic
-  # error. Unconditional remove (no staleness check). Placed AFTER the no-op
-  # early-exit so a read-only "did I land?" run never deletes a lock a live git
-  # may hold; only the commit path needs the index writable.
-  # WARNING: if a git process is actively writing the index right now (e.g. a
-  # running lazygit), this races it — accepted for unattended lands.
+  # Clear a leftover git index.lock (crashed lazygit/git) before the auto-commit
+  # — it would otherwise fail `git add`/`commit`. Unconditional remove, placed
+  # AFTER the no-op early-exit so a read-only run never deletes a live lock.
+  # WARNING: races a git process actively writing the index — accepted for
+  # unattended lands.
   local index_lock
   index_lock=$(git rev-parse --git-path index.lock)
   if [ -e "$index_lock" ]; then
@@ -643,20 +612,16 @@ cmd_land() {
   [ -n "$main_path" ] || land_die "main is not checked out in any worktree"
   slot_path=$(git rev-parse --show-toplevel)
 
-  # Acquire per-source land.lock before any check that reads main_path's state
-  # — without serialization, two parallel lands race on submodule preflights,
-  # ff targets, and main's ref. EXIT trap releases on every exit path (normal,
-  # die, conflict-exit, SIGHUP/SIGKILL is handled by the next acquirer's
-  # PID-liveness reclaim).
+  # Acquire per-source land.lock before any check reading main_path's state.
+  # EXIT trap releases on every exit path (SIGHUP/SIGKILL handled by the next
+  # acquirer's PID-liveness reclaim).
   land_lock_acquire "$main_path"
   trap 'land_lock_release' EXIT
 
-  # In-progress check on main worktree + its top-level submodules. The slot→main
-  # submodule-clone advance and the parent ff below write to these clones; an
-  # unfinished rebase/merge there would surface as a confusing mid-flow failure
-  # with no precise hint. Refuse early with a per-path recovery hint. Skip nested
-  # (the submodule advance is top-level only) and skip the slot's own submodules
-  # (the slot-side refresh is cosmetic best-effort).
+  # In-progress check on main worktree + its top-level submodules: the slot→main
+  # advance and parent ff below write to these clones, and an unfinished
+  # rebase/merge there surfaces as a confusing mid-flow failure. Skip nested and
+  # the slot's own submodules (slot-side refresh is cosmetic best-effort).
   local main_marker_failed=0
   report_in_progress "$main_path" || main_marker_failed=1
   while IFS= read -r sub_path; do
@@ -668,7 +633,7 @@ cmd_land() {
 
   # Tracked-uncommitted check only: the parent `merge --ff-only` refuses on
   # untracked-overwrite, and `--ignore-submodules=untracked` lets land proceed
-  # alongside dirty content inside submodules. The `awk` drops `??` (untracked) rows.
+  # alongside dirty submodule content. The `awk` drops `??` (untracked) rows.
   local main_dirty
   main_dirty=$(git -C "$main_path" status --porcelain --ignore-submodules=untracked | awk '!/^\?\?/')
   if [ -n "$main_dirty" ]; then
@@ -681,12 +646,12 @@ cmd_land() {
   if ! git diff --quiet || ! git diff --cached --quiet; then
     # Pre-stage submodule sync (see [[land-submodules.md#the-phases]]): a stale
     # post-merge working dir would be staged by `git add -u` as a gitlink
-    # regression. Classify index gitlink vs working HEAD by ancestry:
-    #   working == index → in sync, skip.
-    #   working < index  → post-merge stale; `submodule update` brings it forward.
-    #   working > index  → operator's pending forward bump; leave for auto-commit.
-    #   diverged         → refuse; operator resolves.
-    # `protocol.file.allow=always`: pool slots' submodule clones use `file://` origins.
+    # regression. Classify working HEAD vs index gitlink by ancestry:
+    #   ==        → in sync, skip
+    #   working < index → post-merge stale; `submodule update` brings it forward
+    #   working > index → operator's pending forward bump; leave for auto-commit
+    #   diverged  → refuse; operator resolves
+    # `protocol.file.allow=always`: slot submodule clones use `file://` origins.
     local sub_sync_failed=0
     if [ -f "$slot_path/.gitmodules" ]; then
       local sub_path sub_index_sha sub_head_sha sub_full
@@ -699,9 +664,9 @@ cmd_land() {
         [ -n "$sub_index_sha" ] || continue
         sub_head_sha=$(git -C "$sub_full" rev-parse HEAD 2>/dev/null) || continue
         [ "$sub_index_sha" = "$sub_head_sha" ] && continue
-        # Ensure index SHA is reachable for the ancestry probe. Stock `git merge`
-        # updates the parent's gitlink but doesn't fetch into the submodule clone
-        # — the new SHA may live only in main's submodule clone.
+        # Ensure index SHA is reachable for the ancestry probe: `git merge`
+        # updates the gitlink but doesn't fetch into the submodule clone, so the
+        # new SHA may live only in main's submodule clone.
         if ! git -C "$sub_full" cat-file -e "${sub_index_sha}^{commit}" 2>/dev/null \
             && [ -e "$main_path/$sub_path/.git" ]; then
           git -C "$sub_full" fetch --quiet "$main_path/$sub_path" 2>/dev/null || true
@@ -743,18 +708,16 @@ cmd_land() {
     fi
   fi
 
-  # Capture pre-merge main for wt_post_land hook, and pre-merge slot HEAD
-  # for the slot-direction submodule refresh below (the post-merge HEAD is
-  # the merge commit; we need the pre-merge tip to compute what the merge
-  # brought in from main's side).
+  # Pre-merge main (for wt_post_land hook) and pre-merge slot HEAD (the
+  # slot-direction submodule refresh below diffs against it to see what the
+  # merge brought in from main's side; post-merge HEAD is the merge commit).
   local main_before slot_head_pre_merge
   main_before=$(git rev-parse main)
   slot_head_pre_merge=$(git rev-parse HEAD)
 
-  # Merge main. Common case (no parallel land): main is ancestor of slot HEAD,
-  # so this is a no-op ("Already up to date.") — slot's commits will fast-forward
-  # main below. Only when a parallel slot has advanced main do we get a real
-  # 3-way merge (with potential conflicts; resume = re-run after manual commit).
+  # Merge main. Common case (no parallel land): no-op ("Already up to date.") —
+  # slot's commits fast-forward main below. Only a parallel slot advancing main
+  # yields a real 3-way merge (resume = re-run after manual commit).
   if ! git merge -m "Merge main into $branch" main; then
     echo >&2
     land_warn "merge halted with conflicts. Resolve and either:"
@@ -772,12 +735,10 @@ cmd_land() {
     exit 1
   fi
 
-  # Reorder parents on the auto-generated merge so main's first-parent history
-  # stays on mainline (slot-side `git merge main` puts slot tip as first parent
-  # — inverted vs. "merge feature into main" convention). Applies to operator-
-  # authored resume commits too (same inversion). Tree-identical rewrite — we
-  # preserve message + author + committer identity since no content changed,
-  # only the parent-pointer order. Skip no-ops and octopus merges (commit-tree
+  # Reorder parents on the auto-generated merge so main stays first-parent on
+  # mainline (slot-side `git merge main` puts slot tip first — inverted vs.
+  # "merge feature into main"). Tree-identical rewrite preserving message +
+  # author + committer identity. Skip no-ops and octopus merges (commit-tree
   # -p main -p slot would silently drop parents 3+).
   local post_merge_head
   post_merge_head=$(git rev-parse HEAD)
@@ -789,8 +750,8 @@ cmd_land() {
       local orig_committer_name orig_committer_email orig_committer_date new_merge
       main_now=$(git rev-parse HEAD^2)
       orig_msg=$(git log -1 --format=%B HEAD)
-      # Replace the topology-inverted auto-generated message; preserve operator-
-      # authored resume messages verbatim.
+      # Replace the inverted auto-generated message; keep operator-authored
+      # resume messages verbatim.
       if [ "$(printf '%s' "$orig_msg" | head -1)" = "Merge main into $branch" ]; then
         orig_msg="Merge $branch into main"
       fi
@@ -819,20 +780,15 @@ cmd_land() {
   local slot_head
   slot_head=$(git rev-parse HEAD)
 
-  # Advance main's existing submodule clones to the pinned commits, LOCALLY,
-  # BEFORE the parent ff — so a failure (untracked collision / divergence)
-  # leaves main at main_before and the re-run retries the same set, never
-  # stranding the operator half-landed. For each clone, fetch the slot sub's
-  # HEAD (= the pin; the pre-stage sync keeps working HEAD == index gitlink, and
-  # HEAD always exists — fetching the superproject branch name was the old
-  # `couldn't find remote ref <branch>` bug) then fast-forward. Local path
-  # source, no origin. ff-only refuses on collision/divergence (subsuming the
-  # old ancestry preflight) and detaches no further than HEAD already is — the
-  # clone needs no branch since the next land fetches by HEAD too. Top-level
-  # only. `.git` is a gitlink *file* (`-e`, not `-d`). See [[land-submodules.md]].
+  # Advance main's existing submodule clones to the pinned commits, LOCALLY and
+  # BEFORE the parent ff — so a failure (collision/divergence) leaves main at
+  # main_before and the re-run retries the same set, never stranding the
+  # operator half-landed. Fetch the slot sub's HEAD (= the pin) then ff-only
+  # (refuses on collision/divergence). Local path source, no origin. Top-level
+  # only; `.git` is a gitlink *file* (`-e`). See [[land-submodules.md]].
   #
-  # new_subs: main has no clone (newly introduced, or clone gone) — nothing to
-  # fast-forward; cloned from the slot post-ff by _land_clone_sub_from_slot.
+  # new_subs: main has no clone (newly introduced/gone) — cloned from the slot
+  # post-ff by _land_clone_sub_from_slot.
   local sub new_sha moved new_subs=()
   moved=$(git diff --raw "$main_before" "$slot_head" | awk '$2=="160000" {print $6}')
   while IFS= read -r sub; do
@@ -852,27 +808,23 @@ cmd_land() {
     echo "land: submodule $sub → ${new_sha:0:7}"
   done <<< "$moved"
 
-  # Skip the no-op so re-runs are idempotent (e.g. after manual conflict resolution).
+  # Skip the no-op so re-runs are idempotent (e.g. after manual conflict fix).
   if [ "$main_before" != "$slot_head" ]; then
-    # `merge --ff-only` advances whatever HEAD points to, not refs/heads/main
-    # by name — so anchor on the symref before letting it run.
+    # `merge --ff-only` advances whatever HEAD points to, not refs/heads/main by
+    # name — anchor on the symref first.
     local main_ref
     main_ref=$(git -C "$main_path" symbolic-ref HEAD 2>/dev/null || true)
     [ "$main_ref" = "refs/heads/main" ] \
       || land_die "$main_path has $main_ref checked out, expected refs/heads/main"
-    # core.hooksPath=/dev/null: don't fire user repos' post-merge —
-    # wt_post_land is the documented hook surface.
     git_no_hooks -C "$main_path" merge --ff-only --quiet "$slot_head" \
       || land_die "fast-forward refused in $main_path — likely an untracked file at a path the slot adds; move/remove it and re-run"
   fi
   local main_after
   main_after=$(git rev-parse main)
 
-  # Populate main's clones of newly-introduced submodules — collected above
-  # because main had no clone to fast-forward. Now that the ff recorded their
-  # gitlinks + .gitmodules, clone each from the slot's populated clone (local,
-  # keeps slot-local commits — see _land_clone_sub_from_slot). Non-fatal: main
-  # is already advanced, so a failure warns with the recovery command.
+  # Populate main's clones of newly-introduced submodules (collected above).
+  # The ff recorded their gitlinks + .gitmodules; clone each from the slot's
+  # populated clone. Non-fatal — main is already advanced — so failures warn.
   for sub in ${new_subs[@]+"${new_subs[@]}"}; do
     if _land_clone_sub_from_slot "$main_path" "$slot_path" "$sub"; then
       echo "land: submodule $sub populated in main → $(git -C "$main_path/$sub" rev-parse --short HEAD 2>/dev/null)"
@@ -881,12 +833,11 @@ cmd_land() {
     fi
   done
 
-  # Refresh the slot's submodule clones to the gitlinks main brought in via the
-  # `git merge main` above — without it `git status` shows phantom rewinds. Fetch each pin
-  # LOCALLY from main's clone (HEAD = the pin), then `submodule update` checks
-  # them out. Cosmetic — main is already advanced — so failures only WARN.
-  # Diffing slot_head_pre_merge→HEAD yields the gitlinks merged from main's side;
-  # the `.git` guard skips additions the slot has no clone for. Top-level only.
+  # Refresh the slot's submodule clones to the gitlinks main brought in via
+  # `git merge main` (else `git status` shows phantom rewinds). Fetch each pin
+  # locally from main's clone, then `submodule update`. Cosmetic — main is
+  # already advanced — so failures only WARN. Diff slot_head_pre_merge→HEAD for
+  # the merged-in gitlinks; `.git` guard skips additions with no slot clone.
   local main_brought refresh=()
   main_brought=$(git diff --raw "$slot_head_pre_merge" HEAD | awk '$2=="160000" {print $6}')
   while IFS= read -r sub; do
@@ -909,8 +860,8 @@ cmd_land() {
 
   echo "land: $branch landed; main at $(git rev-parse --short HEAD)"
 
-  # Post-land hook (deps-changed advisory etc). Source hooks from main_path
-  # since land runs without a pool key — main_path IS the source repo.
+  # Post-land hook. Source from main_path — land runs without a pool key, and
+  # main_path IS the source repo.
   export WT_MAIN_BEFORE="$main_before" WT_MAIN_AFTER="$main_after"
   source_hooks "$main_path"
   call_hook wt_post_land || true
@@ -945,8 +896,7 @@ cmd_cleanup() {
     exit 0
   fi
 
-  # Pre-cleanup hook (e.g. dev-server stop). Best-effort — failure here
-  # shouldn't block the classifier from running.
+  # Pre-cleanup hook. Best-effort — failure must not block the classifier.
   fire_hook wt_pre_cleanup 0 || true
 
   local marker
@@ -976,8 +926,7 @@ cmd_cleanup() {
     exit 0
   fi
 
-  # Only print 🟢 if release actually succeeded — silencing release's exit code
-  # would lie about a still-broken slot.
+  # Only print 🟢 if release succeeded — else we'd lie about a still-broken slot.
   if "$0" --pool "$POOL_KEY" release "$name"; then
     printf '%s🟢 recycled cleanly: %s/%s%s\n' "$G" "$POOL_KEY" "$name" "$X"
     call_hook wt_post_cleanup || true
@@ -987,18 +936,11 @@ cmd_cleanup() {
   fi
 }
 
-# Run `cleanup` on every held slot in the pool. Operator-driven; not invoked
-# automatically. Catches orphans whose EXIT trap never fired (killed shell,
-# detached-HEAD slots whose branch was hand-deleted, manual worktree adds).
-# Always exits 0 — same trap-friendly contract as cleanup itself.
-#
-# **Concurrency.** Not serialized against parallel `wt go`s. Safe because
-# (a) cleanup→release→`worktree-pool release` takes the pool mutex per-slot,
-# and (b) new acquires reuse existing canonical slots in place — there's no
-# rename, so sweep iterating held branch names doesn't collide with parallel
-# acquires picking idle slot ids. A racing operator-driven `wt release` of a
-# slot sweep is about to clean up just makes cleanup's "already recycled"
-# path fire — harmless.
+# Run `cleanup` on every held slot. Operator-driven; catches orphans whose EXIT
+# trap never fired (killed shell, hand-deleted branch, manual worktree adds).
+# Always exits 0. Not serialized against parallel `wt go`s, but safe: release
+# takes the pool mutex per-slot, and acquires reuse canonical slots in place
+# (no rename), so iterating held branch names can't collide with idle-slot picks.
 cmd_sweep() {
   [ $# -eq 0 ] || die "sweep takes no arguments"
 
@@ -1015,9 +957,8 @@ cmd_sweep() {
   while IFS= read -r name; do
     [ -n "$name" ] || continue
     total=$((total + 1))
-    # Detect recycle by checking whether the slot is still held after cleanup.
-    # cleanup itself always exits 0, so we can't read its exit code, and
-    # parsing its colored output is brittle.
+    # Detect recycle via still-held-after state — cleanup always exits 0, so its
+    # exit code is unreadable and its colored output is brittle to parse.
     before=1
     slot_path_for "$name" >/dev/null || before=0
     "$0" --pool "$POOL_KEY" cleanup "$name"
@@ -1041,13 +982,10 @@ cmd_sweep() {
 
 cmd_release() {
   set -e
-  # Pre-parse `--force` / `-f` so it can appear before or after positionals.
-  # `--force` skips the work-preservation safety (dirty + unmerged); the
-  # ghost-dir guard remains because release physically can't run without git
-  # state — broken slots need explicit `rm -rf`, not --force.
-  # Reject other `--*` flags so a stray typo doesn't get silently treated as
-  # a slot named `--whatever`. `--` is end-of-options for slot names that
-  # begin with `-` (rare).
+  # Pre-parse `--force`/`-f` (either side of positionals). `--force` skips the
+  # dirty+unmerged safety but NOT the ghost-dir guard (broken slots need
+  # `rm -rf`, not --force). Reject other `--*`/`-*` so a typo isn't treated as a
+  # slot name; `--` ends options for names starting with `-` (rare).
   local force=0 args=() arg seen_endopts=0
   for arg in "$@"; do
     if [ "$seen_endopts" = 1 ]; then
@@ -1064,7 +1002,18 @@ cmd_release() {
   set -- ${args[@]+"${args[@]}"}
 
   local name="${1:-}"; shift || true
-  require_arg name "$name" "wt release <name> [--force]"
+  # No name → release the slot cwd sits in; resolve its branch so the rest of
+  # the flow matches an explicit `release NAME`.
+  if [ -z "$name" ]; then
+    local cwd_slot
+    cwd_slot=$(slot_path_from_cwd) \
+      || die "wt release [name] — no name given and cwd isn't inside a slot. Pass a name or cd into a slot."
+    slot_repo_ok "$cwd_slot" \
+      || die "cwd's slot at $cwd_slot is broken (no valid .git). Recover with: rm -rf $(printf '%q' "$cwd_slot")"
+    name=$(git -C "$cwd_slot" symbolic-ref --short --quiet HEAD 2>/dev/null) \
+      || die "cwd's slot at $cwd_slot is idle (detached HEAD) — nothing to release."
+  fi
+  require_arg name "$name" "wt release [name] [--force]"
 
   # Broken-dir guard: surface ghost dirs loudly (slot_path_for would skip them).
   local literal_path="$POOL_ROOT/$name"
@@ -1100,8 +1049,7 @@ cmd_release() {
     fi
   fi
 
-  # Remote branch delete is delegated to release.rs's silent push_delete
-  # (best-effort).
+  # Remote branch delete delegated to release.rs's silent push_delete.
   worktree-pool --pool "$POOL_KEY" release "$name"
 }
 
@@ -1122,8 +1070,8 @@ cmd_whoami() {
     key="${rel%%/*}"
     rest="${rel#*/}"
     name="${rest%%/*}"
-    # Bare cwd == pool root (no key) or cwd at $WORKTREE_ROOT/<key> with no slot
-    # below: not a worktree context. Fall through to none.
+    # Bare pool root or $WORKTREE_ROOT/<key> with no slot below: not a worktree
+    # context — fall through to none.
     if [ -n "$key" ] && [ "$rel" != "$key" ] && [ -n "$name" ]; then
       printf 'worktree\t%s\n' "$WORKTREE_ROOT/$key/$name" | sed "s|$HOME|~|"
       return 0
@@ -1156,15 +1104,10 @@ cmd_orient() {
 }
 
 cmd_ls() {
-  # Show only held slots; drop ID (canonical slot-N is meaningless to
-  # operators — the branch NAME is the real identity), drop STATE
-  # (constant after filter), and drop GROUP when uniform across held rows.
-  # Use `worktree-pool ls` for the full table including idle/fresh rows
-  # (where the ID column matters because there's no branch yet).
-  #
-  # Defaults `--git-status` on (DIRTY/UNTRK/AHEAD): the dev-session wrapper
-  # is almost always asked "what state are my slots in?", and one
-  # `git status --porcelain` per held slot is cheap. `--bare` opts out.
+  # Held slots only; drop ID (canonical slot-N — branch NAME is the real
+  # identity), STATE (constant after filter), and GROUP when uniform. Use
+  # `worktree-pool ls` for the full table incl idle rows. `--git-status` on by
+  # default (DIRTY/UNTRK/AHEAD; cheap per held slot); `--bare` opts out.
   local bare=0 forward=()
   local arg
   for arg in "$@"; do
@@ -1192,13 +1135,12 @@ cmd_ls() {
 }
 
 # Initialize a pool, inferring --source from cwd's git toplevel and --pool from
-# its basename (override via `wt --pool <key> init`). All other flags pass
-# through to `worktree-pool init`; `--max-slots` defaults to 16 if omitted.
+# its basename. Other flags pass through; `--max-slots` defaults to 16.
 cmd_init() {
   set -e
 
-  # Refuse from inside any existing pool — `git rev-parse --show-toplevel` would
-  # resolve to the slot, not the underlying source repo.
+  # Refuse from inside any pool — `--show-toplevel` would resolve to the slot,
+  # not the source repo.
   inside_dir "$WORKTREE_ROOT" \
     && die "init: refusing to run from inside a pool slot — cd into the source repo first."
 
@@ -1226,9 +1168,8 @@ cmd_info() {
 
 # ---------- help ----------
 
-# Per-verb usage. `wt help [verb]` and `wt <verb> --help` route here. Each
-# block mirrors the contract in docs/wt.md so the CLI is self-documenting
-# without requiring the operator to grep markdown.
+# Per-verb usage. `wt help [verb]` and `wt <verb> --help` route here; blocks
+# mirror docs/wt.md so the CLI is self-documenting.
 print_help() {
   local verb="${1:-}"
   case "$verb" in
@@ -1250,6 +1191,14 @@ Print the absolute slot path. Exit 0 if slot exists, 1 if not, 2 on error.
 Lets scripts branch on resume vs. fresh acquire.
 EOF
       ;;
+    acquire)
+      cat <<'EOF'
+wt [--pool <key>] acquire <name> [--from <commit-ish>] [pool-acquire-flags...]
+
+Acquire a slot and print its path. No session launch, no cleanup trap — the
+plain primitive with pool-key inference and `--from` (→ acquire --commit).
+EOF
+      ;;
     go)
       cat <<'EOF'
 wt [--pool <key>] go <name> [--from <commit-ish>] [pool-acquire-flags...]
@@ -1264,10 +1213,12 @@ EOF
       ;;
     release)
       cat <<'EOF'
-wt [--pool <key>] release <name> [--force|-f]
+wt [--pool <key>] release [name] [--force|-f]
 
 Manual safety-checked release. Refuses on dirty working tree or commits not
 in main; refuses 🔴 BROKEN slots (recover via `rm -rf`).
+  [name]         branch of the slot to release; defaults to the slot cwd
+                 sits in (resolved via its current branch)
   --force / -f   discard dirty tracked changes and unmerged commits
 EOF
       ;;
@@ -1344,6 +1295,7 @@ wt — dev-session wrapper around `worktree-pool`.
 
 Pool lifecycle:
   init     initialize a pool (run from inside the source repo)
+  acquire  acquire a slot and print its path (no session)
   go       acquire/resume a slot and launch a session
   release  safety-checked release of a slot
   cleanup  classifier invoked by `go`'s EXIT trap (🟢/🟡/🔴)
@@ -1376,7 +1328,7 @@ EOF
 # ---------- dispatch ----------
 
 POOL_KEY=""
-# Parse `--pool <key>` / `-p <key>` anywhere before the verb.
+# `--pool <key>` / `-p <key>` anywhere before the verb.
 while [ $# -gt 0 ]; do
   case "$1" in
     --pool)   [ $# -ge 2 ] || die "--pool requires an argument"; POOL_KEY="$2"; shift 2 ;;
@@ -1394,9 +1346,8 @@ case "$verb" in
   help)         print_help "${1:-}"; exit 0 ;;
 esac
 
-# Per-verb help: `wt <verb> --help` / `-h` anywhere in args. Routes before the
-# subcommand sees the args, so `--help` can't get treated as a positional
-# (e.g. `wt cleanup --help` was previously parsed as a slot named `--help`).
+# Per-verb help: `--help`/`-h` anywhere in args. Routes before the subcommand
+# sees the args so `--help` isn't treated as a positional (slot name).
 for arg in "$@"; do
   case "$arg" in
     --help|-h) print_help "$verb"; exit 0 ;;
@@ -1407,6 +1358,7 @@ case "$verb" in
   init)    cmd_init    "$@" ;;
   path)    require_pool; cmd_path    "$@" ;;
   go)      require_pool; cmd_go      "$@" ;;
+  acquire) require_pool; cmd_acquire "$@" ;;
   land)    cmd_land    "$@" ;;
   cleanup) require_pool; cmd_cleanup "$@" ;;
   _exit_handler) require_pool; cmd__exit_handler "$@" ;;

@@ -12,12 +12,11 @@ worktree-pool --pool myapp init \
   --max-slots 16 \
   --groups ios,android
 
-# Acquire a slot at a specific commit. Prints the canonical slot path
-# (e.g. `$WORKTREE_ROOT/myapp/ios-0`) on stdout. NAME becomes the branch ref
-# inside the slot.
+# Acquire a slot at a commit. Prints the canonical slot path (e.g.
+# `$WORKTREE_ROOT/myapp/ios-0`) on stdout; NAME becomes the slot's branch ref.
 worktree-pool --pool myapp acquire abc12345 --commit abc12345 --group ios
 
-# Acquire a dev session at the pool's default_commit
+# Acquire at the pool's default_commit
 worktree-pool --pool myapp acquire feature-x --group ios
 
 # Release (looks up the held slot by branch name)
@@ -27,7 +26,7 @@ worktree-pool --pool myapp release abc12345
 worktree-pool --pool myapp ls
 worktree-pool --pool myapp ls --git-status     # adds dirty/untracked/ahead columns
 worktree-pool --pool myapp inspect abc12345
-worktree-pool --pool myapp path abc12345       # prints the canonical slot path; exit 1 if not held
+worktree-pool --pool myapp path abc12345       # canonical slot path; exit 1 if not held
 ```
 
 ## CLI
@@ -48,49 +47,51 @@ worktree-pool --pool <key> validate-gitmodules
 worktree-pool doctor
 ```
 
-`NAME` is positional. For `acquire`, it becomes the branch ref inside the
-chosen canonical slot. For `release`/`inspect`/`path`, it's the lookup key —
-the tool scans held slots and matches by branch name.
+`NAME` is positional. For `acquire` it becomes the branch ref inside the chosen
+slot; for `release`/`inspect`/`path` it's the lookup key — the tool scans held
+slots and matches by branch name (see [[lifecycle.md#identity-model]]).
 
 `acquire` fires the `wt_post_acquire` hook if the source ships `.wt-hooks.sh` —
-runs in the slot, fail-loud (a non-zero hook fails the acquire before the path
-is printed), so build pools using `worktree-pool acquire` directly get the same
-extension point as `wt go`. See [[wt.md#hooks-sourcewt-hookssh]].
+fail-loud, so build pools get the same extension point as `wt go`. See
+[[wt.md#hooks-sourcewt-hookssh]].
 
-`unstick` is a read-only diagnostic now: it reports whether each init mutex
-file is currently locked by a live process. With OS-managed flocks
-(`std::fs::File::try_lock`, stable since Rust 1.89) the kernel
-auto-releases on process death, so there's nothing to force-clear.
+`unstick` is a read-only diagnostic: it reports whether each init mutex file is
+currently locked by a live process. OS-managed flocks auto-release on process
+death, so there's nothing to force-clear.
 
 ## Exit codes
 
 Generic failures exit `1`. The codes below tag specific conditions so
-retry-aware callers (CI build farms, supervisor scripts) can branch on
-them:
+retry-aware callers (CI build farms, supervisors) can branch on them:
 
 | Code | Kind        | Meaning                                                          | Caller action          |
 |------|-------------|------------------------------------------------------------------|------------------------|
 | 0    | Success     | —                                                                | —                      |
 | 1    | Generic     | Any other error (I/O, config, git failure, …)                    | Inspect stderr         |
-| 2    | Usage       | Bad CLI shape (assigned by clap)                                  | Fix invocation         |
+| 2    | Usage       | Bad CLI shape (assigned by clap)                                 | Fix invocation         |
 | 3    | Contended   | Every candidate slot's init mutex is held by another live acquire | Transient — retry      |
-| 4    | Capacity    | Every slot in the requested group is held                         | `release` something    |
-| 5    | UniqueSha   | `--unique-sha` matched an already-held slot                       | Reuse / release holder |
+| 4    | Capacity    | Every slot in the requested group is held                        | `release` something    |
+| 5    | UniqueSha   | `--unique-sha` matched an already-held slot                      | Reuse / release holder |
 
 The contract is locked by `tests/lifecycle.rs::acquire_capacity_exhaustion` and
 `unique_sha_refuses_second_acquire`. New conditions get new codes; existing
 codes don't shift.
 
-`doctor` is host-level (no `--pool`) and read-only. Checks: arch, `git --version`, `$WORKTREE_ROOT` + pool count, binary quarantine xattr, and per-pool config + source-path validation.
+`doctor` is host-level (no `--pool`) and read-only. Checks: arch, `git --version`,
+`$WORKTREE_ROOT` + pool count, binary quarantine xattr, and per-pool config +
+source-path validation.
 
 ## Distribution
 
 arm64 macOS only. Two tools end up on `$PATH`:
 
-- `worktree-pool` — the Rust binary (the pool primitive). Built locally via `cargo build --release`; the install script symlinks `~/.local/bin/worktree-pool` → `target/release/worktree-pool`, so any subsequent `cargo build --release` updates the installed tool in place.
-- `wt` — Bash wrapper for the common dev-session lifecycle. Project-agnostic; auto-resolves pool key from cwd (override with `--pool`). Symlinked from `bin/wt`.
+- `worktree-pool` — the Rust binary (the pool primitive).
+- `wt` — Bash wrapper for the common dev-session lifecycle; auto-resolves pool
+  key from cwd (override with `--pool`). Symlinked from `bin/wt`.
 
-`scripts/install.sh` (also `just install`) builds + symlinks both into `~/.local/bin/`.
+`scripts/install.sh` (also `just install`) builds via `cargo build --release` and
+symlinks both into `~/.local/bin/` at the cargo artifact path, so any subsequent
+`cargo build --release` updates the installed tool in place.
 
 ```sh
 git clone https://github.com/studio-boxcat/worktree-pool.git ~/Develop/worktree-pool
