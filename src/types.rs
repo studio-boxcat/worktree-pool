@@ -35,8 +35,10 @@ str_newtype!(
     SlotId
 );
 str_newtype!(
-    /// A feature branch — the caller-given acquire `NAME`, held in the slot's branch ref.
-    BranchName
+    /// A caller's claim on a slot — the `--lease` given to `acquire`, stored as the slot's
+    /// branch ref. Paired with `SlotId`: the lease says what the slot is held *for*, the id
+    /// says *where* it lives.
+    LeaseName
 );
 str_newtype!(
     /// A pool group (e.g. `ios`, `android`). Persisted in `config.yaml`'s `groups`.
@@ -63,8 +65,6 @@ impl FullSha {
         }
     }
     pub fn as_str(&self) -> &str { &self.0 }
-    /// 8-char display prefix — never panics (length validated at construction).
-    pub fn short(&self) -> &str { &self.0[..8] }
 }
 impl fmt::Display for FullSha {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(&self.0) }
@@ -78,10 +78,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn full_sha_validates_and_shortens() {
+    fn full_sha_validates() {
         let sha = "a".repeat(40);
         let fs = FullSha::parse(sha.clone()).unwrap();
-        assert_eq!(fs.short(), "aaaaaaaa");
         assert_eq!(fs.as_str(), sha);
         assert!(FullSha::parse("abc").is_err(), "short string must be rejected");
         assert!(FullSha::parse("z".repeat(40)).is_err(), "non-hex must be rejected");
@@ -91,6 +90,6 @@ mod tests {
     fn str_newtypes_roundtrip() {
         assert_eq!(SlotId::from("ios-0").as_str(), "ios-0");
         assert_eq!(GroupName::from("ios").to_string(), "ios");
-        assert_eq!(BranchName::from("feat-x".to_string()).as_str(), "feat-x");
+        assert_eq!(LeaseName::from("feat-x".to_string()).as_str(), "feat-x");
     }
 }

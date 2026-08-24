@@ -2,14 +2,14 @@
 //!
 //! A slot is **always** at its canonical path `<pool>/{group}-{N}` (or
 //! `<pool>/slot-{N}` for groupless pools). It's **held** iff HEAD is on a
-//! branch; **idle** when HEAD is detached. The user-given name lives in the
+//! branch; **idle** when HEAD is detached. The caller's lease lives in the
 //! branch ref inside the slot — see [[../docs/lifecycle.md]].
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
 use crate::config::PoolConfig;
 use crate::git;
-use crate::types::{BranchName, GroupName, SlotId};
+use crate::types::{LeaseName, GroupName, SlotId};
 
 /// `cfg.groups` rendered as `ios, android` for diagnostics.
 fn groups_list(cfg: &PoolConfig) -> String {
@@ -113,18 +113,17 @@ pub fn count_held_in_group(entries: &[SlotEntry], group: Option<&GroupName>) -> 
         .count()
 }
 
-/// Look up a held slot by branch name. Scans canonical slots, matches by
-/// `git symbolic-ref --short HEAD`. None if no held slot has branch `name`
-/// (already released, never acquired, or HEAD detached).
-pub fn find_by_name(
+/// Look up the slot holding `lease`, matching against `git symbolic-ref --short HEAD`.
+/// None if no slot holds it (already released, never acquired, or HEAD detached).
+pub fn find_by_lease(
     pool_root: &Path,
     cfg: &PoolConfig,
-    name: &BranchName,
+    lease: &LeaseName,
 ) -> Result<Option<SlotEntry>> {
     for entry in enumerate(pool_root, cfg)? {
-        // `current_branch` is None on detached (idle) HEAD, so the name match
+        // `current_branch` is None on detached (idle) HEAD, so a lease match
         // alone implies held — no separate `is_held_at` read needed.
-        if git::current_branch(&entry.path).as_deref() == Some(name.as_str()) {
+        if git::current_branch(&entry.path).as_deref() == Some(lease.as_str()) {
             return Ok(Some(entry));
         }
     }

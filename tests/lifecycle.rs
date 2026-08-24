@@ -16,7 +16,7 @@ fn full_lifecycle() {
     let out = acquire_dev(&key, "feat-x");
     assert_ok(&out, "");
     let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    // Canonical-only: slot stays at `{group}-N`, never `<name>`.
+    // Canonical-only: slot stays at `{group}-N`, never the lease.
     assert!(path.ends_with("/ios-0"), "expected canonical ios-0 path, got: {path}");
 
     let ls = wtp()
@@ -24,11 +24,11 @@ fn full_lifecycle() {
         .output()
         .unwrap();
     let ls_text = String::from_utf8_lossy(&ls.stdout);
-    assert!(ls_text.contains("feat-x"), "ls should mention branch name 'feat-x'");
+    assert!(ls_text.contains("feat-x"), "ls should mention the lease");
     assert!(ls_text.contains("held"));
 
     let inspect = wtp()
-        .args(["--pool", &key, "inspect", "feat-x"])
+        .args(["--pool", &key, "inspect", "--lease", "feat-x"])
         .output()
         .unwrap();
     let inspect_text = String::from_utf8_lossy(&inspect.stdout);
@@ -39,7 +39,7 @@ fn full_lifecycle() {
 
     // Idempotent re-release.
     wtp()
-        .args(["--pool", &key, "release", "feat-x"])
+        .args(["--pool", &key, "release", "--lease", "feat-x"])
         .assert()
         .success();
 }
@@ -92,7 +92,7 @@ fn groupless_pool_full_lifecycle() {
 
     // Acquire (no --group) → slot-0.
     let out = wtp()
-        .args(["--pool", &key, "acquire", "feat-x"])
+        .args(["--pool", &key, "acquire", "--lease", "feat-x"])
         .output()
         .unwrap();
     assert_ok(&out, "groupless acquire");
@@ -101,7 +101,7 @@ fn groupless_pool_full_lifecycle() {
 
     // --group on a groupless pool is rejected.
     let out = wtp()
-        .args(["--pool", &key, "acquire", "feat-y", "--group", "ios"])
+        .args(["--pool", &key, "acquire", "--lease", "feat-y", "--group", "ios"])
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -109,12 +109,12 @@ fn groupless_pool_full_lifecycle() {
     assert!(stderr.contains("no groups configured"),
         "expected group-refusal; got: {stderr}");
 
-    // Release by branch.
+    // Release by lease.
     release(&key, "feat-x");
 
     // Recycle: re-acquire lands at the same slot-0.
     let out = wtp()
-        .args(["--pool", &key, "acquire", "feat-z"])
+        .args(["--pool", &key, "acquire", "--lease", "feat-z"])
         .output()
         .unwrap();
     assert_ok(&out, "groupless re-acquire");
@@ -123,46 +123,35 @@ fn groupless_pool_full_lifecycle() {
 }
 
 #[test]
-fn unique_sha_refuses_second_acquire() {
+fn acquire_refuses_a_lease_already_held() {
     let key = pool_key();
     let _c = Cleanup(key.clone());
     let tmp = tempfile::TempDir::new().unwrap();
     let bare = make_fixture(tmp.path());
     init_pool(&key, &bare);
 
-    let out1 = wtp()
-        .args([
-            "--pool", &key, "acquire", "build-1",
-            "--commit", "main", "--group", "ios", "--unique-sha",
-        ])
-        .output()
-        .unwrap();
-    assert_ok(&out1, "first acquire");
-    let out = wtp()
-        .args([
-            "--pool", &key, "acquire", "build-2",
-            "--commit", "main", "--group", "ios", "--unique-sha",
-        ])
-        .output()
-        .unwrap();
-    assert!(!out.status.success());
-    // Exit 5 = ExitKind::UniqueSha — distinguishes the same-SHA conflict from
-    // capacity/contended for retry-aware callers.
-    assert_eq!(out.status.code(), Some(5),
-        "unique-sha conflict must exit 5; got {:?}", out.status.code());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("full_sha"));
-    assert!(stderr.contains("build-1"));
+    assert_ok(&acquire_dev(&key, "build-1"), "first acquire");
 
-    // Dev acquire (no --unique-sha) is allowed.
-    let out_dev = wtp()
-        .args([
-            "--pool", &key, "acquire", "dev-foo",
-            "--commit", "main", "--group", "ios",
-        ])
+    // A lease identifies exactly one slot. Without this check the second acquire would
+    // succeed — plumbing bypasses git's same-branch-in-two-worktrees guard — and `release`
+    // would then resolve it to an arbitrary one of the two.
+    let dup = acquire_dev(&key, "build-1");
+    assert!(!dup.status.success());
+    assert_eq!(dup.status.code(), Some(6),
+        "duplicate lease must exit 6; got {:?}", dup.status.code());
+    let stderr = String::from_utf8_lossy(&dup.stderr);
+    assert!(stderr.contains("already held"), "got: {stderr}");
+
+    // A distinct lease in a sibling group is unaffected.
+    let other = wtp()
+        .args(["--pool", &key, "acquire", "--lease", "build-2", "--group", "android"])
         .output()
         .unwrap();
-    assert_ok(&out_dev, "dev acquire");
+    assert_ok(&other, "distinct lease");
+
+    // Released leases are reusable.
+    release(&key, "build-1");
+    assert_ok(&acquire_dev(&key, "build-1"), "re-acquire after release");
 }
 
 #[test]
@@ -326,7 +315,7 @@ fn acquire_capacity_exhaustion() {
     let out = acquire_dev(&key, "c");
     assert!(!out.status.success());
     // Exit 4 = ExitKind::Capacity — distinguishes "all slots held" from
-    // transient contention or unique-sha conflict for retry-aware callers.
+    // transient contention or a held lease, for retry-aware callers.
     assert_eq!(out.status.code(), Some(4),
         "capacity exhaustion must exit 4; got {:?}", out.status.code());
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -356,7 +345,7 @@ fn parallel_releases_different_names() {
         handles.push(std::thread::spawn(move || {
             barrier.wait();
             wtp()
-                .args(["--pool", &key, "release", name])
+                .args(["--pool", &key, "release", "--lease", name])
                 .output()
                 .unwrap()
         }));
@@ -383,10 +372,11 @@ fn parallel_releases_different_names() {
     assert!(!stdout.lines().any(|l| l.starts_with("b ")));
 }
 
-/// `--unique-sha` coverage: sequential acquires (pool_mutex serializes anyway;
-/// the second acquire's SHA scan sees the first holder's branch and refuses).
+/// Distinct leases at one SHA are independent work and must both succeed — this is what a
+/// build's player and bundles halves do, and what the two platforms do off every release
+/// commit. Guards against reintroducing a commit-keyed exclusion.
 #[test]
-fn parallel_unique_sha_at_most_one_succeeds() {
+fn distinct_leases_at_one_sha_both_acquire() {
     let key = pool_key();
     let _c = Cleanup(key.clone());
     let tmp = tempfile::TempDir::new().unwrap();
@@ -395,22 +385,27 @@ fn parallel_unique_sha_at_most_one_succeeds() {
 
     let out1 = wtp()
         .args([
-            "--pool", &key, "acquire", "b-0",
-            "--commit", "main", "--group", "ios", "--unique-sha",
+            "--pool", &key, "acquire", "--lease", "b-0",
+            "--commit", "main", "--group", "ios",
         ])
         .output()
         .unwrap();
-    assert_ok(&out1, "first --unique-sha acquire");
+    assert_ok(&out1, "first acquire");
     let out2 = wtp()
         .args([
-            "--pool", &key, "acquire", "b-1",
-            "--commit", "main", "--group", "ios", "--unique-sha",
+            "--pool", &key, "acquire", "--lease", "b-1",
+            "--commit", "main", "--group", "ios",
         ])
         .output()
         .unwrap();
-    assert!(!out2.status.success(),
-        "second --unique-sha acquire on same SHA should fail; stderr={}",
-        String::from_utf8_lossy(&out2.stderr));
+    assert_ok(&out2, "distinct lease at the same SHA");
+
+    // Distinct slots, so neither can disturb the other's checkout.
+    assert_ne!(
+        String::from_utf8_lossy(&out1.stdout).trim(),
+        String::from_utf8_lossy(&out2.stdout).trim(),
+        "distinct leases must land on distinct slots"
+    );
 }
 
 // ---------- wt_post_acquire hook (core-fired) ----------
@@ -425,7 +420,7 @@ fn post_acquire_hook_fires_in_slot() {
     // Relative `HOOK_MARKER` proves cwd == slot; body captures the WT_* contract.
     let bare = make_fixture_with_hook(
         tmp.path(),
-        "wt_post_acquire() { printf '%s|%s' \"$WT_KEY\" \"$WT_NAME\" > HOOK_MARKER; }\n",
+        "wt_post_acquire() { printf '%s|%s' \"$WT_KEY\" \"$WT_LEASE\" > HOOK_MARKER; }\n",
     );
     init_pool(&key, &bare);
 
@@ -438,7 +433,7 @@ fn post_acquire_hook_fires_in_slot() {
     assert_eq!(
         std::fs::read_to_string(&marker).unwrap(),
         format!("{key}|feat-hook"),
-        "hook saw wrong WT_KEY/WT_NAME contract"
+        "hook saw wrong WT_KEY/WT_LEASE contract"
     );
 }
 
@@ -524,7 +519,7 @@ fn release_succeeds_despite_stale_index_lock() {
     // --porcelain` for the dirty-tree precheck and could race the same lock,
     // muddying what this test is meant to pin (release.rs's detach step).
     let out = wtp()
-        .args(["--pool", &key, "release", "leaky"])
+        .args(["--pool", &key, "release", "--lease", "leaky"])
         .output().unwrap();
     assert_ok(&out, "release should succeed despite stale index.lock");
     let stderr = String::from_utf8_lossy(&out.stderr);

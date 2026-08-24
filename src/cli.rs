@@ -97,8 +97,11 @@ impl SubmoduleMirrorMode {
 
 #[derive(clap::Args, Debug)]
 pub struct AcquireArgs {
-    /// Branch name created in the slot. Identifies the slot for release/inspect.
-    pub name: String,
+    /// The claim on the slot: your handle for `release`/`inspect`/`path`, and the branch
+    /// created inside it. Must not already be held. Distinct from the slot's canonical id
+    /// (`ios-0`), which is the pool's to assign.
+    #[arg(long)]
+    pub lease: String,
 
     /// Commit-ish to check out. Default: pool's `default_commit`.
     #[arg(long)]
@@ -112,17 +115,14 @@ pub struct AcquireArgs {
     #[arg(long, value_delimiter = ',')]
     pub exclude_submodule_tags: Vec<String>,
 
-    /// Refuse if any held slot already has the same resolved full SHA.
-    /// Use for CI builds (avoid duplicate work). Omit for dev sessions
-    /// (common case: dev branches off main while a build is also at main).
-    #[arg(long)]
-    pub unique_sha: bool,
 }
 
 #[derive(clap::Args, Debug)]
 pub struct ReleaseArgs {
-    /// Branch name of the held slot to release.
-    pub name: String,
+    /// Lease to release. Also accepts a canonical slot id (`ios-0`) for addressing a slot
+    /// straight off `ls`.
+    #[arg(long)]
+    pub lease: String,
 }
 
 #[derive(clap::Args, Debug)]
@@ -134,14 +134,16 @@ pub struct LsArgs {
 
 #[derive(clap::Args, Debug)]
 pub struct InspectArgs {
-    /// Branch name of the held slot to inspect.
-    pub name: String,
+    /// Lease to inspect. Also accepts a canonical slot id (`ios-0`).
+    #[arg(long)]
+    pub lease: String,
 }
 
 #[derive(clap::Args, Debug)]
 pub struct PathArgs {
-    /// Branch name of the held slot.
-    pub name: String,
+    /// Lease to resolve to a slot path. Also accepts a canonical slot id (`ios-0`).
+    #[arg(long)]
+    pub lease: String,
 }
 
 #[derive(clap::Args, Debug)]

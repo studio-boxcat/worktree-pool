@@ -18,7 +18,7 @@ Deferred work: [[TODO.md]].
 
 ## Concepts
 
-A **pool** is a fixed-cardinality set of slots backed by a single source repo. Slots are interchangeable git worktrees living at canonical paths (`{group}-{N}` or `slot-{N}`); each `acquire` picks an idle slot, creates a branch named after the caller's `NAME` (which flips the slot to held), and hands back the canonical path. `release` detaches HEAD and deletes the branch. The slot dir never moves, so any cache that keys on absolute path (Unity Bee compile cache, watchman watches, IDE indexes) stays warm across recycles.
+A **pool** is a fixed-cardinality set of slots backed by a single source repo. Slots are interchangeable git worktrees at canonical paths (`{group}-{N}` or `slot-{N}`); `acquire` picks an idle one, brands it with the caller's `--lease` (which flips it to held), and prints its path. `release` reverses that. Slot id vs lease — the distinction the design turns on — is [[lifecycle.md#identity-model]].
 
 Pools are referenced by **key** (e.g. `myapp`, `another-pool`). Path: `$WORKTREE_ROOT/<key>/` — env var required, no fallback (set in `~/.zshenv.local`). For pools needing a different physical location (external SSD, etc.), symlink: `ln -s /Volumes/big/<key> "$WORKTREE_ROOT/<key>"`.
 
@@ -37,7 +37,7 @@ $WORKTREE_ROOT/<key>/{group}-{N}/                      # slot (always canonical;
 <source-gitdir>/worktree-pool-config.lock             # per-source mutex (top-level submodule URL writes)
 ```
 
-Slot dir stays at its canonical path for the lifetime of the pool — never renamed. Held/idle is determined by git's own HEAD state: **on a branch = held, detached HEAD = idle** (read from the gitdir's `HEAD` file — no subprocess; `ref:` prefix = held, raw SHA = idle). The user-given name lives in the git branch ref inside the slot (`git symbolic-ref --short HEAD`), not on disk; `release NAME` looks up the slot by branch. `full_sha` for same-SHA exclusion is resolved via `git rev-parse HEAD`. Group is derivable from the slot's path basename.
+Held/idle is read from git's own HEAD state: **on a branch = held, detached = idle** (straight from the gitdir's `HEAD` file — no subprocess; `ref:` prefix = held, raw SHA = idle). No slot state lives on disk separately, so there is nothing to desync. Group is derivable from the slot's path basename.
 
 Mutex files are advisory flocks (`std::fs::File::try_lock`, stable since Rust 1.89). The OS auto-releases on process death (SIGKILL / panic=abort / SIGHUP), so leftover files carry no semantic load — no PID tracking, heartbeat, or staleness threshold.
 

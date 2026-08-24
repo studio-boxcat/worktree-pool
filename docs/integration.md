@@ -41,14 +41,14 @@ Cuts that simplify the design:
 - **No reclaim on holder death.** A SIGKILL'd holder leaves the slot held; operator notices via `ls` and runs `release`. (A crash *mid* acquire/release instead converges on its own — see [[lifecycle.md#crash-recovery]].)
 - **No `--fresh` / `--volatile` flags.** Caller wipes warmth itself if needed; release is the only "give back" verb.
 
-If you need GC-like behavior, write a 5-line script: `worktree-pool ls` → filter → `release <NAME>` per match.
+If you need GC-like behavior, write a 5-line script: `worktree-pool ls` → filter → `release --lease <L>` per match.
 
-Retry-aware CI callers branch on exit codes (see [[cli.md#exit-codes]]): **3 = contended** (retry), **4 = capacity** (release first), **5 = unique-sha conflict** (reuse holder's output). Everything else exits 1.
+Retry-aware CI callers branch on exit codes (see [[cli.md#exit-codes]]): **3 = contended** (retry), **4 = capacity** (release first), **6 = lease held** (reuse the holder's output, or release it). Everything else exits 1.
 
 ---
 
 ## Limits
 
 - Branch refs accumulate for SIGKILL'd builds and abandoned dev sessions (the latter intentional — work recovery via `git branch | grep`). For high-volume CI, periodic `git for-each-ref --format='%(refname:short)' refs/heads/ | xargs -I X sh -c 'git merge-base --is-ancestor X origin/main && git branch -D X'` is the consumer's responsibility.
-- Same-SHA exclusion is per-pool — two pools sharing a source don't coordinate.
+- Duplicate-work refusal is per-pool and lease-keyed, so two pools sharing a source don't coordinate (see [[lifecycle.md#identity-model]]).
 - `git status --porcelain` on huge worktrees (50k+ files) is the bottleneck for `ls --git-status`; plain `ls` is cheap (gitdir HEAD read only).

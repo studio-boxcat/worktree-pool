@@ -8,8 +8,8 @@ use crate::bail_exit;
 use crate::cli::AcquireArgs;
 use crate::config::PoolConfig;
 use crate::exit::ExitKind;
-use crate::types::{BranchName, FullSha, GroupName, SlotId};
-use crate::{fs_paths, git, hooks, mutex, parallel, slot, submodules};
+use crate::types::{GroupName, LeaseName, SlotId};
+use crate::{fs_paths, git, hooks, mutex, slot, submodules};
 
 pub fn run(pool_key: &str, pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> {
     let group = slot::resolve_group(cfg, args.group.as_deref())?;
@@ -24,20 +24,22 @@ pub fn run(pool_key: &str, pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs
     let pool_mu = mutex::FileLock::acquire(fs_paths::pool_mutex(pool_root))
         .context("acquiring pool-wide mutex for slot allocation")?;
 
-    // One enumeration feeds same-SHA scan, capacity check, and slot-pick.
+    // One enumeration feeds the capacity check and slot-pick.
     let entries = slot::enumerate(pool_root, cfg)?;
 
-    if args.unique_sha
-        && let Some(holder) = find_same_sha_holder(&entries, &full_sha)
-    {
+    // Refuse here because nothing downstream would: `checkout_force_branch` bypasses git's
+    // "branch already checked out elsewhere" guard, and `find_by_lease` resolves duplicates in
+    // `read_dir` order — so `release` could detach the wrong slot under a live consumer.
+    // What a lease means, and why this is the only duplicate-work guard: [[lifecycle.md#identity-model]].
+    let lease = LeaseName::from(args.lease.clone());
+    if let Some(entry) = slot::find_by_lease(pool_root, cfg, &lease)? {
         bail_exit!(
-            ExitKind::UniqueSha,
-            "acquire --unique-sha failed: full_sha {} already held by slot '{}' (branch '{}').\n\
-             Wait for it, reuse its output, or run: worktree-pool --pool <key> release {}",
-            full_sha.short(),
-            holder.slot_id,
-            holder.branch,
-            holder.branch
+            ExitKind::LeaseHeld,
+            "acquire failed: lease '{}' is already held by slot '{}'.\n\
+             Pick a different lease, or run: worktree-pool --pool <key> release --lease {}",
+            args.lease,
+            entry.id,
+            args.lease
         );
     }
 
@@ -121,17 +123,17 @@ pub fn run(pool_key: &str, pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs
     // Branch creation flips idle → held. If we crash between worktree-add/
     // reset and here, the slot stays detached (idle) — next acquire can safely
     // reclaim it. Pool mutex is still held, so no race.
-    git::checkout_force_branch(&canonical_path, &args.name)?;
+    git::checkout_force_branch(&canonical_path, &args.lease)?;
 
     // Slot is now visibly held; further state is per-slot only. Drop pool mutex
     // before submodule clone (potentially minutes for cold meow-tower).
     drop(pool_mu);
 
-    submodules::update(&canonical_path, cfg, &args.exclude_submodule_tags, &args.name).with_context(|| {
+    submodules::update(&canonical_path, cfg, &args.exclude_submodule_tags, &args.lease).with_context(|| {
         format!(
-            "submodule update failed for slot '{slot_id}' (branch '{name}'); slot is left HELD with partial state. \
-             Recover: `worktree-pool --pool <key> release {name}`.",
-            name = args.name
+            "submodule update failed for slot '{slot_id}' (lease '{lease}'); slot is left HELD with partial state. \
+             Recover: `worktree-pool --pool <key> release --lease {lease}`.",
+            lease = args.lease
         )
     })?;
 
@@ -147,14 +149,14 @@ pub fn run(pool_key: &str, pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs
         "wt_post_acquire",
         &canonical_path,
         pool_key,
-        args.name.as_str(),
+        args.lease.as_str(),
         cand.is_fresh,
     )
     .with_context(|| {
         format!(
             "post-acquire hook failed for slot '{slot_id}' (branch '{name}'); slot is left HELD. \
              Recover: `worktree-pool --pool <key> release {name}`.",
-            name = args.name
+            name = args.lease
         )
     })?;
 
@@ -162,39 +164,12 @@ pub fn run(pool_key: &str, pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs
     Ok(())
 }
 
-struct Holder {
-    slot_id: SlotId,
-    branch: BranchName,
-}
-
-fn find_same_sha_holder(entries: &[slot::SlotEntry], full_sha: &FullSha) -> Option<Holder> {
-    // Parallel read: each entry needs a current_branch + rev-parse spawn.
-    // Under the pool mutex, doing this serially blocks all other acquires;
-    // the parallel version cuts ~5x on 8-slot pools.
-    parallel::map(entries, |entry| {
-        // `current_branch` returns None on a detached (idle) HEAD, so it doubles
-        // as the held-gate — no separate `is_held_at` read needed.
-        let branch = git::current_branch(&entry.path)?;
-        let sha = git::run(&entry.path, &["rev-parse", "HEAD"]).ok()?;
-        if sha != full_sha.as_str() {
-            return None;
-        }
-        Some(Holder {
-            slot_id: entry.id.clone(),
-            branch: BranchName::from(branch),
-        })
-    })
-    .into_iter()
-    .flatten()
-    .next()
-}
-
 fn print_capacity_error(pool_root: &Path, entries: &[slot::SlotEntry]) {
     eprintln!("\nHeld slots in pool {}:", pool_root.display());
     for e in entries {
-        // Held iff HEAD is on a branch; idle (detached) slots have no name to list.
-        if let Some(branch) = git::current_branch(&e.path) {
-            eprintln!("  {} (branch: {})", e.id, branch);
+        // Held iff HEAD is on a branch; idle (detached) slots hold no lease to list.
+        if let Some(lease) = git::current_branch(&e.path) {
+            eprintln!("  {} (lease: {})", e.id, lease);
         }
     }
 }

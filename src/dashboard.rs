@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::{InspectArgs, LsArgs, PathArgs};
 use crate::config::PoolConfig;
-use crate::types::{BranchName, GroupName};
+use crate::types::{LeaseName, GroupName};
 use crate::{git, parallel, slot};
 
 pub fn ls(pool_root: &Path, cfg: &PoolConfig, args: LsArgs) -> Result<()> {
@@ -64,8 +64,8 @@ pub fn ls(pool_root: &Path, cfg: &PoolConfig, args: LsArgs) -> Result<()> {
 }
 
 pub fn path(pool_root: &Path, cfg: &PoolConfig, args: PathArgs) -> Result<()> {
-    let name = BranchName::from(args.name.as_str());
-    let Some(entry) = slot::find_by_name(pool_root, cfg, &name)? else {
+    let name = LeaseName::from(args.lease.as_str());
+    let Some(entry) = slot::find_by_lease(pool_root, cfg, &name)? else {
         // Empty stderr + exit 1 so callers can `if wp path X >/dev/null; then`.
         std::process::exit(1);
     };
@@ -74,11 +74,11 @@ pub fn path(pool_root: &Path, cfg: &PoolConfig, args: PathArgs) -> Result<()> {
 }
 
 pub fn inspect(pool_root: &Path, cfg: &PoolConfig, args: InspectArgs) -> Result<()> {
-    let name = BranchName::from(args.name.as_str());
-    let entry = slot::find_by_name(pool_root, cfg, &name)?.ok_or_else(|| {
+    let name = LeaseName::from(args.lease.as_str());
+    let entry = slot::find_by_lease(pool_root, cfg, &name)?.ok_or_else(|| {
         anyhow::anyhow!(
             "no held slot with branch '{}' in {}",
-            args.name,
+            args.lease,
             pool_root.display()
         )
     })?;
@@ -86,7 +86,7 @@ pub fn inspect(pool_root: &Path, cfg: &PoolConfig, args: InspectArgs) -> Result<
     let gitdir = git::worktree_gitdir(&entry.path)?;
     let sha = git::run(&entry.path, &["rev-parse", "HEAD"]).unwrap_or_else(|_| "?".into());
 
-    println!("# slot: {} (branch: {})", entry.id, args.name);
+    println!("# slot: {} (branch: {})", entry.id, args.lease);
     println!("path: {}", entry.path.display());
     println!("gitdir: {}", gitdir.display());
     println!("sha: {}", sha);
@@ -117,7 +117,7 @@ enum State {
 struct Row {
     id: String,
     state: State,
-    name: String,
+    lease: String,
     group: String,
     full_sha: String,
     dirty: String,
@@ -131,7 +131,7 @@ impl Row {
         Self {
             id: id.to_string(),
             state: State::Fresh,
-            name: "-".into(),
+            lease: "-".into(),
             group: group.map(|g| g.to_string()).unwrap_or_else(|| "-".into()),
             full_sha: "-".into(),
             dirty: "-".into(),
@@ -146,7 +146,7 @@ fn build_row(entry: &slot::SlotEntry) -> Row {
     let branch = git::current_branch(&entry.path);
     let state = if branch.is_some() { State::Held } else { State::Idle };
     let group = entry.group.as_ref().map(GroupName::as_str).unwrap_or("-").to_string();
-    let name = branch.unwrap_or_else(|| "-".into());
+    let lease = branch.unwrap_or_else(|| "-".into());
 
     let full_sha = if state == State::Held {
         git::run(&entry.path, &["rev-parse", "HEAD"])
@@ -159,7 +159,7 @@ fn build_row(entry: &slot::SlotEntry) -> Row {
     Row {
         id: entry.id.to_string(),
         state,
-        name,
+        lease,
         group,
         full_sha,
         dirty: "-".into(),
@@ -209,7 +209,7 @@ fn state_order(s: &State) -> u8 {
 }
 
 fn print_table(rows: &[Row], with_git: bool) {
-    let mut headers = vec!["ID", "STATE", "NAME", "GROUP", "SHA"];
+    let mut headers = vec!["ID", "STATE", "LEASE", "GROUP", "SHA"];
     if with_git {
         headers.extend(["DIRTY", "UNTRK", "AHEAD"]);
     }
@@ -219,7 +219,7 @@ fn print_table(rows: &[Row], with_git: bool) {
             let mut row = vec![
                 r.id.clone(),
                 state_label(&r.state).into(),
-                r.name.clone(),
+                r.lease.clone(),
                 r.group.clone(),
                 r.full_sha.clone(),
             ];

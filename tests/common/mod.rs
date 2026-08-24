@@ -166,14 +166,14 @@ pub fn init_pool_groupless(key: &str, bare: &Path) {
 
 pub fn acquire_dev(key: &str, name: &str) -> std::process::Output {
     wtp()
-        .args(["--pool", key, "acquire", name, "--group", "ios"])
+        .args(["--pool", key, "acquire", "--lease", name, "--group", "ios"])
         .output()
         .unwrap()
 }
 
 pub fn acquire_dev_sub(key: &str, name: &str) -> std::process::Output {
     wtp()
-        .args(["--pool", key, "acquire", name, "--group", "ios"])
+        .args(["--pool", key, "acquire", "--lease", name, "--group", "ios"])
         .env("GIT_ALLOW_PROTOCOL", "file")
         .output()
         .unwrap()
@@ -181,7 +181,7 @@ pub fn acquire_dev_sub(key: &str, name: &str) -> std::process::Output {
 
 pub fn release(key: &str, name: &str) {
     wtp()
-        .args(["--pool", key, "release", name])
+        .args(["--pool", key, "release", "--lease", name])
         .assert()
         .success();
 }
@@ -204,7 +204,7 @@ pub fn init_pool_groupless_max1(key: &str, bare: &Path) {
 
 pub fn acquire_dev_groupless(key: &str, name: &str) -> std::process::Output {
     wtp()
-        .args(["--pool", key, "acquire", name])
+        .args(["--pool", key, "acquire", "--lease", name])
         .output()
         .unwrap()
 }

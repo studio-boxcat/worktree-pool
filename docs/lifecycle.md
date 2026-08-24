@@ -4,37 +4,54 @@
 
 ## Identity model
 
-Slot dirs live at canonical paths forever — `{group}-{N}` for grouped pools,
-`slot-{N}` otherwise. There is no rename. The user-given `NAME` from
-`acquire NAME` is **the git branch name** inside the slot; `git symbolic-ref
---short HEAD` is the source of truth for which slot belongs to which user
-context. Lookup by name (`release`/`inspect`/`path NAME`) scans held slots and
-matches on branch.
+Two identifiers, and conflating them is the classic bug:
 
-Stable absolute paths keep abs-path-keyed caches warm across acquire cycles
-(Unity Bee compile cache, watchman watches, IDE indexes). The trade-off is a
-small per-call git probe for name → slot resolution — cheap vs. the cache
-rebuild cost.
+| | Assigned by | Form | Means |
+|---|---|---|---|
+| **slot id** | the pool | `{group}-{N}`, or `slot-{N}` ungrouped | *where* — the directory |
+| **lease** | the caller (`--lease`) | anything | *what for* — the claim on it |
 
-## `acquire NAME`
+Slot dirs live at their canonical path forever; there is no rename. Stable
+absolute paths keep abs-path-keyed caches warm across acquire cycles (Unity Bee
+compile cache, watchman watches, IDE indexes), at the cost of a small git probe
+per lease → slot lookup.
+
+The lease is stored as the slot's branch ref, so `git symbolic-ref --short HEAD`
+is the source of truth for who holds what, and a detached HEAD *is* idle.
+`release`/`inspect`/`path` also accept a slot id, so an operator can address a
+slot straight off `ls`.
+
+A lease identifies **exactly one** held slot: `acquire` refuses one already held
+(exit 6). Nothing downstream would catch a duplicate — step 7 below bypasses
+git's same-branch-in-two-worktrees guard, `refs/heads/` is shared across linked
+worktrees, and lookup resolves in `read_dir` order, so `release` could silently
+detach the wrong slot while a consumer was still using it.
+
+That refusal is also the **only** duplicate-work guard. The pool deliberately
+has no commit-keyed exclusion: two leases at one SHA are two jobs, which is the
+normal case (a build's player and bundles halves; both platforms off a release
+commit). A caller that wants "don't run this twice" derives the lease from what
+it produces, and gets the refusal for free.
+
+## `acquire --lease <L>`
 
 1. Resolve `--commit` (default `default_commit`) against source → full SHA.
 2. Take pool-wide mutex (flock).
-3. If `--unique-sha`, scan held slots for matching SHA via `rev-parse HEAD`; refuse on hit, naming the holder's branch.
+3. Refuse if the lease is already held (see [[#identity-model]]).
 4. Check capacity (`count_held_in_group >= max_slots` → refuse with the slot table inline).
 5. Iterate acquirable Ns (canonical `0..max_slots` with detached HEAD, plus surplus recycled-idle N >= max_slots — see [[#over-provisioned-pools]]). Try each slot's init mutex (flock); first success wins.
 6. Materialize at canonical path: fresh → `git worktree add --detach`; recycled → remove any leftover `<gitdir>/index.lock` (see [[#crash-recovery]]), then `git reset --hard <full_sha>`. **Never `git clean`** — untracked files are caller's warmth.
-7. Force-create branch (`update-ref refs/heads/NAME HEAD && symbolic-ref HEAD refs/heads/NAME`). **This flips idle → held.** (Avoids `git checkout -B`'s 600ms of per-file filter-process pings on an already-correct tree.)
+7. Force-create branch (`update-ref refs/heads/<L> HEAD && symbolic-ref HEAD refs/heads/<L>`). **This flips idle → held.** (Avoids `git checkout -B`'s 600ms of per-file filter-process pings on an already-correct tree.)
 8. Drop pool-wide mutex.
-9. Submodule update, two-phase: (a) sequential `git config submodule.<name>.url` writes per submodule under a per-source mutex (`<source-gitdir>/worktree-pool-config.lock`) so parallel acquires sharing a source don't fight on `<source>/.git/config`'s lockfile; (b) parallel per-submodule `git submodule update` via `parallel::try_for_each`, then attach each submodule to a branch matching the slot's name. Each worker recurses into nested `.gitmodules` end-to-end, so the full tree fans out in parallel. Tag exclusion via `--exclude-submodule-tags` (see [[#submodule-filtering-worktreepooltag]]).
+9. Submodule update, two-phase: (a) sequential `git config submodule.<name>.url` writes per submodule under a per-source mutex (`<source-gitdir>/worktree-pool-config.lock`) so parallel acquires sharing a source don't fight on `<source>/.git/config`'s lockfile; (b) parallel per-submodule `git submodule update` via `parallel::try_for_each`, then attach each submodule to a branch matching the lease. Each worker recurses into nested `.gitmodules` end-to-end, so the full tree fans out in parallel. Tag exclusion via `--exclude-submodule-tags` (see [[#submodule-filtering-worktreepooltag]]).
 10. Fire `wt_post_acquire` if the source ships `.wt-hooks.sh`. Fail-loud — a non-zero hook fails the acquire before any path is printed. Runs for direct `worktree-pool acquire` (build pools) and `wt go`. See [[wt.md#hooks-sourcewt-hookssh]].
 11. Drop init mutex; print canonical path on stdout (last line).
 
-## `release NAME`
+## `release --lease <L>`
 
 1. Take pool-wide mutex (flock).
-2. `slot::find_by_name(NAME)` — scan held slots, match by branch. Not found → idempotent success (already released, never acquired, or branch hand-deleted).
-3. **`detach_head`** — flips held → idle (under pool mutex, no race). Then `branch -D NAME` (local), `push --delete origin NAME` (best-effort; no-op against a bare mirror). Mirror recursively in every submodule.
+2. `slot::find_by_lease` — scan held slots, matching the lease against the branch ref. Not found → idempotent success (already released, never acquired, or branch hand-deleted).
+3. **`detach_head`** — flips held → idle (under pool mutex, no race). Then `branch -D <L>` (local), `push --delete origin <L>` (best-effort; no-op against a bare mirror). Mirror recursively in every submodule.
 4. Drop pool mutex.
 
 Release touches only refs (`detach_head` is `rev-parse` + `update-ref
@@ -58,10 +75,10 @@ chose explicit operator recovery.
 - **Crash mid-acquire before branch creation.** Slot has detached HEAD = idle.
   No recovery — next acquire reclaims it as recycled-idle.
 - **Crash mid-acquire during submodule init.** Slot is held with partial
-  submodule state. `release NAME` finds it by branch and runs the idempotent
+  submodule state. `release --lease <L>` finds it and runs the idempotent
   detach + branch deletion. One command.
 - **Crash mid-release after detach.** Slot is idle; branch ref may be orphaned.
-  Re-running `release NAME` returns "already released". The orphan ref is
+  Re-running `release` returns "already released". The orphan ref is
   harmless (`git gc` cleans it; `git branch -D <name>` also works).
 
 **Leftover `git index.lock`.** Git's, not ours — it leaks when a git process
@@ -92,11 +109,11 @@ table inline plus the next command verbatim:
 acquire failed: all 16 ios slots are held.
 
 Held slots in pool /Users/x/.worktree-pool/myapp:
-  ios-0 (branch: abc12345)
-  ios-1 (branch: feature-x)
+  ios-0 (lease: abc12345-ios)
+  ios-1 (lease: feature-x)
   ...
 
-Release one with: worktree-pool --pool myapp release <branch-name>
+Release one with: worktree-pool --pool myapp release --lease <L>
 ```
 
 There is no GC — the operator releases manually based on the table.
@@ -114,20 +131,6 @@ eating down the over-provision over time.
 
 No operator-facing GC. Manual: `git -C <source> worktree remove --force
 <pool>/slot-N`.
-
----
-
-## Same-SHA exclusion
-
-Opt-in via `--unique-sha`. Caller asserts "I'm doing duplicate-detectable work;
-refuse if another slot is already on this SHA." Build callers (CI) opt in; dev
-callers don't (devs branching off `main` don't want to fight a CI build at the
-same SHA).
-
-On a hit the error names the slot id and branch; the operator decides whether to
-wait, reuse the existing slot's output, or release it. The check holds the
-pool-wide mutex, so it's atomic w.r.t. other acquires. Exclusion is per-pool —
-each pool is its own bucket.
 
 ---
 

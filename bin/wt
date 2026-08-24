@@ -118,7 +118,7 @@ slot_repo_ok() {
 # `wt go ios-0` against an idle canonical dir doesn't mis-resume.
 slot_path_for() {
   local name=$1 path
-  if path=$(worktree-pool --pool "$POOL_KEY" path "$name" 2>/dev/null) && [ -n "$path" ]; then
+  if path=$(worktree-pool --pool "$POOL_KEY" path --lease "$name" 2>/dev/null) && [ -n "$path" ]; then
     printf '%s\n' "$path"
     return 0
   fi
@@ -345,7 +345,7 @@ call_hook() {
 # $name and $path come from the enclosing function's locals (dynamic scoping).
 fire_hook() {
   local hook_name="$1" fresh="$2"
-  export WT_KEY="$POOL_KEY" WT_NAME="$name" WT_PATH="$path" WT_FRESH="$fresh"
+  export WT_KEY="$POOL_KEY" WT_LEASE="$name" WT_PATH="$path" WT_FRESH="$fresh"
   source_hooks
   call_hook "$hook_name"
 }
@@ -389,7 +389,7 @@ cmd_acquire() {
   done
   [ -n "$from" ] && acquire_args=(--commit "$from" ${acquire_args[@]+"${acquire_args[@]}"})
 
-  worktree-pool --pool "$POOL_KEY" acquire "$name" ${acquire_args[@]+"${acquire_args[@]}"}
+  worktree-pool --pool "$POOL_KEY" acquire --lease "$name" ${acquire_args[@]+"${acquire_args[@]}"}
 }
 
 cmd_go() {
@@ -459,7 +459,7 @@ Recover with: rm -rf $(printf '%q' "$literal_path"), then re-run."
     printf '%s⚠ slot %s/%s already exists — resuming (acquire flags ignored). Use `%s release %s` first to recreate.%s\n' \
       "$Y" "$POOL_KEY" "$name" "${0##*/}" "$name" "$X" >&2
   else
-    path=$(worktree-pool --pool "$POOL_KEY" acquire "$name" ${acquire_args[@]+"${acquire_args[@]}"} | tail -1)
+    path=$(worktree-pool --pool "$POOL_KEY" acquire --lease "$name" ${acquire_args[@]+"${acquire_args[@]}"} | tail -1)
     if [[ -z "$path" || ! -d "$path" ]]; then
       die "pool returned no path."
     fi
@@ -470,8 +470,8 @@ Recover with: rm -rf $(printf '%q' "$literal_path"), then re-run."
   # empty and get real values just before the launcher exec; a failure before
   # that (e.g. crashed wt_pre_go) fires the trap with WT_FRESH empty → cleanup,
   # not preserve.
-  export WT_KEY="$POOL_KEY" WT_NAME="$name" WT_FRESH="" WT_LAUNCH_START=""
-  trap "'$0' --pool \"\$WT_KEY\" _exit_handler \"\$WT_NAME\"" EXIT
+  export WT_KEY="$POOL_KEY" WT_LEASE="$name" WT_FRESH="" WT_LAUNCH_START=""
+  trap "'$0' --pool \"\$WT_KEY\" _exit_handler \"\$WT_LEASE\"" EXIT
 
   printf '\n──── session: %s/%s @ %s ────\n\n' "$POOL_KEY" "$name" "$path"
 
@@ -927,7 +927,7 @@ cmd_cleanup() {
   fi
 
   # Only print 🟢 if release succeeded — else we'd lie about a still-broken slot.
-  if "$0" --pool "$POOL_KEY" release "$name"; then
+  if "$0" --pool "$POOL_KEY" release --lease "$name"; then
     printf '%s🟢 recycled cleanly: %s/%s%s\n' "$G" "$POOL_KEY" "$name" "$X"
     call_hook wt_post_cleanup || true
   else
@@ -1050,7 +1050,7 @@ cmd_release() {
   fi
 
   # Remote branch delete delegated to release.rs's silent push_delete.
-  worktree-pool --pool "$POOL_KEY" release "$name"
+  worktree-pool --pool "$POOL_KEY" release --lease "$name"
 }
 
 # Print the cwd context for an AI-agent bootstrap. One of:
@@ -1163,7 +1163,7 @@ cmd_init() {
 cmd_info() {
   local name="${1:-}"; shift || true
   require_arg name "$name" "wt info <name>"
-  exec worktree-pool --pool "$POOL_KEY" inspect "$name" "$@"
+  exec worktree-pool --pool "$POOL_KEY" inspect --lease "$name" "$@"
 }
 
 # ---------- help ----------

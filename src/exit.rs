@@ -7,7 +7,8 @@ use std::fmt;
 pub enum ExitKind {
     Contended = 3,
     Capacity = 4,
-    UniqueSha = 5,
+    // 5 is retired and must stay unassigned — callers branch on these, so codes never shift.
+    LeaseHeld = 6,
 }
 
 impl ExitKind {
@@ -21,7 +22,7 @@ impl fmt::Display for ExitKind {
         match self {
             Self::Contended => f.write_str("contended"),
             Self::Capacity => f.write_str("capacity"),
-            Self::UniqueSha => f.write_str("unique-sha"),
+            Self::LeaseHeld => f.write_str("lease-held"),
         }
     }
 }

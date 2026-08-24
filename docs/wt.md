@@ -41,7 +41,7 @@ Acquire and `wt land` both clear a leftover `git index.lock` in the active slot 
 
 `path` resolves NAME to a canonical slot path: first the held-slot branch lookup (`worktree-pool path NAME`), then a literal canonical-id fallback (`$WORKTREE_ROOT/<key>/NAME`). Exits 0 found, 1 not, 2 on usage/pool-not-init. Lets consumer scripts branch on resume vs. fresh acquire (pattern matches `git rev-parse --git-dir`, `brew --prefix`).
 
-`ls` filters `worktree-pool ls` to held slots — operators almost always want "what's active now." `--git-status` (DIRTY/UNTRK/AHEAD) is **on by default**; one `git status --porcelain` per held slot is cheap. `--bare` opts out for cold caches or huge slot dirs. The `NAME` column shows `(detached)` when HEAD isn't on a branch (operator checked out a SHA or hand-deleted the branch); such slots still recycle but the column flags the anomaly. `info` is a pass-through to `worktree-pool inspect <name>` with the pool key prefilled.
+`ls` filters `worktree-pool ls` to held slots — operators almost always want "what's active now." `--git-status` (DIRTY/UNTRK/AHEAD) is **on by default**; one `git status --porcelain` per held slot is cheap. `--bare` opts out for cold caches or huge slot dirs. The `LEASE` column shows `(detached)` when HEAD isn't on a branch (operator checked out a SHA or hand-deleted the branch); such slots still recycle but the column flags the anomaly. `info` is a pass-through to `worktree-pool inspect --lease <name>` with the pool key prefilled.
 
 `sweep` runs `cleanup` over every held slot — same classifier semantics in a loop, with a final tally. Operator-driven. Catches orphans whose EXIT trap never fired (killed shell, hand-deleted branch → detached HEAD with 0 ahead → 🟢 recycle, manual `git worktree add`). Always exits 0.
 
@@ -51,7 +51,7 @@ Acquire and `wt land` both clear a leftover `git index.lock` in the active slot 
 
 ## Hooks (`<source>/.wt-hooks.sh`)
 
-If the source repo has a `.wt-hooks.sh` at its toplevel, the named bash functions below extend lifecycle verbs. All optional; define any subset. Every hook sees `$WT_KEY`, `$WT_NAME`, `$WT_PATH` plus `$WT_FRESH` — but the two firers carry **different axes** in `WT_FRESH`: `wt`-fired hooks use acquire-vs-resume (`1`=fresh acquire, `0`=resume); core-fired `wt_post_acquire` uses slot-materialization (`1`=freshly created worktree with cold caches, `0`=recycled warm slot).
+If the source repo has a `.wt-hooks.sh` at its toplevel, the named bash functions below extend lifecycle verbs. All optional; define any subset. Every hook sees `$WT_KEY`, `$WT_LEASE`, `$WT_PATH` plus `$WT_FRESH` — but the two firers carry **different axes** in `WT_FRESH`: `wt`-fired hooks use acquire-vs-resume (`1`=fresh acquire, `0`=resume); core-fired `wt_post_acquire` uses slot-materialization (`1`=freshly created worktree with cold caches, `0`=recycled warm slot).
 
 **Who fires what.** `wt_post_acquire` is fired by **worktree-pool core** (`src/hooks.rs`), so it runs for a direct `worktree-pool acquire` (CI / build pools) *and* a fresh `wt go` acquire — but **not** `wt go` *resume* (resume reuses the slot without calling `acquire`). The rest are wrapper-only verbs fired by `wt`. Core reads `.wt-hooks.sh` from the **acquired slot's checkout** (works for bare sources, reflects the acquired commit's hook); `wt` sources it from the source worktree.
 
@@ -85,7 +85,7 @@ wt_post_acquire() {
 wt_pre_go() {
   cd "$WT_PATH/app" && bun install --silent
 }
-wt_pre_cleanup() { just _dev-stop "$WT_NAME" || true; }
+wt_pre_cleanup() { just _dev-stop "$WT_LEASE" || true; }
 wt_post_cleanup() { rm -f "$WT_PATH.log"; }
 wt_post_land() {
   if [ -n "$(git diff --name-only "$WT_MAIN_BEFORE" "$WT_MAIN_AFTER" -- package.json bun.lock)" ]; then

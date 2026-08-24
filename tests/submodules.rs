@@ -64,7 +64,7 @@ fn exclude_submodule_tags_skips_tagged_submodule() {
 
     let out = wtp()
         .args([
-            "--pool", &key, "acquire", "ci-1",
+            "--pool", &key, "acquire", "--lease", "ci-1",
             "--group", "ios",
             "--exclude-submodule-tags", "editor",
         ])
@@ -165,7 +165,7 @@ fn parallel_submodule_init_acquires_all() {
     init_pool_mirror(&key, &bare, &tmp.path().join("staging"));
 
     let out = wtp()
-        .args(["--pool", &key, "acquire", "many", "--group", "ios"])
+        .args(["--pool", &key, "acquire", "--lease", "many", "--group", "ios"])
         .output()
         .unwrap();
     assert!(

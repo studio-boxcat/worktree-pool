@@ -15,7 +15,7 @@
 //! contrast, sources from the source worktree — it fires *before* a slot
 //! exists, e.g. `wt_pre_go`.)
 //!
-//! Each hook runs **in the slot** with the `WT_KEY / WT_NAME / WT_PATH /
+//! Each hook runs **in the slot** with the `WT_KEY / WT_LEASE / WT_PATH /
 //! WT_FRESH` env contract set. A non-zero hook is a hard error (fail-loud):
 //! the caller decides whether to gate on it.
 
@@ -72,7 +72,7 @@ pub fn fire(
         .current_dir(slot_path)
         .env("WT_HOOKS_FILE", &hooks_file)
         .env("WT_KEY", pool_key)
-        .env("WT_NAME", name)
+        .env("WT_LEASE", name)
         .env("WT_PATH", slot_path)
         .env("WT_FRESH", if fresh { "1" } else { "0" })
         .status()
@@ -126,7 +126,7 @@ mod tests {
         // contract including WT_PATH (the export the path-isolation relies on).
         fs::write(
             slot.join(HOOKS_FILE),
-            "wt_post_acquire() { printf '%s|%s|%s|%s' \"$WT_KEY\" \"$WT_NAME\" \"$WT_FRESH\" \"$WT_PATH\" > out; }\n",
+            "wt_post_acquire() { printf '%s|%s|%s|%s' \"$WT_KEY\" \"$WT_LEASE\" \"$WT_FRESH\" \"$WT_PATH\" > out; }\n",
         )
         .unwrap();
         fire("wt_post_acquire", &slot, "mykey", "myname", true).unwrap();
