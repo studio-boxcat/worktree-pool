@@ -40,10 +40,10 @@ it produces, and gets the refusal for free.
 3. Refuse if the lease is already held (see [[#identity-model]]).
 4. Check capacity (`count_held_in_group >= max_slots` → refuse with the slot table inline).
 5. Iterate acquirable Ns (canonical `0..max_slots` with detached HEAD, plus surplus recycled-idle N >= max_slots — see [[#over-provisioned-pools]]). Try each slot's init mutex (flock); first success wins.
-6. Materialize at canonical path: fresh → `git worktree add --detach`; recycled → remove any leftover `<gitdir>/index.lock` (see [[#crash-recovery]]), then `git reset --hard <full_sha>`. **Never `git clean`** — untracked files are caller's warmth.
+6. Materialize at canonical path: fresh → `git worktree add --detach`; recycled → remove any leftover `<gitdir>/index.lock` (see [[#crash-recovery]]), then `git reset --hard <full_sha>`, then sweep stranded git working dirs — untracked dirs containing a `.git` entry, the litter a submodule dropped from `.gitmodules` leaves behind (checkout removes the gitlink but not the dir, and `reset --hard` never touches untracked paths). **Never `git clean`** — untracked files are caller's warmth; the sweep is the one exception, because an undeclared repo copy sits as duplicate content beside the real one and checkout consumers (Unity import) can't tell them apart.
 7. Force-create branch (`update-ref refs/heads/<L> HEAD && symbolic-ref HEAD refs/heads/<L>`). **This flips idle → held.** (Avoids `git checkout -B`'s 600ms of per-file filter-process pings on an already-correct tree.)
 8. Drop pool-wide mutex.
-9. Submodule update, two-phase: (a) sequential `git config submodule.<name>.url` writes per submodule under a per-source mutex (`<source-gitdir>/worktree-pool-config.lock`) so parallel acquires sharing a source don't fight on `<source>/.git/config`'s lockfile; (b) parallel per-submodule `git submodule update` via `parallel::try_for_each`, then attach each submodule to a branch matching the lease. Each worker recurses into nested `.gitmodules` end-to-end, so the full tree fans out in parallel. Tag exclusion via `--exclude-submodule-tags` (see [[#submodule-filtering-worktreepooltag]]).
+9. Submodule update, two-phase: (a) sequential `git config submodule.<name>.url` writes per submodule under a per-source mutex (`<source-gitdir>/worktree-pool-config.lock`) so parallel acquires sharing a source don't fight on `<source>/.git/config`'s lockfile; (b) parallel per-submodule `git submodule update` via `parallel::try_for_each`, then attach each submodule to a branch matching the lease and sweep stranded git working dirs inside it (step 6's rule, one level down — a *nested* submodule dropped from the outer's `.gitmodules` strands inside the outer's tree, out of the parent sweep's sight). Each worker recurses into nested `.gitmodules` end-to-end, so the full tree fans out in parallel. Tag exclusion via `--exclude-submodule-tags` (see [[#submodule-filtering-worktreepooltag]]).
 10. Fire `wt_post_acquire` if the source ships `.wt-hooks.sh`. Fail-loud — a non-zero hook fails the acquire before any path is printed. Runs for direct `worktree-pool acquire` (build pools) and `wt go`. See [[wt.md#hooks-sourcewt-hookssh]].
 11. Drop init mutex; print canonical path on stdout (last line).
 
@@ -178,10 +178,10 @@ matches:
 
 ```sh
 # CI build skips editor-only modules
-worktree-pool --pool myapp acquire abc12345 --commit abc12345 --group ios --exclude-submodule-tags editor
+worktree-pool --pool myapp acquire --lease abc12345-ios --commit abc12345 --group ios --exclude-submodule-tags editor
 
 # Dev session includes them
-worktree-pool --pool myapp acquire feature-x --group ios
+worktree-pool --pool myapp acquire --lease feature-x --group ios
 ```
 
 Tag filter applies at top level only; nested submodules always init when their
