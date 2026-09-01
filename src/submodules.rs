@@ -279,6 +279,10 @@ fn update_recursive(
                     sub_path.display()
                 )
             })?;
+            // The update above may have crossed a commit that dropped a nested
+            // submodule; sweep before recursing (which only sees the survivors).
+            // Free on fresh clones — nothing untracked to list.
+            sweep_stranded(&sub_path)?;
             if sub_path.join(".gitmodules").exists() {
                 let child_scope = if name_scope.is_empty() {
                     format!("{}/modules", e.name)
@@ -301,6 +305,27 @@ fn update_recursive(
             eprintln!("warn: submodule deinit -f {} failed: {}", e.path, stderr);
         }
         let _ = std::fs::remove_dir_all(dir.join(&e.path));
+    }
+    Ok(())
+}
+
+/// Remove untracked dirs that are themselves git repos (a `.git` entry inside) —
+/// working dirs stranded by a topology change. When a submodule is dropped from
+/// `.gitmodules`, checkout removes the gitlink but leaves the working dir behind,
+/// and `reset --hard` never touches untracked paths — so tools that scan the
+/// checkout (e.g. Unity's asset import, which reassigns GUIDs on duplicates)
+/// consume the stale copy alongside the real one, persistently. Ordinary
+/// untracked files/dirs are caller warmth and stay.
+pub fn sweep_stranded(dir: &Path) -> Result<()> {
+    for entry in git::ls_untracked(dir)? {
+        let Some(rel) = entry.strip_suffix('/') else { continue };
+        let stranded = dir.join(rel);
+        if !stranded.join(".git").exists() {
+            continue;
+        }
+        std::fs::remove_dir_all(&stranded)
+            .with_context(|| format!("removing stranded git working dir {}", stranded.display()))?;
+        eprintln!("swept stranded git working dir '{rel}' (not declared by this checkout)");
     }
     Ok(())
 }

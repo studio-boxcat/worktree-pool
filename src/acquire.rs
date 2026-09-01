@@ -74,34 +74,14 @@ pub fn run(pool_key: &str, pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs
     };
     let canonical_path = pool_root.join(slot_id.as_str());
 
-    // Materialize the slot at full_sha. Fresh → `worktree add`; recycled → `reset --hard`.
+    // Materialize the slot at full_sha. Fresh → `worktree add`; recycled → `recycle_slot`.
     if cand.is_fresh {
         if let Err(e) = git::worktree_add(&cfg.source, &canonical_path, full_sha.as_str()) {
             cleanup_partial_worktree_add(&cfg.source, &canonical_path);
             return Err(e);
         }
     } else {
-        // Clear any leftover `index.lock` before `reset --hard`, which writes the
-        // index and would fail with EEXIST on a stale lock (e.g. a crashed lazygit
-        // in a prior session). The slot is idle (detached HEAD) and we hold the
-        // pool + this slot's init mutex, so no legitimate git process is writing
-        // the index — unconditional remove is race-free, and catches partial
-        // non-zero locks a staleness heuristic would skip. git owns the lock's
-        // lifecycle; we only sweep what a dead process left behind.
-        if let Ok(gitdir) = git::worktree_gitdir(&canonical_path) {
-            let lock = fs_paths::worktree_index_lock(&gitdir);
-            match std::fs::remove_file(&lock) {
-                Ok(()) => eprintln!("cleared leftover index.lock in '{slot_id}' before recycle"),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                // Don't swallow a real failure: the next reset --hard would hit
-                // EEXIST with a generic git error, so surface the cause here.
-                Err(e) => eprintln!("warn: removing {}: {e:#}", lock.display()),
-            }
-        }
-        // Recycled slot: just `reset --hard`. Don't `git clean` — untracked files
-        // (Unity Library/, node_modules/, build outputs) are caller warmth the pool
-        // exists to preserve. The build system invalidates its own caches.
-        git::reset_hard(&canonical_path, full_sha.as_str())?;
+        recycle_slot(&canonical_path, &slot_id, full_sha.as_str())?;
     }
 
     // Backstop the init-time mirror gate BEFORE the idle→held flip: a pool
@@ -162,6 +142,33 @@ pub fn run(pool_key: &str, pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs
 
     println!("{}", canonical_path.display());
     Ok(())
+}
+
+/// Re-pin an idle slot to `full_sha` in place. No `git clean` — untracked files
+/// (Unity `Library/`, `node_modules/`, build outputs) are caller warmth the pool
+/// exists to preserve; the build system invalidates its own caches. The one
+/// exception is `sweep_stranded`: an untracked dir that is itself a git repo is
+/// topology-change litter (a dropped submodule's leftover working dir), not warmth.
+fn recycle_slot(canonical_path: &Path, slot_id: &SlotId, full_sha: &str) -> Result<()> {
+    // Clear any leftover `index.lock` before `reset --hard`, which writes the
+    // index and would fail with EEXIST on a stale lock (e.g. a crashed lazygit
+    // in a prior session). The slot is idle (detached HEAD) and we hold the
+    // pool + this slot's init mutex, so no legitimate git process is writing
+    // the index — unconditional remove is race-free, and catches partial
+    // non-zero locks a staleness heuristic would skip. git owns the lock's
+    // lifecycle; we only sweep what a dead process left behind.
+    if let Ok(gitdir) = git::worktree_gitdir(canonical_path) {
+        let lock = fs_paths::worktree_index_lock(&gitdir);
+        match std::fs::remove_file(&lock) {
+            Ok(()) => eprintln!("cleared leftover index.lock in '{slot_id}' before recycle"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // Don't swallow a real failure: the next reset --hard would hit
+            // EEXIST with a generic git error, so surface the cause here.
+            Err(e) => eprintln!("warn: removing {}: {e:#}", lock.display()),
+        }
+    }
+    git::reset_hard(canonical_path, full_sha)?;
+    submodules::sweep_stranded(canonical_path)
 }
 
 fn print_capacity_error(pool_root: &Path, entries: &[slot::SlotEntry]) {

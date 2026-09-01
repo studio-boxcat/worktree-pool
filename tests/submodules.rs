@@ -330,6 +330,86 @@ fn acquire_backstop_refuses_no_mirror_submodule_pool_and_keeps_slot_idle() {
     );
 }
 
+/// A submodule dropped from `.gitmodules` between two acquires leaves its working
+/// dir behind (`reset --hard` never touches untracked paths); recycle must sweep
+/// it — a checkout consumer can't tell the stale copy from a declared one — while
+/// ordinary untracked warmth survives.
+#[test]
+fn recycled_acquire_sweeps_stranded_submodule_dir() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture_with_submodule(tmp.path());
+    let staging = tmp.path().join("staging");
+    init_pool_mirror(&key, &bare, &staging);
+
+    let out = acquire_dev_sub(&key, "first");
+    assert_ok(&out, "initial acquire");
+    let slot = output_to_slot_path(&out);
+    assert!(slot.join("sub/FILE").exists(), "submodule should materialize");
+    std::fs::write(slot.join("warm.txt"), b"warm").unwrap();
+    std::fs::create_dir_all(slot.join("warm-dir")).unwrap();
+    std::fs::write(slot.join("warm-dir/f"), b"warm").unwrap();
+    release(&key, "first");
+
+    // Drop the submodule at the tip (`git rm` removes gitlink + .gitmodules entry).
+    run_git(&staging, &["rm", "--quiet", "sub"]);
+    git_commit(&staging, "drop submodule");
+    run_git(&staging, &["push", "--quiet", "origin", "main"]);
+
+    let out = acquire_dev_sub(&key, "second");
+    assert_ok(&out, "recycled acquire");
+    assert_eq!(output_to_slot_path(&out), slot, "should recycle the same canonical slot");
+    assert!(!slot.join("sub").exists(), "stranded submodule working dir must be swept");
+    assert!(slot.join("warm.txt").exists(), "untracked warmth file must survive");
+    assert!(slot.join("warm-dir/f").exists(), "untracked non-repo dir must survive");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("swept stranded git working dir"),
+        "sweep should leave a breadcrumb, got: {stderr}"
+    );
+}
+
+/// Same stranding one level down: a nested submodule dropped from the outer's
+/// `.gitmodules` strands inside the outer's working tree, where the parent-level
+/// sweep can't see it — the per-submodule sweep in `update_recursive` must.
+#[test]
+fn recycled_acquire_sweeps_stranded_nested_submodule_dir() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture_with_nested_submodule(tmp.path());
+    let staging = tmp.path().join("staging");
+    init_pool_mirror(&key, &bare, &staging);
+
+    let out = acquire_dev_sub(&key, "first");
+    assert_ok(&out, "initial acquire");
+    let slot = output_to_slot_path(&out);
+    assert!(slot.join("outer/inner/FILE").exists(), "nested submodule should materialize");
+    release(&key, "first");
+
+    // Drop `inner` at outer's tip, then bump outer's pin in the superproject.
+    // Pulling inside staging's own `outer/` both advances the pin source and
+    // lands the new commit in `staging/.git/modules/outer` — the object store
+    // the pool's source-submodules mirror serves slots from.
+    let outer_staging = tmp.path().join("outer-staging");
+    run_git(&outer_staging, &["rm", "--quiet", "inner"]);
+    git_commit(&outer_staging, "drop inner");
+    run_git(&outer_staging, &["push", "--quiet", "origin", "main"]);
+    run_git(&staging.join("outer"), &["pull", "--quiet", "origin", "main"]);
+    git_commit(&staging, "bump outer past the drop");
+    run_git(&staging, &["push", "--quiet", "origin", "main"]);
+
+    let out = acquire_dev_sub(&key, "second");
+    assert_ok(&out, "recycled acquire");
+    assert_eq!(output_to_slot_path(&out), slot, "should recycle the same canonical slot");
+    assert!(
+        !slot.join("outer/inner").exists(),
+        "stranded nested submodule working dir must be swept"
+    );
+    assert!(slot.join("outer/OUTER_FILE").exists(), "outer itself must stay materialized");
+}
+
 /// Capstone for the original incident: a working-clone source whose submodule is
 /// advanced to a LOCAL-ONLY commit (present in `<source>/.git/modules/<name>` but
 /// never pushed to the submodule's origin). `source-submodules` mirror resolves it from

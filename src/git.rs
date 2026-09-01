@@ -146,6 +146,21 @@ pub fn reset_hard(slot: &Path, commit: &str) -> Result<()> {
     run(slot, &["reset", "--hard", commit]).map(drop)
 }
 
+/// Untracked, non-ignored entries. Untracked dirs come collapsed at the topmost
+/// untracked level with a trailing `/`; ignored paths (`Library/`, `node_modules/`)
+/// are neither listed nor descended into, so this stays cheap on warm slots.
+pub fn ls_untracked(slot: &Path) -> Result<Vec<String>> {
+    let raw = run(
+        slot,
+        &["ls-files", "--others", "--directory", "--exclude-standard", "-z"],
+    )?;
+    Ok(raw
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 /// Force-create `<name>` at HEAD and attach HEAD to it. Tree-touchless.
 ///
 /// Why not `git checkout -B <name>`? Even though HEAD is already at the right
