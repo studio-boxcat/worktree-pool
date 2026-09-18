@@ -137,7 +137,7 @@ fn check_git() -> Check {
 }
 
 fn check_pools_dir(dir: &Path) -> Check {
-    if !dir.exists() {
+    if !dir.is_dir() {
         return warn(
             "pools dir",
             format!("{} not present — first init will create it", dir.display()),
