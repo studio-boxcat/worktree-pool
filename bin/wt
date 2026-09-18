@@ -927,7 +927,9 @@ cmd_cleanup() {
   fi
 
   # Only print 🟢 if release succeeded — else we'd lie about a still-broken slot.
-  if "$0" --pool "$POOL_KEY" release --lease "$name"; then
+  # `wt release` (this script), which takes a positional name — not the pool
+  # binary's `--lease`. Re-runs the safety checks above, which is the point.
+  if "$0" --pool "$POOL_KEY" release "$name"; then
     printf '%s🟢 recycled cleanly: %s/%s%s\n' "$G" "$POOL_KEY" "$name" "$X"
     call_hook wt_post_cleanup || true
   else

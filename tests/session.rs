@@ -83,6 +83,31 @@ fn session_cleanup_does_not_lie_on_broken_slot() {
     assert!(path.exists(), "cleanup should not delete the broken slot dir");
 }
 
+/// The happy path the two broken-slot tests above can't reach: a clean slot must
+/// actually recycle. Regression guard for `cleanup` invoking `wt release` with
+/// the pool binary's `--lease` flag, which `wt release` rejects as unknown —
+/// every recycle failed while both broken-slot tests stayed green.
+#[test]
+fn session_cleanup_recycles_a_clean_slot() {
+    let key = pool_key();
+    let _c = Cleanup(key.clone());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bare = make_fixture(tmp.path());
+    init_pool(&key, &bare);
+
+    let acquired = acquire_dev(&key, "tidy");
+    assert_ok(&acquired, "acquire tidy");
+    let slot_path = output_to_slot_path(&acquired);
+    let slot_id = slot_id_from_output(&acquired);
+
+    let out = session_cmd(&key, &["cleanup", &slot_id]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stdout.contains("recycled cleanly"),
+        "clean slot must recycle.\nstdout={stdout}\nstderr={stderr}");
+    assert_head_detached(&slot_path);
+}
+
 /// Stress the `slot_repo_ok` predicate against the upward-walk failure mode:
 /// no gitlink AND no source-repo admin. `git -C <slot> rev-parse --git-dir`
 /// alone would walk up from the slot path; the explicit `[ -e <slot>/.git ]`
