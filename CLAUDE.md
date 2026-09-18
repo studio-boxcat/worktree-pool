@@ -1,16 +1,17 @@
 # worktree-pool
 
-A recyclable pool of `git worktree` checkouts with named lifecycle, branch creation, and same-SHA exclusion. Each pool serves one source repo; multiple pools coexist on a host. Designed for CI build farms and dev-session workflows where worktree caches (Unity `Library/`, `node_modules/`, gradle/xcode artifacts) should stay warm across acquires.
+A recyclable pool of `git worktree` checkouts with named lifecycle, branch creation, and lease-keyed duplicate-work refusal. Each pool serves one source repo; multiple pools coexist on a host. Designed for CI build farms and dev-session workflows where worktree caches (Unity `Library/`, `node_modules/`, gradle/xcode artifacts) should stay warm across acquires.
 
 **Status:** v0.1 — early. arm64 macOS only.
 
 This file is the contract. `README.md` is a symlink to it. Detail lives in `docs/`:
 
-- [[cli.md]] — quick start, full CLI reference, stdout/JSON output contract, exit codes, install
-- [[lifecycle.md]] — `acquire`/`release` invariants, crash recovery, same-SHA exclusion, submodule filtering, design rationale
+- [[cli.md]] — quick start, CLI reference, output contract, exit codes, install
+- [[lifecycle.md]] — `acquire`/`release` invariants, identity model, crash recovery
+- [[submodules.md]] — acquire-time submodules: mirror modes, `worktreePoolTag` filtering
 - [[wt.md]] — `wt` dev-session helper: subcommands, hooks, cleanup classifier, land flow
-- [[land-submodules.md]] — `wt land` × newly-introduced submodules: populate-from-slot rationale, local-only constraint
-- [[integration.md]] — integration patterns, multi-slot gotchas, limits, scope cuts
+- [[land-submodules.md]] — land-time submodules: populate-from-slot rationale, local-only constraint
+- [[integration.md]] — integration patterns, multi-slot gotchas, scope boundaries
 
 Deferred work: [[TODO.md]].
 
@@ -55,7 +56,7 @@ submodule_mirror_mode: source-submodules             # bare-mirror | source-subm
 submodule_mirror_base: ~/Develop/myapp
 ```
 
-`source` is the absolute path to the source git repo (bare or working clone). `submodule_mirror_*` rewrites submodule URLs to a **local mirror** (`source-submodules` or `bare-mirror`) at acquire time; a mirror is **mandatory** when the source declares submodules. Mode semantics, the deliberately-absent declared-URL fallback, and the init/acquire fail-loud gates: [[lifecycle.md#submodule-mirror-mandatory-when-submodules-exist]].
+`source` is the absolute path to the source git repo (bare or working clone). `submodule_mirror_*` rewrites submodule URLs to a local mirror at acquire time, and is **mandatory** when the source declares submodules — see [[submodules.md#mirror-mandatory-when-submodules-exist]].
 
 Per-host `init` runs once per pool key. Source path differs by host (build server's bare mirror vs laptop's working clone); pool config carries the host-specific values.
 

@@ -1,6 +1,6 @@
 # Lifecycle invariants
 
-> **Related:** [[CLAUDE.md]], [[cli.md]], [[wt.md]] (land flow + cleanup classifier)
+> **Related:** [[CLAUDE.md]], [[cli.md]], [[submodules.md]] (mirror + tag filtering), [[wt.md]] (land flow + cleanup classifier)
 
 ## Identity model
 
@@ -40,12 +40,28 @@ it produces, and gets the refusal for free.
 3. Refuse if the lease is already held (see [[#identity-model]]).
 4. Check capacity (`count_held_in_group >= max_slots` → refuse with the slot table inline).
 5. Iterate acquirable Ns (canonical `0..max_slots` with detached HEAD, plus surplus recycled-idle N >= max_slots — see [[#over-provisioned-pools]]). Try each slot's init mutex (flock); first success wins.
-6. Materialize at canonical path: fresh → `git worktree add --detach`; recycled → remove any leftover `<gitdir>/index.lock` (see [[#crash-recovery]]), then `git reset --hard <full_sha>`, then sweep stranded git working dirs — untracked dirs containing a `.git` entry, the litter a submodule dropped from `.gitmodules` leaves behind (checkout removes the gitlink but not the dir, and `reset --hard` never touches untracked paths). **Never `git clean`** — untracked files are caller's warmth; the sweep is the one exception, because an undeclared repo copy sits as duplicate content beside the real one and checkout consumers (Unity import) can't tell them apart.
+6. Materialize at canonical path: fresh → `git worktree add --detach`; recycled → remove any leftover `<gitdir>/index.lock` (see [[#crash-recovery]]), `git reset --hard <full_sha>`, then sweep stranded git working dirs (see [[#the-stranded-working-dir-sweep]]).
 7. Force-create branch (`update-ref refs/heads/<L> HEAD && symbolic-ref HEAD refs/heads/<L>`). **This flips idle → held.** (Avoids `git checkout -B`'s 600ms of per-file filter-process pings on an already-correct tree.)
 8. Drop pool-wide mutex.
-9. Submodule update, two-phase: (a) sequential `git config submodule.<name>.url` writes per submodule under a per-source mutex (`<source-gitdir>/worktree-pool-config.lock`) so parallel acquires sharing a source don't fight on `<source>/.git/config`'s lockfile; (b) parallel per-submodule `git submodule update` via `parallel::try_for_each`, then attach each submodule to a branch matching the lease and sweep stranded git working dirs inside it (step 6's rule, one level down — a *nested* submodule dropped from the outer's `.gitmodules` strands inside the outer's tree, out of the parent sweep's sight). Each worker recurses into nested `.gitmodules` end-to-end, so the full tree fans out in parallel. Tag exclusion via `--exclude-submodule-tags` (see [[#submodule-filtering-worktreepooltag]]).
+9. Submodule update: sequential URL rewrites, then a parallel per-submodule `update` that recurses into nested `.gitmodules` end-to-end, attaches each to a lease-named branch, and re-runs step 6's sweep one level down. See [[submodules.md]].
 10. Fire `wt_post_acquire` if the source ships `.wt-hooks.sh`. Fail-loud — a non-zero hook fails the acquire before any path is printed. Runs for direct `worktree-pool acquire` (build pools) and `wt go`. See [[wt.md#hooks-sourcewt-hookssh]].
-11. Drop init mutex; print canonical path on stdout (last line).
+11. Drop init mutex; print the canonical path (see [[cli.md#output-contract]]).
+
+### The stranded working-dir sweep
+
+Dropping a submodule from `.gitmodules` leaves its working dir behind: checkout
+removes the gitlink but not the directory, and `reset --hard` never touches
+untracked paths. The recycle sweep removes untracked dirs that contain a `.git`
+entry.
+
+This is the **one** exception to never running `git clean` — untracked files are
+the caller's warmth, the whole reason slots are recycled rather than recreated.
+An undeclared repo copy earns the exception because it sits as duplicate content
+beside the real one and checkout consumers (Unity import) can't tell them apart.
+
+A *nested* submodule dropped from an outer submodule's `.gitmodules` strands
+inside that outer tree, out of the parent sweep's sight — hence the second pass
+in step 9.
 
 ## `release --lease <L>`
 
@@ -102,23 +118,9 @@ touched: their `index.lock` belongs to a live session.
 
 ## Capacity-bound failures
 
-When all slots in the requested group are held, `acquire` errors with the slot
-table inline plus the next command verbatim:
-
-```
-acquire failed: all 16 ios slots are held.
-
-Held slots in pool /Users/x/.worktree-pool/myapp:
-  ios-0 (lease: abc12345-ios)
-  ios-1 (lease: feature-x)
-  ...
-
-Release one with: worktree-pool --pool myapp release --lease <L>
-```
-
-There is no GC — the operator releases manually based on the table.
-
----
+When every slot in the requested group is held, `acquire` exits 4 and lists the
+held slots with their leases on stderr, plus the `release` command to run. There
+is no GC — the operator picks from that list.
 
 ## Over-provisioned pools
 
@@ -131,59 +133,3 @@ eating down the over-provision over time.
 
 No operator-facing GC. Manual: `git -C <source> worktree remove --force
 <pool>/slot-N`.
-
----
-
-## Submodule mirror (mandatory when submodules exist)
-
-A submodule's effective fetch URL at acquire time is rewritten to a **local
-mirror** by `submodule_mirror_mode`:
-
-| Mode | Effective URL | Resolves local-only pins? |
-|------|---------------|---------------------------|
-| `source-submodules` | `<base>/.git/modules/<composedName>` | **yes** — reads a working clone's own object store |
-| `bare-mirror` | `<base>/<org>/<repo>.git` | only if the mirror is fresh |
-
-Both need `submodule_mirror_base`. When the source declares submodules a mirror
-is **mandatory** — there is deliberately no declared-URL fallback. An absent
-mirror could only reach the network, failing mid-acquire with a cryptic `not our
-ref` the moment a pin is local-only (a freshly-bumped-but-unpushed submodule —
-the common dev case). So we fail loud:
-
-- **`init`** refuses a submodule-bearing source with no mirror (no pool created).
-- **`acquire`** backstops pools predating the gate (or whose source gained
-  submodules since): it bails **before** the idle→held flip, leaving the slot
-  detached (idle) and reclaimable rather than HELD with a half-fetched tree.
-
-For a working-clone source you actively commit in, use `source-submodules` with
-`base = source`: it resolves whatever the source HEAD references, pushed or not.
-`base` may differ from `source` — e.g. a bare source mirrored from its sibling
-working clone's `.git/modules`.
-
-## Submodule filtering (`worktreePoolTag`)
-
-Submodule taxonomy lives in the source repo's `.gitmodules` (version-controlled,
-propagates on next checkout). The tool reads `worktreePoolTag = <tag>` lines
-(case-insensitive key — git lowercases on read).
-
-```ini
-[submodule "Packages/com.unity.ide.rider"]
-    path = Packages/com.unity.ide.rider
-    url = git@github.com:org/com.unity.ide.rider.git
-    worktreePoolTag = editor
-```
-
-`acquire --exclude-submodule-tags <t1,t2>` deinits + skips submodules whose tag
-matches:
-
-```sh
-# CI build skips editor-only modules
-worktree-pool --pool myapp acquire --lease abc12345-ios --commit abc12345 --group ios --exclude-submodule-tags editor
-
-# Dev session includes them
-worktree-pool --pool myapp acquire --lease feature-x --group ios
-```
-
-Tag filter applies at top level only; nested submodules always init when their
-parent is included. `validate-gitmodules` warns on misspelled `worktreePool*`
-keys (catches the `worktreePoolTags` plural typo etc).

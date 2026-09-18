@@ -5,20 +5,21 @@
 Bash dispatcher in `bin/wt`. Subcommands wrapping the slot + git-flow lifecycle for interactive dev work. `wt` is the human-readable face over the pool binary's JSON ([[cli.md#output-contract]]), so `jq` is a hard dependency — it fails fast at startup without one.
 
 ```sh
-wt [--pool <key>] init    [--max-slots <n>] [pool-init-flags...] # --source inferred from cwd; --max-slots defaults to 16
-wt [--pool <key>] path    <name>     # print canonical slot path; exit 0 found, 1 not, 2 on error
-wt [--pool <key>] acquire <name> [--from <commit-ish>] [pool-acquire-flags...]   # acquire only, print path; no session
+wt [--pool <key>] init    [--max-slots <n>] [pool-init-flags...]
+wt [--pool <key>] path    <name>
+wt [--pool <key>] acquire <name> [--from <commit-ish>] [pool-acquire-flags...]
 wt [--pool <key>] go      <name> [--from <commit-ish>] [pool-acquire-flags...]
-wt [--pool <key>] release [name] [--force]   # safety-checked release; name defaults to cwd's slot; --force discards dirty/unmerged
-wt [--pool <key>] cleanup <name>     # 🟢/🟡/🔴 exit-trap classifier
-wt [--pool <key>] sweep              # run cleanup over every held slot in the pool
-wt [--pool <key>] ls      [--bare]   # held slots + git status (DIRTY/UNTRK/AHEAD); --bare skips git calls
+wt [--pool <key>] release [name] [--force]
+wt [--pool <key>] cleanup <name>
+wt [--pool <key>] sweep
+wt [--pool <key>] ls      [--bare]
 wt [--pool <key>] info    <name>
-wt land   [message]                  # ff slot's commits onto local main (local-only; no push, no PR)
-wt whoami                            # cwd context: worktree|source|none + path
-wt orient                            # print current repo path + CLAUDE.md
-wt help   [verb]                     # per-verb usage; also `wt <verb> --help`
+wt land   [message]
+wt whoami
+wt orient
 ```
+
+Per-verb usage and flags: `wt help [verb]`, or `wt <verb> --help`.
 
 **Pool-key auto-resolution.** `--pool` is optional; `wt` infers the key from cwd:
 1. cwd inside `$WORKTREE_ROOT/<key>/...` (a slot) → key is that path segment.
@@ -35,13 +36,13 @@ So inside the source repo or any of its slots, every verb works without a pool-k
 
 **TTY guard.** `go` refuses early if stdin/stdout isn't a TTY: the launcher exits in <1s without one, and the EXIT trap would silently 🟢-recycle the fresh slot, destroying the diagnostic surface. Common cause: running `wt go` from inside an existing AI session. For non-interactive automation use `worktree-pool acquire`, or set `WT_GO_ALLOW_NOTTY=1`.
 
-Acquire and `wt land` both clear a leftover `git index.lock` in the active slot before writing the index (see [[lifecycle.md#crash-recovery]]). So a stuck `git status`/`git commit` reporting `Unable to create 'index.lock'` clears on the next `wt land` or when the slot is later recycled.
+A stuck `Unable to create 'index.lock'` clears on the next `wt land` or recycle — both drop a leftover lock before writing the index ([[lifecycle.md#crash-recovery]]).
 
-`release` is the manual one-shot with the same safety checks (refuse on dirty / unmerged). With no `name` it releases the slot cwd sits in (resolved via that slot's branch). `--force` (`-f`) discards dirty tracked changes and/or unmerged commits, but still refuses 🔴 BROKEN slots (recover via `rm -rf`). `--force` is intentionally `release`-only, not a `cleanup` flag: `cleanup` is the auto-invoked exit-trap classifier whose purpose is preserving uncommitted work, so force-recycle there would defeat the trap.
+`release` is the manual one-shot with the classifier's safety checks. With no `name` it releases the slot cwd sits in. `--force` (`-f`) discards dirty tracked changes and unmerged commits, but still refuses 🔴 BROKEN slots. It is deliberately `release`-only and not a `cleanup` flag: `cleanup` fires automatically from an exit trap *to preserve uncommitted work*, so a force there would defeat its purpose.
 
-`path` resolves NAME to a canonical slot path: first the held-slot branch lookup (`worktree-pool path NAME`), then a literal canonical-id fallback (`$WORKTREE_ROOT/<key>/NAME`). Exits 0 found, 1 not, 2 on usage/pool-not-init. Lets consumer scripts branch on resume vs. fresh acquire (pattern matches `git rev-parse --git-dir`, `brew --prefix`).
+`path` resolves NAME to a canonical slot path — held-slot branch lookup first, then a literal canonical-id fallback (`$WORKTREE_ROOT/<key>/NAME`). Exits 0 found, 1 not, 2 on usage/pool-not-init, so consumer scripts can branch on resume vs. fresh acquire the way `git rev-parse --git-dir` and `brew --prefix` are used.
 
-`ls` filters `worktree-pool ls` to held slots — operators almost always want "what's active now" — and renders them as a table, dropping GROUP when every held slot shares one. `--git-status` (DIRTY/UNTRK/AHEAD) is **on by default**; one `git status --porcelain` per held slot is cheap. `--bare` opts out for cold caches or huge slot dirs. `info` renders `worktree-pool inspect --lease <name>` with the pool key prefilled. Idle slots (detached HEAD — operator checked out a SHA or hand-deleted the branch) don't appear in either; use `worktree-pool ls` for every slot.
+`ls` and `info` render the pool binary's JSON as text — `ls` filtered to held slots, since operators almost always want "what's active now". Git status columns (DIRTY/UNTRK/AHEAD) are **on by default**; one `git status --porcelain` per held slot is cheap, and `--bare` opts out for cold caches or huge slot dirs. Idle slots never appear: use `worktree-pool ls` for the whole pool.
 
 `sweep` runs `cleanup` over every held slot — same classifier semantics in a loop, with a final tally. Operator-driven. Catches orphans whose EXIT trap never fired (killed shell, hand-deleted branch → detached HEAD with 0 ahead → 🟢 recycle, manual `git worktree add`). Always exits 0.
 
@@ -121,13 +122,13 @@ Steps in order, refusing loudly on anything unexpected:
 5. **Acquire per-source `land.lock`** at `<common-gitdir>/worktree-pool/land.lock` (one source ⇒ one in-flight land; different sources parallelize). PID-tagged, reclaimed by next acquirer via `kill -0` liveness or mtime fallback (5 min stale). Released by EXIT trap on every exit path (incl. `die` and conflict-exit), so a long manual-resolution pause doesn't wedge other slots.
 6. **Refuse on in-progress git operation in `<main_path>` or any top-level submodule.** Walks `.gitmodules` for the path list. Maps marker → recovery hint (`MERGE_HEAD` → `merge --abort`, etc.), aggregated into one refusal.
 7. Refuse if main has tracked uncommitted changes (untracked there is fine — the parent `merge --ff-only` refuses if untracked files would be overwritten, so operator scratch survives).
-8. **Pre-stage submodule sync, then auto-commit dirty tracked work.** Sync each submodule's working dir to its recorded gitlink (handles the post-merge-without-`--recurse-submodules` state where a blind `git add -u` would regress the gitlink); refuse on divergence. Then auto-commit with the supplied message — refuses if dirty *and* no message (`wip` → `WIP via land`). See [[land-submodules.md#the-phases]].
-9. `git merge main`. No-op in the common case (main is ancestor of slot HEAD); slot's commits fast-forward main below — keeps history linear. A real 3-way merge only happens when a parallel slot advanced main first; halts on conflict (resolve + `git add` + `git commit`, then re-run). **Parent-order rewrite (always-on):** if HEAD moved and has exactly 2 parents, rebuild via `git commit-tree` with parents `(main, slot)`. Message (`%B`), author and committer identity are preserved verbatim — the rewrite is tree-identical. Auto-generated `"Merge main into <branch>"` becomes `"Merge <branch> into main"`; operator-authored resume messages survive. Skipped for no-ops and octopus (3+ parents). Keeps `git log --first-parent main` on mainline.
-10. Refuse if `main` is no longer ancestor of `HEAD` (a parallel land advanced main during long conflict resolution — fires only when the lock was released mid-flow, e.g. conflict-exit + resume).
-11. **Advance main's submodule clones to the new pins — before the parent ff.** For each top-level submodule whose gitlink moved between `<main_before>` and slot HEAD: fetch the slot submodule's `HEAD` (= the pin) into main's clone (local, no origin), then `merge --ff-only`. Done *before* the parent advance so a failure (untracked collision or main-side divergence, both refused by ff-only) leaves `main` un-advanced and the re-run retries cleanly. Submodules with no main clone are newly introduced — collected for step 12. Detached HEAD is fine; top-level only; tag-excluded ones skipped. See [[land-submodules.md]].
-12. `git -C <main_path> -c core.hooksPath=/dev/null merge --ff-only <slot_HEAD>` — advances `refs/heads/main` and refreshes main's working tree atomically. Pre-guarded by `symbolic-ref HEAD == refs/heads/main` so a manually-checked-out other branch in main_path can't silently fast-forward. `--ff-only` refuses on untracked collision (preserves scratch) and on a parallel land that advanced main past our base. `core.hooksPath=/dev/null` suppresses `post-merge` — `wt_post_land` is the documented extension point.
+8. **Pre-stage submodule sync, then auto-commit dirty tracked work.** Sync each submodule's working dir to its recorded gitlink, refusing on divergence — without this a blind `git add -u` can silently regress a gitlink ([[land-submodules.md#the-phases]]). Then auto-commit with the supplied message; refuses if dirty *and* no message (`wip` → `WIP via land`).
+9. `git merge main`. A no-op in the common case (main is already an ancestor); a real 3-way merge only when a parallel slot advanced main first, halting on conflict (resolve + `git add` + `git commit`, then re-run). **Parent-order rewrite (always-on):** when HEAD moved and has exactly 2 parents, rebuild via `git commit-tree` with parents `(main, slot)` so `git log --first-parent main` stays on mainline. Tree-identical — message, author and committer survive verbatim; `"Merge main into <branch>"` reads `"Merge <branch> into main"`. Skipped for no-ops and octopus merges.
+10. Refuse if `main` is no longer an ancestor of `HEAD` — a parallel land advanced it during long conflict resolution. Only reachable when the lock was released mid-flow (conflict-exit, then resume).
+11. **Advance main's submodule clones to the new pins**, before the parent ff. Newly-introduced submodules have no clone to advance and are deferred to step 12. See [[land-submodules.md#the-phases]].
+12. `git -C <main_path> -c core.hooksPath=/dev/null merge --ff-only <slot_HEAD>` — advances `refs/heads/main` and refreshes its working tree atomically. Pre-guarded by `symbolic-ref HEAD == refs/heads/main` so a manually-checked-out branch there can't silently fast-forward. `--ff-only` refuses on untracked collision (preserving operator scratch) and on a parallel land that moved main past our base. `core.hooksPath=/dev/null` suppresses `post-merge`; `wt_post_land` is the supported extension point.
 
-    **Then populate main's clones of newly-introduced submodules** (step 11's collection) — after the ff (main's `.gitmodules` now lists them), cloning each from the slot's clone, fully local. **Non-fatal**: a failure emits `land: WARN:` with the recovery command. See [[land-submodules.md]] for why it sources from the slot.
-13. **Refresh slot's submodule working trees for gitlinks main brought in.** When a parallel land bumped a submodule this slot didn't touch, fetch the pin from main's clone (local) then `git submodule update` so `git status` stops showing phantom rewinds. **Cosmetic** — main is already advanced, so failures only `WARN`. Top-level only. See [[land-submodules.md#the-phases]].
+    **Then populate main's clones of the step-11 deferrals**, now that the ff has recorded their `.gitmodules` entries. Non-fatal — a failure emits `land: WARN:` with the recovery command.
+13. **Refresh the slot's submodule working trees** for gitlinks main brought in, so `git status` stops showing phantom rewinds. Cosmetic: main is already advanced, so failures only `WARN`. See [[land-submodules.md#the-phases]].
 
 Idempotent: re-runs are safe (step 2 covers the trivial case; mid-flow re-runs reach the same gates). Resume after conflict = re-run land after the manual merge commit lands.

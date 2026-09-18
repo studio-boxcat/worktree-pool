@@ -1,6 +1,6 @@
 # Land × submodules
 
-> **Related:** [[wt.md#land-flow]] (the land step contract), [[lifecycle.md#submodule-filtering-worktreepooltag]] (acquire-time clone + URL rewrite)
+> **Related:** [[wt.md#land-flow]] (the land step contract), [[submodules.md]] (the same problem at acquire time)
 
 How `wt land` keeps git submodule clones in step with the gitlinks it moves
 between the slot and main worktree. [[wt.md#land-flow]] lists *what* each step
@@ -12,6 +12,10 @@ Land is **local-only** — every fetch source is a sibling local clone
 --init --recursive`). Submodule clones are checked out **detached at the pinned
 commit** — no branch tracking, because each land fetches the *commit* (the other
 side's `HEAD`), not a branch ref.
+
+A submodule the acquire skipped via `worktreePoolTag` ([[submodules.md#filtering-worktreepooltag]])
+has no clone in the slot, so every phase below passes over it — the gitlink lands
+unchanged, which is what a filtered-out submodule should do.
 
 ## The phases
 
@@ -84,29 +88,20 @@ missing those commits. acquire never writes mirror URLs into `.gitmodules` (only
 into `.git/config`, `src/submodules.rs`), so the declared URL is all `--init`
 has, and it isn't the right source.
 
-## Use cases
-
-1. **No submodule changes** — no `160000` diff; nothing runs.
-2. **Existing pin bumped** — fetch the pin (local) + ff main's clone, before the parent ff.
-3. **Brand-new submodule introduced** — deferred past the ff, then cloned from the slot.
-4. **New submodule with slot-local commits** — covered: the populate sources from the slot.
-5. **Parallel land bumped a sub this slot didn't touch** — cosmetic refresh of the slot's clone.
-
 ## Non-goals
 
 - No push / fetch-origin / PR — every fetch is from a sibling local clone.
-- No branch tracking — clones sit detached at the pin (each land fetches the
-  commit, not a branch). Dropped the attach-to-branch machinery that only
-  existed to support fetch-by-branch.
+- No branch tracking — clones sit detached at the pin, since each land fetches
+  the commit rather than a branch.
 - No `submodule.recurse` / `--recursive` — nested submodules stay top-level-scoped.
 
 ## Pitfalls
 
-- `git merge --ff-only` never populates submodule working trees — populate/advance must be explicit.
-- The submodule clone lacks the superproject branch ref — fetch `HEAD` (the pin), not the branch name.
-- Advance submodules **before** the parent ff: a post-ff advance that fails would leave `main` advanced with no clean re-run.
-- The declared `.gitmodules` URL is remote and lacks slot-local commits — clone new submodules from the slot, not the URL.
-- `set -u` + empty bash array: guard expansions with `${arr[@]+"${arr[@]}"}` (macOS ships bash 3.2).
+Two that aren't visible from the phases above:
+
+- `git merge --ff-only` never populates submodule working trees, which is why
+  every advance and populate has to be explicit.
+- `set -u` + an empty bash array needs `${arr[@]+"${arr[@]}"}` — macOS ships bash 3.2.
 
 ## References
 

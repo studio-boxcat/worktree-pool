@@ -1,47 +1,49 @@
 # Integration
 
-> **Related:** [[CLAUDE.md]], [[wt.md]] (hooks, land flow), [[cli.md]]
+> **Related:** [[CLAUDE.md]], [[wt.md]] (hooks, land flow), [[cli.md]] (output contract, exit codes)
 
 ## Integration patterns
 
-The minimal-friction integration is **no integration at all** — auto-resolution + `.wt-hooks.sh` covers the common cases. From inside the source repo or any slot, `wt go feature-x`, `wt land`, `wt ls`, `wt release feature-x` work without consumer wrappers. Project-specific extras live in `<source>/.wt-hooks.sh`; see [[wt.md#hooks-sourcewt-hookssh]].
+The minimal-friction integration is **no integration at all** — pool-key auto-resolution plus `.wt-hooks.sh` covers the common cases. From inside the source repo or any slot, `wt go feature-x`, `wt land`, `wt ls`, `wt release feature-x` work with no consumer wrapper and no pool key. Project-specific extras belong in `<source>/.wt-hooks.sh`; see [[wt.md#hooks-sourcewt-hookssh]].
 
-Consumers only need a `just` recipe (or alias) when the wrapper adds *operator-facing* surface — independent verbs like `wt-meta`, `wt-dev-start` — not for pre-filling the pool key. Avoid the old pattern of a recipe per verb just to inject the key:
+Reach for a `just` recipe or alias only when it adds *operator-facing* surface — an independent verb like `wt-dev-start`. A recipe that exists purely to inject the pool key is redundant.
 
-```bash
-# OLD — redundant; auto-resolution makes this unnecessary.
-wt-go name:    @wt go myapp {{quote(name)}}
-wt-release name: @wt release myapp {{quote(name)}}
-# … (delete; just type `wt go feature-x` directly)
-```
+Pool config (source path, mirror mode) lives in `config.yaml`, written once by `init`. Both it and `.wt-hooks.sh` are host-agnostic in practice — keys map to `$WORKTREE_ROOT/<key>/` and the hooks file is version-controlled with the source, so one setup runs on server and laptop alike.
 
-Pool config (source path, mirror mode) lives in `config.yaml`, written once by `init`. Both it and `.wt-hooks.sh` are host-agnostic in practice — keys map to `$WORKTREE_ROOT/<key>/`, and the hooks file is version-controlled with the source, so the same setup runs on server and laptop.
+Retry-aware CI callers branch on [[cli.md#exit-codes]] rather than parsing stderr.
 
 ---
 
 ## Multi-slot gotchas
 
-Slots share `.git/` and `.git/modules/` with the source repo, but **not** the working tree. When running multiple slots concurrently:
+Slots share `.git/` and `.git/modules/` with the source repo, but **not** the working tree. When running several concurrently:
 
-- **Per-slot warmth lives inside the slot dir.** Build artifacts (Unity `Library/`, `Temp/`, `node_modules/`, gradle caches) survive recycle because the slot stays canonical (no rename) and acquire does `git reset --hard` only — never `git clean`. Stable abs paths preserve abs-path-keyed caches (Unity Bee, watchman, IDE indexes). Across-platform flips inside one slot rebuild platform-specific caches; don't symlink caches across slots.
-- **Submodule git-dirs (`<source>/.git/modules/...`) are shared.** Concurrent updates can race on ref locks; git's own `O_EXCL` retry handles transient contention. A *crashed-git* leftover `index.lock` (distinct case) is removed by acquire when it recycles that slot — see [[lifecycle.md#crash-recovery]].
+- **Per-slot warmth lives inside the slot dir** and survives recycle (see [[lifecycle.md#identity-model]]). Flipping platforms *within* one slot rebuilds that platform's caches; don't symlink caches across slots to dodge it.
+- **Submodule git-dirs (`<source>/.git/modules/...`) are shared.** Concurrent updates can race on ref locks; git's own `O_EXCL` retry absorbs transient contention. A crashed-git leftover `index.lock` is a distinct case — see [[lifecycle.md#crash-recovery]].
 - **Shared docs (`TODO.md`, `CLAUDE.md`, `docs/`) are high-traffic.** Keep edits scoped, commit separately, rebase early. A long-held session diverging on these is the usual conflict source.
-- **Branch refs accumulate in the source repo.** `release` deletes the branch (local + remote best-effort), so steady state is zero buildup. Crashed acquires that bypass release leave prunable orphans.
-- **LFS endpoint routing is the consumer's responsibility.** Slots clone submodules from the source bare; if those use LFS, smudging hits whatever `lfs.url` resolves to. With a remote LFS relay, set a `[url] insteadOf` rewrite to a faster local endpoint — e.g. `git config --global url.http://localhost:3690/.insteadOf https://relay.example/` (lives in `~/.gitconfig.local`, machine-specific). Without it, cold acquires incur per-object WAN round-trips. Pool tooling doesn't inspect or enforce this.
+- **LFS endpoint routing is the consumer's responsibility.** Slots clone submodules from the source bare; if those use LFS, smudging hits whatever `lfs.url` resolves to. With a remote relay, rewrite it to a local endpoint — `git config --global url.http://localhost:3690/.insteadOf https://relay.example/` in `~/.gitconfig.local`. Without it, cold acquires pay per-object WAN round-trips. Pool tooling neither inspects nor enforces this.
 
 ---
 
-## What this tool does NOT do
+## Scope boundaries
 
-Cuts that simplify the design:
+Cuts that simplify the design, and the limits they imply:
 
-- **No GC.** All cleanup is operator-explicit. Capacity errors list the table; operator picks a slot to release.
-- **No registry.** Pool key → path is convention (`$WORKTREE_ROOT/<key>/`). No tracked file.
-- **No cross-host coordination.** Pools are host-local. Network-mounted shared pools aren't supported (no host/pid liveness checks).
-- **No reclaim on holder death.** A SIGKILL'd holder leaves the slot held; operator notices via `ls` and runs `release`. (A crash *mid* acquire/release instead converges on its own — see [[lifecycle.md#crash-recovery]].)
-- **No `--fresh` / `--volatile` flags.** Caller wipes warmth itself if needed; release is the only "give back" verb.
+- **No GC.** All cleanup is operator-explicit; capacity errors list the held slots to pick from.
+- **No registry.** Pool key → path is convention (`$WORKTREE_ROOT/<key>/`), not a tracked file.
+- **No cross-host coordination.** Pools are host-local. Network-mounted shared pools aren't supported — there are no host/pid liveness checks.
+- **No reclaim on holder death.** A SIGKILL'd holder leaves the slot held; the operator spots it via `ls` and releases. (A crash *mid* acquire/release converges on its own — [[lifecycle.md#crash-recovery]].)
+- **No `--fresh` / `--volatile` flags.** `release` is the only "give back" verb; a caller that wants a cold slot wipes it itself.
+- **No cross-pool coordination.** Duplicate-work refusal is per-pool and lease-keyed, so two pools sharing a source don't see each other ([[lifecycle.md#identity-model]]).
 
-If you need GC-like behavior, write a 5-line script — `ls` reports JSON ([[cli.md#output-contract]]), so filtering is a `jq` select rather than column arithmetic:
+**Branch refs accumulate** when a holder dies before `release` — and, deliberately, for abandoned dev sessions, since the branch is how that work is recovered (`git branch | grep`). Steady state is otherwise zero: `release` deletes the branch. High-volume CI can prune periodically:
+
+```sh
+git for-each-ref --format='%(refname:short)' refs/heads/ \
+  | xargs -I X sh -c 'git merge-base --is-ancestor X origin/main && git branch -D X'
+```
+
+GC-like reaping is the same shape — `ls` reports JSON ([[cli.md#output-contract]]), so the filter is a `jq` select:
 
 ```sh
 worktree-pool --pool myapp ls --git-status \
@@ -49,12 +51,4 @@ worktree-pool --pool myapp ls --git-status \
   | xargs -I L worktree-pool --pool myapp release --lease L
 ```
 
-Retry-aware CI callers branch on exit codes (see [[cli.md#exit-codes]]): **3 = contended** (retry), **4 = capacity** (release first), **6 = lease held** (reuse the holder's output, or release it). Everything else exits 1.
-
----
-
-## Limits
-
-- Branch refs accumulate for SIGKILL'd builds and abandoned dev sessions (the latter intentional — work recovery via `git branch | grep`). For high-volume CI, periodic `git for-each-ref --format='%(refname:short)' refs/heads/ | xargs -I X sh -c 'git merge-base --is-ancestor X origin/main && git branch -D X'` is the consumer's responsibility.
-- Duplicate-work refusal is per-pool and lease-keyed, so two pools sharing a source don't coordinate (see [[lifecycle.md#identity-model]]).
-- `git status --porcelain` on huge worktrees (50k+ files) is the bottleneck for `ls --git-status`; plain `ls` is cheap (gitdir HEAD read only).
+`git status --porcelain` on huge worktrees (50k+ files) is the bottleneck for `ls --git-status`; plain `ls` is cheap — a gitdir HEAD read per slot, no subprocess.

@@ -32,7 +32,7 @@ worktree-pool --pool myapp path --lease abc12345-ios   # slot path; exit 1 if no
 
 ```
 worktree-pool --pool <key> init --source <repo> [--submodule-mirror-mode <source-submodules|bare-mirror> --submodule-mirror-base <p>] [--default-commit <ref>] --max-slots <n> [--groups <g1,g2>]
-  # mirror flags are REQUIRED (together) when <repo> declares submodules — see [[lifecycle.md#submodule-mirror-mandatory-when-submodules-exist]]
+  # mirror flags are REQUIRED (together) when <repo> declares submodules — see [[submodules.md#mirror-mandatory-when-submodules-exist]]
 
 worktree-pool --pool <key> acquire --lease <L> [--commit <commitish>] [--group <g>] [--exclude-submodule-tags <t1,t2>]
 
@@ -68,26 +68,21 @@ Stdout is machine-readable in every subcommand, in exactly one of three shapes:
 | One bare line | `acquire`, `path` | The canonical slot path. Consumed as `$(…)` — no parser in the hot loop. |
 | One line of compact JSON | `ls`, `inspect`, `unstick`, `validate-gitmodules`, `doctor` | `\| jq` to read. |
 
-There is **no `--json` flag**: a verb that reports structure always reports JSON,
-so callers never branch on format and no human-readable table can drift from the
-machine-readable one. Rendering is the consumer's job — `wt` does it for
-operators (see [[wt.md]]).
+There is **no `--json` flag**: one rendering can't drift from another, and
+callers never branch on format. Rendering for humans is the consumer's job —
+[[wt.md]] does it for operators.
 
-Conventions:
-
-- **Everything else is stderr.** Logs, warnings, hook output, and the `error: …`
-  line never touch stdout.
+- **Everything else is stderr** — logs, warnings, hook output, the `error: …` line.
 - **Absent data is `null`**, never a placeholder like `"-"`. An idle slot has
   `"lease": null`; `"git"` is absent entirely unless `ls --git-status` was passed.
 - **A report and a failure are independent.** `doctor` and `validate-gitmodules`
-  print their full report *and* exit non-zero when it contains problems — the
+  emit their full report *and* exit non-zero when it contains problems — the
   payload is the point, so it survives the failure. `path` inverts this: exit 1
-  with empty stdout *and* empty stderr, so `if worktree-pool … path …; then` reads
-  cleanly.
+  with both streams empty, so `if worktree-pool … path …; then` reads cleanly.
 
-`src/output.rs` defines the three shapes and `main` is the only writer, so a
-subcommand cannot print off-contract; the field-level schema of each report lives
-in the verb's own module and is locked by `tests/lifecycle.rs`.
+`src/output.rs` holds the shapes and `main` is the only writer, so a subcommand
+cannot print off-contract. Per-report fields live in the verb's own module,
+locked by `tests/lifecycle.rs`.
 
 ## Exit codes
 
