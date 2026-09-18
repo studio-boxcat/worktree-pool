@@ -14,7 +14,7 @@ pub fn run() -> Result<Outcome> {
         Some(root) => vec![check_pools_dir(&root), check_pools()],
         None => vec![fail(
             "pools dir",
-            "WORKTREE_ROOT unset → boxcat/env.zsh (config) defines it; run from a shell that sourced .zshenv",
+            "WORKTREE_ROOT unset → the env boxcat-devenv generates defines it; run from a shell that sourced .zshenv",
         )],
     };
     let sections = [
