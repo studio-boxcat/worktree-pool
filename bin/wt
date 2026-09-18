@@ -42,6 +42,11 @@ die() { echo "${0##*/}: $*" >&2; exit 1; }
 [ -n "${WORKTREE_ROOT:-}" ] \
   || die "WORKTREE_ROOT is unset. Add 'export WORKTREE_ROOT=\"\$HOME/.worktree-pool\"' to ~/.zshenv.local (or equivalent) and reopen your shell."
 
+# wt is the human face over worktree-pool's JSON verbs ([[cli.md#output-contract]]),
+# so jq is a hard dependency rather than a nicety.
+command -v jq >/dev/null 2>&1 \
+  || die "jq is required (wt renders worktree-pool's JSON output). Install with: brew install jq"
+
 require_arg() { [ -n "$2" ] || die "usage: $3"; }
 
 # Read `source:` from a pool's config and expand `~`. Empty on failure.
@@ -54,9 +59,17 @@ pool_source_path() {
   printf '%s' "${src/#\~/$HOME}"
 }
 
-# Filter captured `worktree-pool ls` output ($1) to held data rows (col 2 ==
-# "held", past the 2 header lines). Single source of the ls-column coupling.
-held_data_rows() { printf '%s\n' "$1" | awk 'NR>2 && $2=="held"'; }
+# Held slots from `worktree-pool ls`, one TSV row each:
+#   lease, group, sha, dirty, untracked, ahead   ("-" where null)
+# Single source of the ls-JSON coupling. Args forward to `ls` (e.g. --git-status;
+# without it the last three are "-"). Schema: [[cli.md#output-contract]].
+held_slots_tsv() {
+  worktree-pool --pool "$POOL_KEY" ls "$@" | jq -r '
+    map(select(.state == "held"))[]
+    | [.lease, .group, .sha, .git.dirty, .git.untracked, .git.ahead]
+    | map(if . == null then "-" else tostring end)
+    | @tsv'
+}
 
 # Echo any in-progress git operation marker for the repo at $1; empty if clean.
 in_progress_marker() {
@@ -398,13 +411,10 @@ cmd_go() {
   # Bare `wt go`: show held slots (what's in flight) then a usage warning.
   # Idle/fresh rows filtered out as noise.
   if [ -z "$name" ]; then
-    local ls_out
-    ls_out=$(worktree-pool --pool "$POOL_KEY" ls)
     local held_rows
-    held_rows=$(held_data_rows "$ls_out")
+    held_rows=$(held_slots_tsv)
     if [ -n "$held_rows" ]; then
-      printf '%s\n' "$ls_out" | awk 'NR<=2'
-      printf '%s\n' "$held_rows"
+      { printf 'NAME\tGROUP\tSHA\n'; cut -f1-3 <<<"$held_rows"; } | column -t -s $'\t'
     else
       echo "(no held slots)"
     fi
@@ -946,10 +956,8 @@ cmd_cleanup() {
 cmd_sweep() {
   [ $# -eq 0 ] || die "sweep takes no arguments"
 
-  # Held slot names are column 3 of `worktree-pool ls` held rows.
-  local out names
-  out=$(worktree-pool --pool "$POOL_KEY" ls)
-  names=$(held_data_rows "$out" | awk '{print $3}')
+  local names
+  names=$(held_slots_tsv | cut -f1)
   if [ -z "$names" ]; then
     echo "(no held slots to sweep)"
     return 0
@@ -1106,10 +1114,9 @@ cmd_orient() {
 }
 
 cmd_ls() {
-  # Held slots only; drop ID (canonical slot-N — branch NAME is the real
-  # identity), STATE (constant after filter), and GROUP when uniform. Use
-  # `worktree-pool ls` for the full table incl idle rows. `--git-status` on by
-  # default (DIRTY/UNTRK/AHEAD; cheap per held slot); `--bare` opts out.
+  # Held slots only; drop the canonical slot id (branch NAME is the real identity)
+  # and GROUP when uniform. Use `worktree-pool ls` for every slot incl idle.
+  # `--git-status` on by default (DIRTY/UNTRK/AHEAD; cheap per held slot); `--bare` opts out.
   local bare=0 forward=()
   local arg
   for arg in "$@"; do
@@ -1121,19 +1128,25 @@ cmd_ls() {
   done
   [ "$bare" = 0 ] && forward=(--git-status ${forward[@]+"${forward[@]}"})
 
-  local out held
-  out=$(worktree-pool --pool "$POOL_KEY" ls ${forward[@]+"${forward[@]}"})
-  held=$(held_data_rows "$out")
+  local held
+  held=$(held_slots_tsv ${forward[@]+"${forward[@]}"})
   if [ -z "$held" ]; then
     echo "(no held slots)"
     return 0
   fi
   local drop_group=0
-  [ "$(printf '%s\n' "$held" | awk '{print $4}' | sort -u | wc -l)" -le 1 ] && drop_group=1
-  {
-    printf '%s\n' "$out" | awk 'NR<=2'
-    printf '%s\n' "$held"
-  } | awk -v dg="$drop_group" '{$1=""; $2=""; if (dg) $4=""; print}' | column -t
+  [ "$(cut -f2 <<<"$held" | sort -u | wc -l)" -le 1 ] && drop_group=1
+
+  awk -v dg="$drop_group" -v bare="$bare" 'BEGIN { FS = OFS = "\t" }
+    function row(name, group, sha, d, u, a,   o) {
+      o = name
+      if (!dg) o = o OFS group
+      o = o OFS sha
+      if (!bare) o = o OFS d OFS u OFS a
+      return o
+    }
+    BEGIN { print row("NAME", "GROUP", "SHA", "DIRTY", "UNTRK", "AHEAD") }
+    { print row($1, $2, $3, $4, $5, $6) }' <<<"$held" | column -t -s $'\t'
 }
 
 # Initialize a pool, inferring --source from cwd's git toplevel and --pool from
@@ -1165,7 +1178,19 @@ cmd_init() {
 cmd_info() {
   local name="${1:-}"; shift || true
   require_arg name "$name" "wt info <name>"
-  exec worktree-pool --pool "$POOL_KEY" inspect --lease "$name" "$@"
+  worktree-pool --pool "$POOL_KEY" inspect --lease "$name" "$@" | jq -r '
+    "slot:   \(.id)",
+    "lease:  \(.lease)",
+    (if .group then "group:  \(.group)" else empty end),
+    "path:   \(.path)",
+    "gitdir: \(.gitdir)",
+    "sha:    \(.sha // "?")",
+    "",
+    "## git status -sb",
+    (.status[]),
+    "",
+    "## commits on \(.base)..HEAD",
+    (if (.log // []) == [] then "(none)" else .log[] end)'
 }
 
 # ---------- help ----------
@@ -1249,10 +1274,9 @@ EOF
       cat <<'EOF'
 wt [--pool <key>] ls [--bare]
 
-Show held slots only (use `worktree-pool ls` for full table including idle).
-By default includes git status columns: NAME, DIRTY, UNTRK, AHEAD —
-`(detached)` or a non-name branch in NAME flags slots that won't recycle
-on cleanup, AHEAD>0 flags unmerged.
+Show held slots only (use `worktree-pool ls` for every slot, incl. idle).
+Columns: NAME, GROUP (only when held slots differ), SHA, and by default
+DIRTY, UNTRK, AHEAD. AHEAD>0 flags unmerged commits that block recycle.
   --bare        skip the per-slot git status calls (faster)
 EOF
       ;;
