@@ -1,7 +1,6 @@
-# Build + symlink into ~/.local/bin/. Re-running `cargo build --release` after
-# updates picks up the new binary in place — no re-install needed.
+# Install the binary into ~/.cargo/bin the cargo way; `wt` reaches ~/.local/bin as the manifest's `bin`.
 install:
-    scripts/install.sh
+    cargo install --path . --locked --force --target-dir target
 
 # Run all tests. The `cargo build` pre-step materializes the binary that
 # integration tests (tests/smoke.rs) invoke via assert_cmd, so the run doesn't
