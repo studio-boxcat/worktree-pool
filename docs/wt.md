@@ -2,7 +2,7 @@
 
 > **Related:** [[CLAUDE.md]], [[cli.md]] (underlying primitive), [[lifecycle.md]] (acquire/release invariants)
 
-Bash dispatcher in `bin/wt`. Subcommands wrapping the slot + git-flow lifecycle for interactive dev work:
+Bash dispatcher in `bin/wt`. Subcommands wrapping the slot + git-flow lifecycle for interactive dev work. `wt` is the human-readable face over the pool binary's JSON ([[cli.md#output-contract]]), so `jq` is a hard dependency — it fails fast at startup without one.
 
 ```sh
 wt [--pool <key>] init    [--max-slots <n>] [pool-init-flags...] # --source inferred from cwd; --max-slots defaults to 16
@@ -41,7 +41,7 @@ Acquire and `wt land` both clear a leftover `git index.lock` in the active slot 
 
 `path` resolves NAME to a canonical slot path: first the held-slot branch lookup (`worktree-pool path NAME`), then a literal canonical-id fallback (`$WORKTREE_ROOT/<key>/NAME`). Exits 0 found, 1 not, 2 on usage/pool-not-init. Lets consumer scripts branch on resume vs. fresh acquire (pattern matches `git rev-parse --git-dir`, `brew --prefix`).
 
-`ls` filters `worktree-pool ls` to held slots — operators almost always want "what's active now." `--git-status` (DIRTY/UNTRK/AHEAD) is **on by default**; one `git status --porcelain` per held slot is cheap. `--bare` opts out for cold caches or huge slot dirs. The `LEASE` column shows `(detached)` when HEAD isn't on a branch (operator checked out a SHA or hand-deleted the branch); such slots still recycle but the column flags the anomaly. `info` is a pass-through to `worktree-pool inspect --lease <name>` with the pool key prefilled.
+`ls` filters `worktree-pool ls` to held slots — operators almost always want "what's active now" — and renders them as a table, dropping GROUP when every held slot shares one. `--git-status` (DIRTY/UNTRK/AHEAD) is **on by default**; one `git status --porcelain` per held slot is cheap. `--bare` opts out for cold caches or huge slot dirs. `info` renders `worktree-pool inspect --lease <name>` with the pool key prefilled. Idle slots (detached HEAD — operator checked out a SHA or hand-deleted the branch) don't appear in either; use `worktree-pool ls` for every slot.
 
 `sweep` runs `cleanup` over every held slot — same classifier semantics in a loop, with a final tally. Operator-driven. Catches orphans whose EXIT trap never fired (killed shell, hand-deleted branch → detached HEAD with 0 ahead → 🟢 recycle, manual `git worktree add`). Always exits 0.
 

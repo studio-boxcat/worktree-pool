@@ -41,7 +41,13 @@ Cuts that simplify the design:
 - **No reclaim on holder death.** A SIGKILL'd holder leaves the slot held; operator notices via `ls` and runs `release`. (A crash *mid* acquire/release instead converges on its own — see [[lifecycle.md#crash-recovery]].)
 - **No `--fresh` / `--volatile` flags.** Caller wipes warmth itself if needed; release is the only "give back" verb.
 
-If you need GC-like behavior, write a 5-line script: `worktree-pool ls` → filter → `release --lease <L>` per match.
+If you need GC-like behavior, write a 5-line script — `ls` reports JSON ([[cli.md#output-contract]]), so filtering is a `jq` select rather than column arithmetic:
+
+```sh
+worktree-pool --pool myapp ls --git-status \
+  | jq -r '.[] | select(.state == "held" and .git.ahead == 0) | .lease' \
+  | xargs -I L worktree-pool --pool myapp release --lease L
+```
 
 Retry-aware CI callers branch on exit codes (see [[cli.md#exit-codes]]): **3 = contended** (retry), **4 = capacity** (release first), **6 = lease held** (reuse the holder's output, or release it). Everything else exits 1.
 

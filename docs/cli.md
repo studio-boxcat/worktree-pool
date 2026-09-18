@@ -21,10 +21,10 @@ worktree-pool --pool myapp acquire --lease feature-x --group ios
 
 worktree-pool --pool myapp release --lease abc12345-ios
 
-# Inspect
-worktree-pool --pool myapp ls
-worktree-pool --pool myapp ls --git-status          # adds dirty/untracked/ahead columns
-worktree-pool --pool myapp inspect --lease abc12345-ios
+# Inspect. JSON out — see Output contract below.
+worktree-pool --pool myapp ls | jq
+worktree-pool --pool myapp ls --git-status          # adds a per-slot `git` object
+worktree-pool --pool myapp inspect --lease abc12345-ios | jq
 worktree-pool --pool myapp path --lease abc12345-ios   # slot path; exit 1 if not held
 ```
 
@@ -58,6 +58,37 @@ fail-loud, so build pools get the same extension point as `wt go`. See
 currently locked by a live process. OS-managed flocks auto-release on process
 death, so there's nothing to force-clear.
 
+## Output contract
+
+Stdout is machine-readable in every subcommand, in exactly one of three shapes:
+
+| Shape | Verbs | Notes |
+|-------|-------|-------|
+| *(empty)* | `init`, `release` | Progress goes to stderr; there is no result to return. |
+| One bare line | `acquire`, `path` | The canonical slot path. Consumed as `$(…)` — no parser in the hot loop. |
+| One line of compact JSON | `ls`, `inspect`, `unstick`, `validate-gitmodules`, `doctor` | `\| jq` to read. |
+
+There is **no `--json` flag**: a verb that reports structure always reports JSON,
+so callers never branch on format and no human-readable table can drift from the
+machine-readable one. Rendering is the consumer's job — `wt` does it for
+operators (see [[wt.md]]).
+
+Conventions:
+
+- **Everything else is stderr.** Logs, warnings, hook output, and the `error: …`
+  line never touch stdout.
+- **Absent data is `null`**, never a placeholder like `"-"`. An idle slot has
+  `"lease": null`; `"git"` is absent entirely unless `ls --git-status` was passed.
+- **A report and a failure are independent.** `doctor` and `validate-gitmodules`
+  print their full report *and* exit non-zero when it contains problems — the
+  payload is the point, so it survives the failure. `path` inverts this: exit 1
+  with empty stdout *and* empty stderr, so `if worktree-pool … path …; then` reads
+  cleanly.
+
+`src/output.rs` defines the three shapes and `main` is the only writer, so a
+subcommand cannot print off-contract; the field-level schema of each report lives
+in the verb's own module and is locked by `tests/lifecycle.rs`.
+
 ## Exit codes
 
 Generic failures exit `1`. The codes below tag specific conditions so
@@ -79,7 +110,8 @@ new codes and existing ones never shift. The contract is locked by
 
 `doctor` is host-level (no `--pool`) and read-only. Checks: arch, `git --version`,
 `$WORKTREE_ROOT` + pool count, binary quarantine xattr, and per-pool config +
-source-path validation. Prints the report as `SectionResult[]` JSON (boxcat-ts-core's doctor wire format), nothing else on stdout; boxcat-devenv's doctor merges it, `| jq` reads it.
+source-path validation. Its report is `SectionResult[]` — boxcat-ts-core's doctor
+wire format, which boxcat-devenv's doctor parses whole and merges into its own.
 
 ## Distribution
 

@@ -6,7 +6,7 @@ A recyclable pool of `git worktree` checkouts with named lifecycle, branch creat
 
 This file is the contract. `README.md` is a symlink to it. Detail lives in `docs/`:
 
-- [[cli.md]] — quick start, full CLI reference, install
+- [[cli.md]] — quick start, full CLI reference, stdout/JSON output contract, exit codes, install
 - [[lifecycle.md]] — `acquire`/`release` invariants, crash recovery, same-SHA exclusion, submodule filtering, design rationale
 - [[wt.md]] — `wt` dev-session helper: subcommands, hooks, cleanup classifier, land flow
 - [[land-submodules.md]] — `wt land` × newly-introduced submodules: populate-from-slot rationale, local-only constraint
@@ -63,7 +63,7 @@ Per-host `init` runs once per pool key. Source path differs by host (build serve
 
 ## Build / development
 
-- Code lives in `src/`; one module per concern (e.g. `acquire`, `release`, `slot`, `mutex`, `submodules`, `parallel`, `dashboard`, `admin`, `doctor`, `exit`, `hooks` — `src/` is the source of truth). `parallel` wraps `std::thread::scope` with inline-fallback on OS thread-create failure (`Scope::spawn` panics under thread starvation; `panic = "abort"` would otherwise kill the process mid-release). Exposes `for_each`, `try_for_each`, and `map` (order-preserving collector). `exit` defines distinct exit codes for retry-aware callers — see [[cli.md#exit-codes]].
+- Code lives in `src/`; one module per concern (e.g. `acquire`, `release`, `slot`, `mutex`, `submodules`, `parallel`, `dashboard`, `admin`, `doctor`, `exit`, `hooks` — `src/` is the source of truth). `parallel` wraps `std::thread::scope` with inline-fallback on OS thread-create failure (`Scope::spawn` panics under thread starvation; `panic = "abort"` would otherwise kill the process mid-release). Exposes `for_each`, `try_for_each`, and `map` (order-preserving collector). `exit` defines distinct exit codes for retry-aware callers — see [[cli.md#exit-codes]]. `output` defines the stdout shapes; subcommands return an `Outcome` and `main` is the only writer, so stdout and the exit code are decided in one place — see [[cli.md#output-contract]].
 - Hand-rolled YAML in `yaml.rs` — line-oriented scalars only. `serde_yaml` is unmaintained; ~30 LOC suffices.
 - `git` operations shell out via `git.rs`. Slot identity is the canonical path; the user-given name is just a branch ref. No rename, no `git worktree move`, no submodule admin self-heal.
 - Atomic writes via `tempfile::NamedTempFile::persist` (handles EXDEV across volumes).
