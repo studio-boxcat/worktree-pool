@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 /// Pool root directory: `$WORKTREE_ROOT/<key>/`. `WORKTREE_ROOT` is required —
-/// no fallback. Set it in `~/.zshenv.local` (or equivalent) per host.
+/// no fallback. `boxcat/env.zsh` (config) defines it for every shell.
 pub fn pool_root(key: &str) -> PathBuf {
     worktree_root().join(key)
 }
@@ -58,8 +58,14 @@ pub fn for_each_pool_dir(mut f: impl FnMut(PathBuf)) {
 /// `$WORKTREE_ROOT`. Panics with a clear message if the var is unset — every
 /// pool path is anchored here, so silent fallback would mis-locate state.
 pub fn worktree_root() -> PathBuf {
+    try_worktree_root()
+        .expect("WORKTREE_ROOT is unset; boxcat/env.zsh (config) defines it — run from a shell that sourced .zshenv")
+}
+
+/// `$WORKTREE_ROOT`, or `None` when unset or empty. For `doctor`, which reports the absence
+/// as a verdict instead of dying on it.
+pub fn try_worktree_root() -> Option<PathBuf> {
     std::env::var_os("WORKTREE_ROOT")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
-        .expect("WORKTREE_ROOT is unset; add `export WORKTREE_ROOT=\"$HOME/.worktree-pool\"` to ~/.zshenv.local (or equivalent)")
 }

@@ -23,17 +23,30 @@ fn full_lifecycle() {
         .args(["--pool", &key, "ls"])
         .output()
         .unwrap();
-    let ls_text = String::from_utf8_lossy(&ls.stdout);
-    assert!(ls_text.contains("feat-x"), "ls should mention the lease");
-    assert!(ls_text.contains("held"));
+    let slots = json_stdout(&ls);
+    let held: Vec<_> = slots
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["state"] == "held")
+        .collect();
+    assert_eq!(held.len(), 1, "one held slot: {slots}");
+    assert_eq!(held[0]["lease"], "feat-x");
+    assert_eq!(held[0]["id"], "ios-0");
+    assert_eq!(held[0]["group"], "ios");
+    // Idle/fresh slots carry null, never a placeholder string.
+    let idle = slots.as_array().unwrap().iter().find(|s| s["state"] != "held").unwrap();
+    assert!(idle["lease"].is_null() && idle["sha"].is_null(), "absent data is null: {idle}");
 
     let inspect = wtp()
         .args(["--pool", &key, "inspect", "--lease", "feat-x"])
         .output()
         .unwrap();
-    let inspect_text = String::from_utf8_lossy(&inspect.stdout);
-    assert!(inspect_text.contains("sha:"), "inspect should show sha");
-    assert!(inspect_text.contains("group: ios"));
+    let info = json_stdout(&inspect);
+    assert_eq!(info["lease"], "feat-x");
+    assert_eq!(info["group"], "ios");
+    assert_eq!(info["sha"].as_str().unwrap().len(), 40, "full sha: {info}");
+    assert!(info["status"].is_array() && info["log"].is_array());
 
     release(&key, "feat-x");
 
@@ -175,9 +188,26 @@ fn doctor_runs_without_pool() {
         .unwrap();
     assert_ok(&out, "");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("worktree-pool doctor"));
-    assert!(stdout.contains("arch:"));
-    assert!(stdout.contains("git:"));
+    assert!(stdout.trim_start().starts_with('['), "stdout is the JSON report: {stdout}");
+    assert!(stdout.contains("\"name\":\"arch\""));
+    assert!(stdout.contains("\"name\":\"git\""));
+}
+
+#[test]
+fn doctor_json_is_the_wire_format() {
+    let out = wtp().arg("doctor").output().unwrap();
+    assert_ok(&out, "");
+    // Nothing but the array on stdout: boxcat-devenv parses stdout whole (doctor.ts in boxcat-ts-core).
+    let sections: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let sections = sections.as_array().unwrap();
+    assert!(!sections.is_empty());
+    for section in sections {
+        assert!(section["name"].is_string());
+        for r in section["results"].as_array().unwrap() {
+            assert!(r["name"].is_string() && r["message"].is_string());
+            assert!(matches!(r["status"].as_str(), Some("ok" | "warn" | "error")));
+        }
+    }
 }
 
 #[test]
@@ -201,18 +231,21 @@ fn unstick_reports_init_mutex_state() {
         .output()
         .unwrap();
     assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("init mutex ios-2: free"),
-        "expected diagnostic line for ios-2; got: {stdout}");
-    assert!(stdout.contains("unstick:") && stdout.contains("total"),
-        "expected summary line; got: {stdout}");
+    let report = json_stdout(&out);
+    let planted = report["init_mutexes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["slot"] == "ios-2")
+        .unwrap_or_else(|| panic!("expected an ios-2 entry; got: {report}"));
+    assert_eq!(planted["held"], false, "no flock was taken on the planted file");
     // The file is left in place — flock is the source of truth, not the file.
     assert!(leftover.exists(),
         "unstick is read-only; mutex file should remain (got removed)");
 }
 
 #[test]
-fn ls_renders_with_git_status_for_held_only() {
+fn ls_reports_git_status_for_held_only() {
     let key = pool_key();
     let _c = Cleanup(key.clone());
     let tmp = tempfile::TempDir::new().unwrap();
@@ -225,14 +258,18 @@ fn ls_renders_with_git_status_for_held_only() {
         .output()
         .unwrap();
     assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    // Header includes git-status columns
-    assert!(stdout.contains("DIRTY"));
-    assert!(stdout.contains("UNTRK"));
-    assert!(stdout.contains("AHEAD"));
-    // Slot is at ios-0; branch name 'feat-x' should appear in the row.
-    let row = stdout.lines().find(|l| l.contains("feat-x")).unwrap();
-    assert!(row.contains(" 0 "), "feat-x row missing 0 dirty: {row}");
+    let slots = json_stdout(&out);
+    let slots = slots.as_array().unwrap();
+
+    let held = slots.iter().find(|s| s["lease"] == "feat-x").unwrap();
+    assert_eq!(held["git"]["dirty"], 0, "freshly acquired slot is clean: {held}");
+    assert!(held["git"]["untracked"].is_number());
+
+    // `git` is present only on held slots — the columns cost a git spawn each.
+    assert!(
+        slots.iter().filter(|s| s["state"] != "held").all(|s| s.get("git").is_none()),
+        "git counts on a non-held slot: {slots:?}"
+    );
 }
 
 // ---------- race tests ----------
@@ -364,12 +401,12 @@ fn parallel_releases_different_names() {
         .args(["--pool", &key, "ls"])
         .output()
         .unwrap();
-    let stdout = String::from_utf8_lossy(&ls.stdout);
-    assert!(stdout.contains("ios-0"));
-    assert!(stdout.contains("ios-1"));
-    // No held slots.
-    assert!(!stdout.lines().any(|l| l.starts_with("a ")));
-    assert!(!stdout.lines().any(|l| l.starts_with("b ")));
+    let slots = json_stdout(&ls);
+    let slots = slots.as_array().unwrap();
+    for id in ["ios-0", "ios-1"] {
+        assert!(slots.iter().any(|s| s["id"] == id), "expected {id}: {ls:?}");
+    }
+    assert!(!slots.iter().any(|s| s["state"] == "held"), "all released: {slots:?}");
 }
 
 /// Distinct leases at one SHA are independent work and must both succeed — this is what a

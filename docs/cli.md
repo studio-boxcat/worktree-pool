@@ -79,7 +79,7 @@ new codes and existing ones never shift. The contract is locked by
 
 `doctor` is host-level (no `--pool`) and read-only. Checks: arch, `git --version`,
 `$WORKTREE_ROOT` + pool count, binary quarantine xattr, and per-pool config +
-source-path validation.
+source-path validation. Prints the report as `SectionResult[]` JSON (boxcat-ts-core's doctor wire format), nothing else on stdout; boxcat-devenv's doctor merges it, `| jq` reads it.
 
 ## Distribution
 
@@ -89,13 +89,12 @@ arm64 macOS only. Two tools end up on `$PATH`:
 - `wt` — Bash wrapper for the common dev-session lifecycle; auto-resolves pool
   key from cwd (override with `--pool`). Symlinked from `bin/wt`.
 
-`scripts/install.sh` (also `just install`) builds via `cargo build --release` and
-symlinks both into `~/.local/bin/` at the cargo artifact path, so any subsequent
-`cargo build --release` updates the installed tool in place.
+`just install` installs the binary into `~/.cargo/bin` (`cargo install --path`, the repo's
+`target/` as build cache); `wt` is linked into `~/.local/bin` by boxcat-devenv's bootstrap, as
+this repo's manifest declares.
 
 ```sh
 git clone https://github.com/studio-boxcat/worktree-pool.git ~/Develop/worktree-pool
 cd ~/Develop/worktree-pool && just install
-echo 'export WORKTREE_ROOT="$HOME/.worktree-pool"' >> ~/.zshenv.local
 worktree-pool doctor
 ```
