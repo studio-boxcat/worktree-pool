@@ -1,22 +1,21 @@
-//! Read-only subcommands: `ls` (slot table, with optional parallel git status),
+//! Read-only subcommands: `ls` (slot array, with optional parallel git status),
 //! `inspect` (one slot's git state), `path` (slot-id lookup).
+//! `ls`/`inspect` report JSON; `path` reports a bare line. See [[../docs/cli.md#output-contract]].
 use anyhow::Result;
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 use crate::cli::{InspectArgs, LsArgs, PathArgs};
 use crate::config::PoolConfig;
-use crate::types::{LeaseName, GroupName};
+use crate::output::{self, Outcome};
+use crate::types::{GroupName, LeaseName};
 use crate::{git, parallel, slot};
 
-pub fn ls(pool_root: &Path, cfg: &PoolConfig, args: LsArgs) -> Result<()> {
+pub fn ls(pool_root: &Path, cfg: &PoolConfig, args: LsArgs) -> Result<Outcome> {
     let entries = slot::enumerate(pool_root, cfg)?;
-    let mut rows: Vec<Row> = Vec::new();
+    let mut rows: Vec<Row> = entries.iter().map(build_row).collect();
 
-    for entry in &entries {
-        rows.push(build_row(entry));
-    }
-
-    // Add unmaterialized canonical slots up to max_slots so the table reflects capacity.
+    // Add unmaterialized canonical slots up to max_slots so the listing reflects capacity.
     let present: std::collections::HashSet<String> =
         entries.iter().map(|e| e.id.to_string()).collect();
     let groups_for_listing: Vec<Option<GroupName>> = if cfg.groups.is_empty() {
@@ -36,19 +35,20 @@ pub fn ls(pool_root: &Path, cfg: &PoolConfig, args: LsArgs) -> Result<()> {
     if args.git_status {
         // Parallel: H held slots × 2 git spawns each is the wall-clock
         // bottleneck. Compute deltas immutably + parallel, apply sequentially.
+        // Held rows always carry a path; `unwrap_or_default` keeps this list
+        // index-aligned with the held rows below even if that ever stops holding
+        // (an empty path yields empty counts rather than shifting every row).
         let held_paths: Vec<PathBuf> = rows
             .iter()
             .filter(|r| r.state == State::Held)
-            .map(|r| r.path.clone())
+            .map(|r| r.path.clone().unwrap_or_default())
             .collect();
-        let mut aug_iter = parallel::map(&held_paths, |p| compute_git_columns(p)).into_iter();
+        let mut aug_iter = parallel::map(&held_paths, |p| compute_git_counts(p)).into_iter();
         for r in &mut rows {
             if r.state == State::Held
-                && let Some((dirty, untracked, ahead)) = aug_iter.next()
+                && let Some(g) = aug_iter.next()
             {
-                r.dirty = dirty;
-                r.untracked = untracked;
-                r.ahead = ahead;
+                r.git = Some(g);
             }
         }
     }
@@ -59,21 +59,19 @@ pub fn ls(pool_root: &Path, cfg: &PoolConfig, args: LsArgs) -> Result<()> {
             .then_with(|| a.id.cmp(&b.id))
     });
 
-    print_table(&rows, args.git_status);
-    Ok(())
+    Ok(Outcome::json(rows.iter().map(Row::to_json).collect()))
 }
 
-pub fn path(pool_root: &Path, cfg: &PoolConfig, args: PathArgs) -> Result<()> {
+pub fn path(pool_root: &Path, cfg: &PoolConfig, args: PathArgs) -> Result<Outcome> {
     let name = LeaseName::from(args.lease.as_str());
     let Some(entry) = slot::find_by_lease(pool_root, cfg, &name)? else {
         // Empty stderr + exit 1 so callers can `if wp path X >/dev/null; then`.
-        std::process::exit(1);
+        return Ok(Outcome::silent_exit(1));
     };
-    println!("{}", entry.path.display());
-    Ok(())
+    Ok(Outcome::line(entry.path.display().to_string()))
 }
 
-pub fn inspect(pool_root: &Path, cfg: &PoolConfig, args: InspectArgs) -> Result<()> {
+pub fn inspect(pool_root: &Path, cfg: &PoolConfig, args: InspectArgs) -> Result<Outcome> {
     let name = LeaseName::from(args.lease.as_str());
     let entry = slot::find_by_lease(pool_root, cfg, &name)?.ok_or_else(|| {
         anyhow::anyhow!(
@@ -84,26 +82,24 @@ pub fn inspect(pool_root: &Path, cfg: &PoolConfig, args: InspectArgs) -> Result<
     })?;
 
     let gitdir = git::worktree_gitdir(&entry.path)?;
-    let sha = git::run(&entry.path, &["rev-parse", "HEAD"]).unwrap_or_else(|_| "?".into());
-
-    println!("# slot: {} (branch: {})", entry.id, args.lease);
-    println!("path: {}", entry.path.display());
-    println!("gitdir: {}", gitdir.display());
-    println!("sha: {}", sha);
-    if let Some(g) = &entry.group {
-        println!("group: {g}");
-    }
-    println!();
-
+    let sha = git::run(&entry.path, &["rev-parse", "HEAD"]).ok();
     let (_, status, _) = git::run_lenient(&entry.path, &["status", "-sb"])?;
-    println!("## git status -sb\n{}", status);
-    println!();
 
+    // `log` is the slot's work: commits on the lease branch not in the pool's base.
     let range = format!("{}..HEAD", cfg.default_commit);
     let (ok, log, _) = git::run_lenient(&entry.path, &["log", "--oneline", "-20", &range])?;
-    println!("## git log --oneline -20 {range}");
-    println!("{}", if ok && !log.is_empty() { log } else { "(none)".to_string() });
-    Ok(())
+
+    Ok(Outcome::json(json!({
+        "id": entry.id.as_str(),
+        "lease": args.lease,
+        "group": output::opt_str(entry.group.as_ref().map(GroupName::as_str)),
+        "path": output::path(&entry.path),
+        "gitdir": output::path(&gitdir),
+        "sha": output::opt_str(sha.as_deref()),
+        "status": output::lines(&status),
+        "base": cfg.default_commit.as_str(),
+        "log": if ok { output::lines(&log) } else { Value::Null },
+    })))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,17 +109,26 @@ enum State {
     Fresh,
 }
 
+/// `git status --porcelain` + `rev-list` counts for a held slot. `None` per field
+/// when its git call failed.
+#[derive(Debug, Clone, Default)]
+struct GitCounts {
+    dirty: Option<u32>,
+    untracked: Option<u32>,
+    ahead: Option<u32>,
+}
+
 #[derive(Debug, Clone)]
 struct Row {
     id: String,
     state: State,
-    lease: String,
-    group: String,
-    full_sha: String,
-    dirty: String,
-    untracked: String,
-    ahead: String,
-    path: PathBuf,
+    lease: Option<String>,
+    group: Option<String>,
+    sha: Option<String>,
+    /// `None` unless `--git-status` was passed.
+    git: Option<GitCounts>,
+    /// `None` for fresh slots — nothing is materialized on disk yet.
+    path: Option<PathBuf>,
 }
 
 impl Row {
@@ -131,56 +136,63 @@ impl Row {
         Self {
             id: id.to_string(),
             state: State::Fresh,
-            lease: "-".into(),
-            group: group.map(|g| g.to_string()).unwrap_or_else(|| "-".into()),
-            full_sha: "-".into(),
-            dirty: "-".into(),
-            untracked: "-".into(),
-            ahead: "-".into(),
-            path: PathBuf::new(),
+            lease: None,
+            group: group.map(|g| g.to_string()),
+            sha: None,
+            git: None,
+            path: None,
         }
+    }
+
+    fn to_json(&self) -> Value {
+        let mut o = json!({
+            "id": self.id,
+            "state": state_label(&self.state),
+            "lease": output::opt_str(self.lease.as_deref()),
+            "group": output::opt_str(self.group.as_deref()),
+            "sha": output::opt_str(self.sha.as_deref()),
+            "path": self.path.as_deref().map_or(Value::Null, output::path),
+        });
+        if let Some(g) = &self.git {
+            o["git"] = json!({
+                "dirty": g.dirty,
+                "untracked": g.untracked,
+                "ahead": g.ahead,
+            });
+        }
+        o
     }
 }
 
 fn build_row(entry: &slot::SlotEntry) -> Row {
     let branch = git::current_branch(&entry.path);
     let state = if branch.is_some() { State::Held } else { State::Idle };
-    let group = entry.group.as_ref().map(GroupName::as_str).unwrap_or("-").to_string();
-    let lease = branch.unwrap_or_else(|| "-".into());
 
-    let full_sha = if state == State::Held {
-        git::run(&entry.path, &["rev-parse", "HEAD"])
-            .map(|sha| sha[..8.min(sha.len())].to_string())
-            .unwrap_or_else(|_| "?".into())
-    } else {
-        "-".into()
-    };
+    // Short sha only for held slots — an idle slot's detached HEAD is pool
+    // bookkeeping, not something a caller acts on.
+    let sha = (state == State::Held)
+        .then(|| git::run(&entry.path, &["rev-parse", "HEAD"]).ok())
+        .flatten()
+        .map(|sha| sha[..8.min(sha.len())].to_string());
 
     Row {
         id: entry.id.to_string(),
         state,
-        lease,
-        group,
-        full_sha,
-        dirty: "-".into(),
-        untracked: "-".into(),
-        ahead: "-".into(),
-        path: entry.path.clone(),
+        lease: branch,
+        group: entry.group.as_ref().map(GroupName::to_string),
+        sha,
+        git: None,
+        path: Some(entry.path.clone()),
     }
 }
 
-/// Returns `(dirty, untracked, ahead)` columns for the held slot at `path`.
-/// Each defaults to `"-"` when its git call failed or the path is empty.
-fn compute_git_columns(path: &Path) -> (String, String, String) {
-    let mut dirty = "-".to_string();
-    let mut untracked = "-".to_string();
-    let mut ahead = "-".to_string();
+fn compute_git_counts(path: &Path) -> GitCounts {
+    let mut counts = GitCounts::default();
     if path.as_os_str().is_empty() {
-        return (dirty, untracked, ahead);
+        return counts;
     }
     if let Ok((true, porcelain, _)) = git::run_lenient(path, &["status", "--porcelain"]) {
-        let mut d = 0u32;
-        let mut u = 0u32;
+        let (mut d, mut u) = (0u32, 0u32);
         for line in porcelain.lines().filter(|l| !l.is_empty()) {
             if line.starts_with("??") {
                 u += 1;
@@ -188,16 +200,15 @@ fn compute_git_columns(path: &Path) -> (String, String, String) {
                 d += 1;
             }
         }
-        dirty = d.to_string();
-        untracked = u.to_string();
+        counts.dirty = Some(d);
+        counts.untracked = Some(u);
     }
-    if let Ok((true, a, _)) = git::run_lenient(
-        path,
-        &["rev-list", "--count", "HEAD", "^refs/heads/main"],
-    ) {
-        ahead = a.trim().to_string();
+    if let Ok((true, a, _)) =
+        git::run_lenient(path, &["rev-list", "--count", "HEAD", "^refs/heads/main"])
+    {
+        counts.ahead = a.trim().parse().ok();
     }
-    (dirty, untracked, ahead)
+    counts
 }
 
 fn state_order(s: &State) -> u8 {
@@ -205,57 +216,6 @@ fn state_order(s: &State) -> u8 {
         State::Held => 0,
         State::Idle => 1,
         State::Fresh => 2,
-    }
-}
-
-fn print_table(rows: &[Row], with_git: bool) {
-    let mut headers = vec!["ID", "STATE", "LEASE", "GROUP", "SHA"];
-    if with_git {
-        headers.extend(["DIRTY", "UNTRK", "AHEAD"]);
-    }
-    let cells: Vec<Vec<String>> = rows
-        .iter()
-        .map(|r| {
-            let mut row = vec![
-                r.id.clone(),
-                state_label(&r.state).into(),
-                r.lease.clone(),
-                r.group.clone(),
-                r.full_sha.clone(),
-            ];
-            if with_git {
-                row.extend([r.dirty.clone(), r.untracked.clone(), r.ahead.clone()]);
-            }
-            row
-        })
-        .collect();
-
-    let widths: Vec<usize> = headers
-        .iter()
-        .enumerate()
-        .map(|(i, h)| {
-            std::cmp::max(
-                h.len(),
-                cells.iter().map(|r| r[i].len()).max().unwrap_or(0),
-            )
-        })
-        .collect();
-
-    let row_str = |cells: &[String]| -> String {
-        cells
-            .iter()
-            .zip(&widths)
-            .map(|(c, w)| format!("{c:<w$}"))
-            .collect::<Vec<_>>()
-            .join("  ")
-    };
-    println!(
-        "{}",
-        row_str(&headers.iter().map(|s| s.to_string()).collect::<Vec<_>>())
-    );
-    println!("{}", widths.iter().map(|w| "-".repeat(*w)).collect::<Vec<_>>().join("  "));
-    for c in &cells {
-        println!("{}", row_str(c));
     }
 }
 

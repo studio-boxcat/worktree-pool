@@ -1,4 +1,5 @@
 //! Admin verbs: `unstick` (report mutex flock state) and `validate-gitmodules`.
+//! Both report JSON — see [[../docs/cli.md#output-contract]].
 //!
 //! With OS-managed flocks (`std::fs::File::try_lock`), leftover mutex files
 //! carry no semantic load — the kernel auto-releases the lock on process
@@ -7,93 +8,101 @@
 //! flock can't be released from outside the holding process (kill the holder
 //! if you really need it gone).
 use anyhow::{Context, Result};
+use serde_json::{Value, json};
 use std::path::Path;
 
 use crate::cli::UnstickArgs;
 use crate::config::PoolConfig;
 use crate::mutex;
+use crate::output::{self, Outcome};
 
-pub fn unstick(pool_root: &Path, args: UnstickArgs) -> Result<()> {
+pub fn unstick(pool_root: &Path, args: UnstickArgs) -> Result<Outcome> {
     let pool_mutex_path = crate::fs_paths::pool_mutex(pool_root);
-    if pool_mutex_path.exists() {
-        if mutex::is_held(&pool_mutex_path) {
-            println!(
-                "pool mutex HELD: {} (live holder; kill the process if it's stuck)",
-                pool_mutex_path.display()
-            );
-        } else {
-            println!(
-                "pool mutex free: {} (no live holder)",
-                pool_mutex_path.display()
-            );
-        }
-    }
+    // Absent file → null, distinct from a present-but-free mutex.
+    let pool_mutex = if pool_mutex_path.exists() {
+        json!({
+            "path": output::path(&pool_mutex_path),
+            "held": mutex::is_held(&pool_mutex_path),
+        })
+    } else {
+        Value::Null
+    };
 
     let init_dir = pool_root.join(".meta/init");
-    if !init_dir.exists() {
-        println!("no init mutexes present at {}", init_dir.display());
-        return Ok(());
-    }
-
-    let mut total = 0u32;
-    let mut held = 0u32;
-
-    for entry in std::fs::read_dir(&init_dir)
-        .with_context(|| format!("read_dir {}", init_dir.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let slot_id = name.strip_suffix(".lock").unwrap_or(&name).to_string();
-
-        if let Some(target) = &args.slot
-            && &slot_id != target
+    let mut init_mutexes: Vec<Value> = Vec::new();
+    if init_dir.exists() {
+        for entry in std::fs::read_dir(&init_dir)
+            .with_context(|| format!("read_dir {}", init_dir.display()))?
         {
-            continue;
-        }
+            let entry = entry?;
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let slot_id = name.strip_suffix(".lock").unwrap_or(&name).to_string();
 
-        total += 1;
-        if mutex::is_held(&path) {
-            held += 1;
-            println!("init mutex {}: HELD", slot_id);
-        } else {
-            println!("init mutex {}: free", slot_id);
+            if let Some(target) = &args.slot
+                && &slot_id != target
+            {
+                continue;
+            }
+
+            init_mutexes.push(json!({
+                "slot": slot_id,
+                "path": output::path(&path),
+                "held": mutex::is_held(&path),
+            }));
         }
     }
+    init_mutexes.sort_by(|a, b| a["slot"].as_str().cmp(&b["slot"].as_str()));
 
-    println!(
-        "unstick: {held} held, {} free, {total} total {}",
-        total - held,
-        if args.slot.is_some() { "(filtered)" } else { "" }
-    );
-    Ok(())
+    // No held/free/total summary: derivable from the array, and two sources for
+    // one fact drift.
+    Ok(Outcome::json(json!({
+        "pool_mutex": pool_mutex,
+        "init_dir": output::path(&init_dir),
+        "init_mutexes": init_mutexes,
+    })))
 }
 
-/// Parse the source repo's `.gitmodules` and warn on unknown `worktreePool*` keys
+/// Parse the source repo's `.gitmodules` and flag unknown `worktreePool*` keys
 /// (typo guard — git silently accepts misspelled keys).
-pub fn validate_gitmodules(cfg: &PoolConfig) -> Result<()> {
+pub fn validate_gitmodules(cfg: &PoolConfig) -> Result<Outcome> {
     let path = cfg.source.join(".gitmodules");
+    // Report shape is identical whether or not the file exists; `gitmodules: null`
+    // is the "nothing to validate" case, so consumers need no second branch.
     if !path.exists() {
-        println!("no .gitmodules at {} — nothing to validate", path.display());
-        return Ok(());
+        return Ok(Outcome::json(
+            json!({ "gitmodules": Value::Null, "tag_entries": 0, "unknown_keys": [] }),
+        ));
     }
 
     let out = crate::git::config_file_list(&cfg.source, &path)?;
 
-    let mut warnings = 0u32;
-    let mut tag_count = 0u32;
-    for (_name, key, _value) in crate::submodules::iter_keys(&out) {
+    let mut unknown_keys: Vec<String> = Vec::new();
+    let mut tag_entries = 0u32;
+    for (name, key, _value) in crate::submodules::iter_keys(&out) {
         if key == "worktreepooltag" {
-            tag_count += 1;
+            tag_entries += 1;
         } else if key.starts_with("worktreepool") {
-            eprintln!("warn: unknown key 'submodule.*.{key}'; did you mean 'worktreePoolTag'?");
-            warnings += 1;
+            unknown_keys.push(format!("submodule.{name}.{key}"));
         }
     }
 
-    println!("validate-gitmodules: {tag_count} `worktreePoolTag` entries, {warnings} warning(s)");
-    if warnings > 0 {
-        anyhow::bail!("{warnings} unknown worktreePool* key(s) in {}", path.display());
+    let report = json!({
+        "gitmodules": output::path(&path),
+        "tag_entries": tag_entries,
+        "unknown_keys": unknown_keys,
+    });
+    if unknown_keys.is_empty() {
+        return Ok(Outcome::json(report));
     }
-    Ok(())
+    // Report still goes to stdout — the caller wants the key list, not just the code.
+    Ok(Outcome::json_failing(
+        report,
+        anyhow::anyhow!(
+            "{} unknown worktreePool* key(s) in {}: {} — did you mean 'worktreePoolTag'?",
+            unknown_keys.len(),
+            path.display(),
+            unknown_keys.join(", ")
+        ),
+    ))
 }

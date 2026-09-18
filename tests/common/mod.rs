@@ -87,6 +87,15 @@ pub fn assert_ok(out: &std::process::Output, ctx: &str) {
         String::from_utf8_lossy(&out.stderr));
 }
 
+/// Parse a structured subcommand's stdout as its JSON report. Panics with the raw
+/// bytes, so a break in the output contract surfaces as a parse failure rather
+/// than a silently-absent field. Contract: [[../docs/cli.md#output-contract]].
+pub fn json_stdout(out: &std::process::Output) -> serde_json::Value {
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!("stdout is not JSON ({e}): {}", String::from_utf8_lossy(&out.stdout))
+    })
+}
+
 /// Assert the slot's HEAD is detached (idle): `symbolic-ref --quiet HEAD` exits
 /// non-zero when HEAD isn't on a branch. The post-release idle invariant the
 /// lifecycle/submodule tests check.

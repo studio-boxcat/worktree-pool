@@ -10,10 +10,11 @@ use std::path::Path;
 
 use crate::cli::ReleaseArgs;
 use crate::config::PoolConfig;
+use crate::output::Outcome;
 use crate::types::LeaseName;
 use crate::{fs_paths, git, mutex, slot, submodules};
 
-pub fn run(pool_root: &Path, cfg: &PoolConfig, args: ReleaseArgs) -> Result<()> {
+pub fn run(pool_root: &Path, cfg: &PoolConfig, args: ReleaseArgs) -> Result<Outcome> {
     let _pool_mu = mutex::FileLock::acquire(fs_paths::pool_mutex(pool_root))
         .context("acquiring pool mutex for release")?;
 
@@ -29,13 +30,13 @@ pub fn run(pool_root: &Path, cfg: &PoolConfig, args: ReleaseArgs) -> Result<()> 
         return release_tail(&path, &held);
     }
     eprintln!("release '{}': no held slot (already released)", args.lease);
-    Ok(())
+    Ok(Outcome::none())
 }
 
 /// The release body without the pool mutex or the lease lookup. `lease` is also the slot's
 /// branch ref, which is what the git cleanup below deletes. Idempotent — each step is a
 /// no-op if already done.
-fn release_tail(slot_path: &Path, lease: &str) -> Result<()> {
+fn release_tail(slot_path: &Path, lease: &str) -> Result<Outcome> {
     // Detach HEAD — this flips held → idle. Can't delete the branch we're on,
     // so detach first. Pool mutex is held, so no race with concurrent acquires.
     let (detach_ok, _, detach_err) = git::detach_head(slot_path)?;
@@ -58,6 +59,6 @@ fn release_tail(slot_path: &Path, lease: &str) -> Result<()> {
     submodules::delete_branch_recursive(slot_path, lease);
 
     eprintln!("released '{lease}'");
-    Ok(())
+    Ok(Outcome::none())
 }
 

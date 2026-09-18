@@ -8,10 +8,16 @@ use crate::bail_exit;
 use crate::cli::AcquireArgs;
 use crate::config::PoolConfig;
 use crate::exit::ExitKind;
+use crate::output::Outcome;
 use crate::types::{GroupName, LeaseName, SlotId};
 use crate::{fs_paths, git, hooks, mutex, slot, submodules};
 
-pub fn run(pool_key: &str, pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs) -> Result<()> {
+pub fn run(
+    pool_key: &str,
+    pool_root: &Path,
+    cfg: &PoolConfig,
+    args: AcquireArgs,
+) -> Result<Outcome> {
     let group = slot::resolve_group(cfg, args.group.as_deref())?;
     let commitish = args
         .commit
@@ -140,8 +146,7 @@ pub fn run(pool_key: &str, pool_root: &Path, cfg: &PoolConfig, args: AcquireArgs
         )
     })?;
 
-    println!("{}", canonical_path.display());
-    Ok(())
+    Ok(Outcome::line(canonical_path.display().to_string()))
 }
 
 /// Re-pin an idle slot to `full_sha` in place. No `git clean` — untracked files

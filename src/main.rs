@@ -11,6 +11,7 @@ mod fs_paths;
 mod git;
 mod hooks;
 mod mutex;
+mod output;
 mod parallel;
 mod release;
 mod slot;
@@ -20,21 +21,40 @@ mod yaml;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
+use output::{Failure, Outcome, Output};
 
 fn main() {
     let cli = cli::Cli::parse();
-    if let Err(e) = run(cli) {
-        // `{:#}` flattens the anyhow context chain; readable for CLI users.
-        eprintln!("error: {e:#}");
-        let code = e
-            .chain()
-            .find_map(|c| c.downcast_ref::<exit::ExitKind>().copied())
-            .map_or(1, |k| k.code());
-        std::process::exit(code);
+    // Subcommands never touch stdout or exit; they return an Outcome. Keeping
+    // both decisions here is what makes the output contract checkable in one place.
+    let outcome = match run(cli) {
+        Ok(o) => o,
+        Err(e) => Outcome {
+            output: Output::None,
+            failure: Some(Failure::Reported(e)),
+        },
+    };
+    match outcome.output {
+        Output::None => {}
+        Output::Line(s) => println!("{s}"),
+        Output::Json(v) => println!("{v}"),
+    }
+    match outcome.failure {
+        None => {}
+        Some(Failure::Silent(code)) => std::process::exit(code),
+        Some(Failure::Reported(e)) => {
+            // `{:#}` flattens the anyhow context chain; readable for CLI users.
+            eprintln!("error: {e:#}");
+            let code = e
+                .chain()
+                .find_map(|c| c.downcast_ref::<exit::ExitKind>().copied())
+                .map_or(1, |k| k.code());
+            std::process::exit(code);
+        }
     }
 }
 
-fn run(cli: cli::Cli) -> Result<()> {
+fn run(cli: cli::Cli) -> Result<Outcome> {
     use cli::Command::*;
 
     // Doctor is the only subcommand that doesn't require --pool.
@@ -64,7 +84,7 @@ fn run(cli: cli::Cli) -> Result<()> {
     }
 }
 
-fn cmd_init(pool_key: &str, pool_path: &std::path::Path, args: cli::InitArgs) -> Result<()> {
+fn cmd_init(pool_key: &str, pool_path: &std::path::Path, args: cli::InitArgs) -> Result<Outcome> {
     if fs_paths::pool_config(pool_path).exists() {
         bail!(
             "pool '{pool_key}' already initialized at {}",
@@ -104,7 +124,7 @@ fn cmd_init(pool_key: &str, pool_path: &std::path::Path, args: cli::InitArgs) ->
         cfg.max_slots,
         cfg.default_commit,
     );
-    Ok(())
+    Ok(Outcome::none())
 }
 
 fn dispatch(
@@ -112,7 +132,7 @@ fn dispatch(
     pool_path: &std::path::Path,
     cfg: &config::PoolConfig,
     cmd: cli::Command,
-) -> Result<()> {
+) -> Result<Outcome> {
     use cli::Command::*;
     match cmd {
         Init(_) | Doctor => unreachable!("handled in run()"),
