@@ -10,9 +10,12 @@ test:
     cargo build
     cargo test
 
+# Compile without emitting — what `boxcat-devenv typecheck` runs for this repo.
+typecheck:
+    cargo check --all-targets
+
 # Cargo check + clippy.
-lint:
-    cargo check
+lint: typecheck
     cargo clippy -- -D warnings
 
 # Microbench pure-Rust hot paths (YAML parse/serialize). Criterion-based.
